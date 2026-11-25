@@ -143,7 +143,20 @@ test('握手前失败仍回收本次创建的完整容器，并允许下次重�
   writeFileSync(script,`const{spawn}=require('node:child_process'),fs=require('node:fs');if(process.argv.includes('--help')){process.stdout.write('fixture app-server');}else{const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',windowsHide:true});fs.writeFileSync(${JSON.stringify(output)},JSON.stringify({wrapper:process.pid,child:child.pid}));setInterval(()=>{},1000);}`,'utf8');
   const adapter=new CodexAdapter({...DEFAULT_CONFIG,codexCommand:[process.execPath,script],codexHome:home},home);t.after(async()=>{adapter.close();assert.deepEqual(await releaseRecordedProcesses(home,()=>true),[]);});
   let attempts=0,lastId:string|undefined,identities:Awaited<ReturnType<typeof processIdentity>>[]=[],container:OwnedProcessRecord|undefined;
-  t.mock.method(adapter,'connect',async()=>{const deadline=Date.now()+5000;while(!existsSync(output)){assert.ok(Date.now()<deadline,'启动夹具未创建后代');await delay(20);}const created=JSON.parse(readFileSync(output,'utf8'));identities=await Promise.all([processIdentity(created.wrapper),processIdentity(created.child)]);container=ownedProcesses(home).records.find(record=>record.windowsJob||record.posixGroup);attempts++;throw new BridgeError('process_launch_unverified','夹具拒绝原生交接');});
+                                             
+  const boundary=adapter as unknown as Record<'declareRuntimeNative'|'connect',()=>Promise<unknown>>;
+  const rejectHandoff=async()=>{
+    const deadline=Date.now()+5000;
+    while(!existsSync(output)){assert.ok(Date.now()<deadline,'启动夹具未创建后代');await delay(20);}
+    const created=JSON.parse(readFileSync(output,'utf8'));
+    identities=await Promise.all([processIdentity(created.wrapper),processIdentity(created.child)]);
+    const launchId=runtimeFor(home,{peerId:'failed-start'})!.value.id;
+    container=ownedProcesses(home).records.find(record=>record.proof.launchId===launchId&&(record.windowsJob||record.posixGroup));
+    attempts++;throw new BridgeError('process_launch_unverified','夹具拒绝原生交接');
+  };
+  const mac=process.platform==='darwin';
+  t.mock.method(boundary,mac?'declareRuntimeNative':'connect',rejectHandoff);
+  const unexpectedConnect=mac?t.mock.method(adapter,'connect',async()=>{throw Error('未声明原生代次时不能握手');}):undefined;
   for(let attempt=0;attempt<2;attempt++){
     await assert.rejects(adapter.ensureEndpoint(home,'failed-start'),{code:'process_launch_unverified'});
     const saved=runtimeFor(home,{peerId:'failed-start'})!.value;
@@ -159,6 +172,7 @@ test('握手前失败仍回收本次创建的完整容器，并允许下次重�
     await pruneDeadProcessRecords(home);assert.equal(runtimeFor(home,{id:saved.id}),undefined);
   }
   assert.equal(attempts,2);
+  assert.equal(unexpectedConnect?.mock.callCount()??0,0);
 });
 
 test('没有启动证明的失败预约保持未知；只有已确认没有进程的失败可清理',async t=>{

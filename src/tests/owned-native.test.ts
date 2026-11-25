@@ -2,7 +2,7 @@ import {lifecycle} from './support/broker-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync,writeFileSync } from 'node:fs';
 import { temporaryDirectory, temporary } from './support/temporary.js';
 import { registration } from './support/registration.js';
 import { FakeAdapter } from './support/fake-adapter.js';
@@ -14,7 +14,14 @@ import { beginNativeLaunch, bindNativeLaunch, captureNativeProcess, failNativeLa
 
 test('后台意图登记后权限关闭或提交守卫拒绝均立即结算，不留下每分钟重试的无身份意图',async t=>{
   const home=temporary(t),store=new Store(':memory:'),peer=store.placeholder('claude',home),adapter=new ClaudeAdapter(DEFAULT_CONFIG,home);t.after(()=>{adapter.close();store.close();});
-  const launch={host:'claude',executable:{command:process.execPath,prefix:[]},configHome:home,cwd:home,env:{...process.env},method:'pin',notes:[],environment:{source:'test',dropped:[],replaced:[],inheritedLoopbackProxy:[]}};
+  const program=path.join(home,'claude.cjs');
+  writeFileSync(program,`
+    const args=process.argv.slice(2);
+    const option=args.find(value=>value.startsWith('--')&&value!=='--messaging-socket-path');
+    if(option)console.error("error: unknown option '"+option+"'");
+    process.exitCode=1;
+  `,'utf8');
+  const launch={host:'claude',executable:{command:process.execPath,prefix:[program]},configHome:home,cwd:home,env:{...process.env},method:'pin',notes:[],environment:{source:'test',dropped:[],replaced:[],inheritedLoopbackProxy:[]}};
   let intent=await beginNativeLaunch(home,peer,home);adapter.setEnabled(peer,undefined,false);
   await assert.rejects((adapter as any).submitLaunch(peer,intent,launch,[]),{code:'member_disabled'});assert.equal(nativeOwnership(home,peer.id)?.phase,'failed');
   adapter.setEnabled(peer,undefined,true);intent=await beginNativeLaunch(home,peer,home);
