@@ -1,6 +1,6 @@
 import {type Pair,type Peer} from '../../types.js';
 import type {IncidentLayer,CauseClass,IncidentAction} from './runtime-incidents.js';
-export interface RuntimeAvailability {state:'reachable'|'blocked'|'unknown'|'starting';reasons:string[];checked_at:number;nativeState?:'alive'|'dead'|'unknown';deliveryIssue?:'claude_inbox_missing';resourceEvidence?:string;incident?:import('./runtime-incidents.js').IncidentStatus;functionalSuccessAt?:number}
+export interface RuntimeAvailability {state:'reachable'|'blocked'|'unknown'|'starting';reasons:string[];checked_at:number;nativeState?:'alive'|'dead'|'unknown';deliveryIssue?:'claude_inbox_missing'|'codex_socket_target_missing';resourceEvidence?:string;incident?:import('./runtime-incidents.js').IncidentStatus;functionalSuccessAt?:number}
 export interface DeliveryCounts {accepted:number;sending:number;runtimeQueued:number;held:number;unknown:number}
 export const emptyDeliveryCounts=():DeliveryCounts=>({accepted:0,sending:0,runtimeQueued:0,held:0,unknown:0});
 export const unsettledCount=(counts:DeliveryCounts)=>Object.values(counts).reduce((a,b)=>a+b,0);

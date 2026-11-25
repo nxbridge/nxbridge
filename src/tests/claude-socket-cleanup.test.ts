@@ -15,6 +15,7 @@ import {atomicJson} from '../shared/files.js';
 import {BridgeError,DeliveryError} from '../shared/errors.js';
 import type {Endpoint,Peer,Message} from '../types.js';
 import type {RuntimeAvailability} from '../broker/health/contracts.js';
+import {TransportMigrations} from '../broker/recovery/transport-migration.js';
 
 const missing=():RuntimeAvailability=>({state:'blocked',nativeState:'alive',deliveryIssue:'claude_inbox_missing',reasons:['Claude native process alive; inbox socket pathname missing'],checked_at:Date.now()});
 const health=(now=Date.now())=>({turnId:'completed',state:'ready' as const,tools:[],lastEventAt:now,lastProgressAt:now});
@@ -79,6 +80,8 @@ function ownedFixture(t:Parameters<typeof fixture>[0]){
   f.store.saveEndpoint({...endpoint,nativeHealth:health(),nativeBackground:{tasks:0,crons:0,observedAt:Date.now()}});
   saveNativeOwnership({version:1,id:randomUUID(),home:endpoint.configHome!,peerId:peer.id,configHome:endpoint.configHome!,phase:'bound',createdAt:Date.now(),sessionId:peer.sessionId!,handle:'owned-test',native:{pid:endpoint.pid!,startedAt:endpoint.procStart!}});
   let stopped=0;
+  (f.claude as any).preflightRestart=async()=>{};
+  (f.claude as any).assertIdleWorkload=async()=>{};
   (f.claude as any).release=async(_peer:Peer,guard:(agent:unknown)=>Promise<void>)=>{await guard({status:'idle',pid:endpoint.pid});stopped++;};
   f.claude.probe=async()=>missing();
   return{...f,pair,peer,endpoint,stopped:()=>stopped};
@@ -155,4 +158,70 @@ test('只保护确定的丢失通道，其他拒绝沿用原行为；停止前�
   (g.claude as any).release=async(_peer:Peer,guard:(agent:unknown)=>void)=>{g.store.updatePeer(g.peer.id,{state:'busy'});await guard({status:'idle',pid:g.endpoint.pid});stopped=true;};
   await lifecycle(g.broker).schedulePairedRecovery(g.peer.id,true);
   assert.equal(stopped,false);assert.equal(g.claude.woken.length,0);assert.equal(g.store.endpoint(g.peer.id)?.active,true);assert.equal(g.store.peer(g.peer.id).state,'busy');
+});
+
+test('仍健康的旧 Claude inbox 在安全空闲时自动迁到持久地址，迁移不占故障恢复额度',{skip:process.platform==='win32'},async t=>{
+  const f=ownedFixture(t),old=path.join(f.endpoint.configHome!,'legacy','inbox.sock'),fresh=path.join(f.endpoint.configHome!,'run','ci-current.sock');
+  f.store.saveEndpoint({...f.store.endpoint(f.peer.id)!,address:old});
+  f.claude.probe=async()=>({state:'reachable',nativeState:'alive',reasons:[],checked_at:Date.now()});
+  const discover=f.claude.discover.bind(f.claude);
+  f.claude.discover=async id=>{const value=await discover(id);return{...value!,endpoint:{...value!.endpoint,address:fresh,configHome:f.endpoint.configHome,epoch:'persistent',procStart:'persistent-generation'}};};
+  await lifecycle(f.broker).schedulePairedRecovery(f.peer.id,false);
+  assert.equal(f.stopped(),1);assert.equal(f.store.peer(f.peer.id).sessionId,f.peer.sessionId);assert.equal(f.store.pairFor(f.peer.id)?.id,f.pair.id);
+  assert.equal(lifecycle(f.broker).transportMigrations.get(f.peer.id)?.state,'ready');
+  assert.equal(f.broker.managedRecovery.get(f.peer.id),undefined);
+  await lifecycle(f.broker).schedulePairedRecovery(f.peer.id,false);assert.equal(f.stopped(),1);
+  const status=f.broker.status() as any;assert.equal(status.peers.find((peer:any)=>peer.id===f.peer.id).transport_migration.state,'ready');
+});
+
+test('可选迁移预检失败保留可用原会话，配置不支持新地址时不停止也不消费额度',{skip:process.platform==='win32'},async t=>{
+  const f=ownedFixture(t);f.store.saveEndpoint({...f.store.endpoint(f.peer.id)!,address:path.join(f.endpoint.configHome!,'legacy','inbox.sock')});
+  f.claude.probe=async()=>({state:'reachable',nativeState:'alive',reasons:[],checked_at:Date.now()});
+  (f.claude as any).preflightRestart=async()=>{throw new BridgeError('claude_inbox_migration_unsupported','旧宿主不支持持久收件参数');};
+  await lifecycle(f.broker).schedulePairedRecovery(f.peer.id,false);
+  assert.equal(f.stopped(),0);assert.equal(f.store.peer(f.peer.id).state,'ready');assert.equal(f.store.endpoint(f.peer.id)?.active,true);
+  const value=lifecycle(f.broker).transportMigrations.get(f.peer.id)!;assert.equal(value.state,'unsupported');assert.equal(value.attempts,0);
+  assert.equal(f.broker.managedRecovery.get(f.peer.id),undefined);
+});
+
+for(const phase of ['stopping','launching'] as const)test('迁移在 '+phase+' 阶段中断后，原进程缺席由普通恢复接回原会话并保留原配置',async t=>{
+  const f=ownedFixture(t),life=lifecycle(f.broker),value=life.transportMigrations.observe(f.peer,f.pair.id,f.endpoint,['legacy'])!;
+  life.transportMigrations.rememberProfile(value,{model:'old-effective-model',effort:'low'});
+  life.transportMigrations.claim(value,f.peer,f.endpoint,f.pair.id);if(phase==='launching')life.transportMigrations.launching(value);
+  (life as {transportMigrations:TransportMigrations}).transportMigrations=new TransportMigrations(f.store);
+  f.store.deactivate(f.peer.id);f.store.updatePeer(f.peer.id,{state:'offline'});
+  let baseline:unknown;const wake=f.claude.wake.bind(f.claude);
+  (f.claude as any).wake=async(peer:Peer,endpoint:Endpoint,signal:AbortSignal,guard:()=>Promise<void>,affinity:any)=>{baseline=affinity.modelProfile;await wake(peer,endpoint,signal,guard);};
+  f.claude.probe=async()=>({state:'reachable',nativeState:'alive',reasons:[],checked_at:Date.now()});
+  const discover=f.claude.discover.bind(f.claude);
+  f.claude.discover=async id=>{const result=await discover(id);return{...result!,endpoint:{...result!.endpoint,address:path.join(f.endpoint.configHome!,'run','ci-recovered.sock'),configHome:f.endpoint.configHome,epoch:'recovered',procStart:'recovered'}};};
+  await life.schedulePairedRecovery(f.peer.id,false);
+  assert.deepEqual(baseline,{model:'old-effective-model',effort:'low'});assert.equal(f.claude.woken.length,1);
+  assert.equal(f.store.peer(f.peer.id).sessionId,f.peer.sessionId);assert.equal(f.store.pairFor(f.peer.id)?.id,f.pair.id);
+  assert.equal(f.broker.managedRecovery.get(f.peer.id)?.attempts.length,1);assert.equal(life.transportMigrations.get(f.peer.id)?.attempts,1);
+  await life.schedulePairedRecovery(f.peer.id,false);assert.equal(f.claude.woken.length,1);assert.equal(life.transportMigrations.get(f.peer.id)?.state,'ready');
+});
+
+test('迁移中断后的替代进程待核验时给出明确未知恢复状态，不重复启动或只留离线提示',async t=>{
+  const f=ownedFixture(t),life=lifecycle(f.broker),value=life.transportMigrations.observe(f.peer,f.pair.id,f.endpoint,['legacy'])!;
+  life.transportMigrations.claim(value,f.peer,f.endpoint,f.pair.id);life.transportMigrations.launching(value);
+  (life as {transportMigrations:TransportMigrations}).transportMigrations=new TransportMigrations(f.store);
+  f.store.deactivate(f.peer.id);f.store.updatePeer(f.peer.id,{state:'offline'});f.claude.fail=new BridgeError('claude_start_pending','上次原生启动的结果尚未核验');
+  await life.schedulePairedRecovery(f.peer.id,false);
+  assert.equal(f.claude.woken.length,0);assert.equal(f.broker.managedRecovery.get(f.peer.id)?.state,'unknown');
+  assert.equal(f.broker.managedRecovery.get(f.peer.id)?.attempts.length,0);
+  const status=f.broker.status() as any,peer=status.peers.find((peer:any)=>peer.id===f.peer.id);
+  assert.equal(peer.recovery.state,'unknown');assert.match(peer.recovery.user_step,/核对上次启动结果.*不要再次启动/);
+  assert.equal(peer.transport_migration.attempts,1);
+});
+
+test('迁移中断后替代会话已经核验登记时复用它，不再创建第二个后台',async t=>{
+  const f=ownedFixture(t),life=lifecycle(f.broker),value=life.transportMigrations.observe(f.peer,f.pair.id,f.endpoint,['legacy'])!;
+  life.transportMigrations.claim(value,f.peer,f.endpoint,f.pair.id);life.transportMigrations.launching(value);
+  (life as {transportMigrations:TransportMigrations}).transportMigrations=new TransportMigrations(f.store);
+  f.store.adopt(f.peer.id,{...registration('claude',f.peer.sessionId!),endpoint:{...f.endpoint,address:path.join(f.endpoint.configHome!,'run','ci-existing.sock'),epoch:'existing-replacement',procStart:'existing-replacement'}});
+  f.claude.probe=async()=>({state:'reachable',nativeState:'alive',reasons:[],checked_at:Date.now()});
+  await life.schedulePairedRecovery(f.peer.id,false);
+  assert.equal(f.claude.woken.length,0);assert.equal(f.claude.created.length,0);assert.equal(life.transportMigrations.get(f.peer.id)?.state,'ready');
+  assert.equal(f.broker.managedRecovery.get(f.peer.id),undefined);
 });

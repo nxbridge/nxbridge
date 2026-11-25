@@ -6,7 +6,7 @@ import { appendFileSync, writeFileSync } from 'node:fs';
 import { RpcClient } from '../ipc/rpc.js';
 import { Store } from '../storage/store.js';
 import { readSessionProfile, resumeSession, snapshotLiveSession } from '../hosts/codex/codex-session-profile.js';
-import { closeHostedWindow, hostingGate, hostingRecord, hostingStatus, SessionTransfers, writeHosting, profileVersionSupported } from '../broker/recovery/session-hosting.js';
+import { closeHostedWindow, hostingGate, hostingKey, hostingRecord, hostingStatus, SessionTransfers, writeHosting, profileVersionSupported } from '../broker/recovery/session-hosting.js';
 import { WindowRecovery } from '../broker/recovery/window-recovery.js';
 import { hostingArguments } from '../app/commands/hosting-command.js';
 import { managedCodexRegistration } from '../hosts/managed-registration.js';
@@ -197,6 +197,35 @@ for(const valid of [true,false])test('核验途中重启仅比较持久证据：
   const calls:string[]=[],rpc=new RpcClient(message=>{calls.push(message.method!);queueMicrotask(()=>rpc.receive({id:message.id,result:{thread:{id:'interrupted',path:file,status:{type:'idle'}},approvalPolicy:'on-request',approvalsReviewer:'user'}}));},()=>{});adapter.connect=async()=>rpc;t.after(()=>rpc.close());
   if(valid)await adapter.attach(store.peer(peer.id),endpoint);else await assert.rejects(adapter.attach(store.peer(peer.id),endpoint),{code:'policy_verification_failed'});
   assert.equal(!!runtimeFor(home,{peerId:peer.id})?.value.sessionVerification,!valid);assert.equal(calls.includes('thread/settings/update'),false);
+});
+
+test('原配置目录不符或门禁写入失败时保留精确核验证据，修复后继续原会话',async t=>{
+  const home=temporary(t),file=path.join(home,'history.jsonl'),sessionId='fixture-recovery',store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home);
+  const broker=new Broker(store,DEFAULT_CONFIG,{codex:adapter,claude:new FakeAdapter()} as unknown as Adapters,home);
+  t.after(async()=>{await broker.stop();store.close();});
+  const peer=store.register(registration('codex',sessionId));store.updatePeer(peer.id,{owner:'nxbridge'});
+  const partner=store.register(registration('claude','fixture-partner'));store.pair(partner.id,peer.id);
+  const endpoint=store.endpoint(peer.id)!;
+  writeFileSync(file,row('session_meta',{id:sessionId})+row('turn_context',{permission_profile:profile,model:'fixture-model',reasoning_effort:'high',service_tier:'priority'}),'utf8');
+  const settings=await readSessionProfile(file,sessionId),live={model:'fixture-model',reasoningEffort:'high',serviceTier:'priority',activePermissionProfile:{id:'fixture-permissions'}};
+  appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:sessionId,thread_settings:{permission_profile:profile}}),'utf8');
+  const runtimeId=randomUUID(),verification={sessionId,profile:{...settings,live},restartSourceId:randomUUID()};
+  saveManagedRuntime(home,{id:runtimeId,peerId:peer.id,sessionId,configHome:home,owner:managedMarker(home),kind:'owned',state:'ready',endpoint:endpoint.address,createdAt:Date.now(),sessionVerification:verification});
+  const resumeCalls:string[]=[];
+  const rpc=new RpcClient(message=>{if(message.method==='thread/resume')resumeCalls.push(message.method);queueMicrotask(()=>rpc.receive({id:message.id,result:{thread:{id:sessionId,path:file,status:{type:'idle'}},...live}}));},()=>{});
+  let detectedHome=temporary(t);
+  adapter.connect=async()=>{(adapter as any).configHomes.set(endpoint.address,detectedHome);return rpc;};t.after(()=>rpc.close());
+  await assert.rejects(adapter.attach(store.peer(peer.id),endpoint),{code:'original_home_changed'});
+  assert.equal(resumeCalls.length,0);assert.equal(hostingGate(store,store.peer(peer.id)),true);
+  detectedHome=home;
+  const setSetting=store.setSetting.bind(store);let failCommit=true;
+  store.setSetting=(key,value)=>{if(key===hostingKey(peer.id)&&(value as {verified?:boolean}).verified){assert.ok(runtimeFor(home,{id:runtimeId})?.value.sessionVerification);if(failCommit)throw new BridgeError('fixture_write_failed','模拟核验门禁写入失败');}setSetting(key,value);};
+  await assert.rejects(adapter.attach(store.peer(peer.id),endpoint),{code:'fixture_write_failed'});
+  assert.equal(hostingGate(store,store.peer(peer.id)),true);assert.ok(runtimeFor(home,{id:runtimeId})?.value.sessionVerification);
+  failCommit=false;
+  await adapter.attach(store.peer(peer.id),endpoint);
+  assert.equal(hostingGate(store,store.peer(peer.id)),false);assert.equal(runtimeFor(home,{id:runtimeId})?.value.sessionVerification,undefined);
+  assert.equal(resumeCalls.length,2);
 });
 
 test('普通冷恢复的核验门禁成功后解除，显式接管仍保留自己的门禁',t=>{

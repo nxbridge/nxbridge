@@ -1,6 +1,7 @@
 import type { FieldObservation } from './storage/observed-fields.js';
 export type Host = 'claude' | 'codex';
-export interface ModelProfile {model?:string;effort?:string|number}
+export interface ModelProfile {model?:string;effort?:string|number;serviceTier?:string}
+export type PartnerProfileSource='recommended'|'host'|'frozen';
 export type PeerState = 'ready' | 'busy' | 'needsHuman' | 'offline' | 'unknown' | 'paused' | 'starting';
 export type DeliveryState = 'accepted' | 'sending' | 'runtimeQueued' | 'held' | 'contextObserved' | 'responded' | 'refused' | 'expired' | 'unknown';
 export type PermissionClass = 'prompting' | 'bypass' | 'unknown';
@@ -63,6 +64,7 @@ export interface Peer {
   permission: PermissionClass;
   model?: string;
   effort?: string | number;
+  serviceTier?: string | null;
   updatedAt: number;
   stateSince?: number;
   activityAt?: number;
@@ -148,6 +150,7 @@ export interface RegisterInput {
   replyContract?: 1;
   model?: string | null;
   effort?: string | number | null;
+  serviceTier?: string | null;
   endpoint: Omit<Endpoint, 'peerId' | 'seenAt' | 'active'>;
   contextStart?: boolean;
   hookContextKey?: string;
@@ -183,7 +186,7 @@ export interface BridgeConfig {
   claudeSdkUserPrompt?: boolean;
   codexEndpoint?: string;
   codexAuthTokenEnv?: string;
-  partnerProfiles?: Partial<Record<Host, ModelProfile & {source?:'host'|'frozen'}>>;
+  partnerProfiles?: Partial<Record<Host, ModelProfile & {source?:PartnerProfileSource}>>;
   subagentSend: 'allow-verified' | 'deny';
   questionTimeoutMs?: number;
   syncTipMinutes: number;

@@ -64,6 +64,21 @@ test('正常双向发信回执由 nxbridge 承接投递，结构字段仍保留�
   }
 });
 
+test('专用 App Server 和共享 daemon 的实际地址缺失都明确报告，存活连接不能掩盖断开的入口',{skip:process.platform==='win32'},async t=>{
+  const directory=temporary(t),native=await processIdentity(process.pid),address='unix://'+path.join(directory,'missing-native.sock');
+  const peer={id:'codex-window',host:'codex',sessionId:'codex-window',cwd:directory,name:'Codex',owner:'user',state:'busy',parentId:null,updatedAt:Date.now(),permission:'prompting',kind:'root'} satisfies Peer;
+  for(const daemon of [false,true]){
+    const endpoint={...registration('codex',peer.sessionId).endpoint,mode:daemon?'embedded' as const:'app-server' as const,address,pid:native.pid,procStart:native.startedAt,active:true,seenAt:Date.now(),peerId:peer.id,...(daemon?{daemon:{address}}:{})};
+    const missing=await probePeerRuntime(peer,endpoint,undefined,async()=>true);
+    assert.equal(missing.state,'blocked');assert.equal(missing.nativeState,'alive');assert.equal(missing.deliveryIssue,'codex_socket_target_missing');
+    const changed=await probePeerRuntime(peer,{...endpoint,procStart:'different-generation'},undefined,async()=>true);
+    assert.equal(changed.deliveryIssue,undefined);
+  }
+  const f=fixture(t),incident=f.broker.incidents.failed(f.x,f.store.endpoint(f.x.id),new BridgeError('codex_socket_target_missing','原生入口缺失'));
+  assert.match(incident.userText,/这个 Codex 窗口.*消息发不进去.*会话本身正常/);
+  assert.match(incident.action!.text,/codex --no-daemon resume x/);assert.equal(incident.action!.owner,'user');
+});
+
 test('发送结果区分保存、受阻、unknown 和上下文证据；同调用不产生第二条任务',async t=>{
   const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id);f.store.updatePeer(f.x.id,{state:'offline'});
   f.codex.probe=async()=>availability('blocked');

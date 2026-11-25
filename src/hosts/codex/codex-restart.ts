@@ -5,21 +5,34 @@ import {BridgeError,describeError} from '../../shared/errors.js';
 import {type Endpoint,type Peer} from '../../types.js';
 import {readJson} from '../../shared/files.js';
 import {removeOwnedSocket} from '../../ipc/home.js';
-import { liveProcess, processIdentity } from '../../process/process.js';
+import { liveProcess, processIdentity, type ProcessIdentity } from '../../process/process.js';
 import type { RpcClient } from '../../ipc/rpc.js';
 import { readCodexThread } from './codex-evidence.js';
 import { ownedProcessState, stopOwnedProcess } from '../../process/process-stop.js';
-import { retireDeadOwnedProcess, ownedProcesses, ownedRecordState, releaseOwnedProcess } from '../../process/owned-processes.js';
-import { runtimeFor, removeManagedRuntime, saveManagedRuntime } from '../managed-runtimes.js';
+import { retireDeadOwnedProcess, ownedProcesses, ownedRecordState, releaseOwnedProcess, type OwnedProcessRecord } from '../../process/owned-processes.js';
+import { runtimeFor, removeManagedRuntime, saveManagedRuntime, type ManagedRuntime } from '../managed-runtimes.js';
+import { assertRuntimeWorkloadIdle, configuredMcpInfrastructure, mcpCommands, nxbridgeMcpCommands, nxbridgeRuntimeInfrastructure } from '../../process/runtime-workload.js';
 import type { TargetSelector } from '../../broker/pairing/admin-target.js';
 import { verifyDedicatedCodex } from './codex-isolation.js';
 import { codexThreadIdle } from './codex-thread-state.js';
 import { codexParent, codexSubagent } from './codex-lineage.js';
 import type { CodexThread } from './adapter.js';
+import { completeRestartProfile, prepareRestartProfile } from './codex-restart-profile.js';
 
 export interface CodexRestartResult {endpoint:string;oldPid:number;pid:number;resumed:any;notes?:string[]}
 export interface RestartSelector extends TargetSelector {partner?:true}
 interface Runtime {endpoint:string;pid:number;procStart?:string}
+interface CodexStopOptions {
+  peer:Peer;endpoint:Endpoint;home:string;connect:(address:string)=>Promise<RpcClient>;guard:()=>void;
+  profile?:SessionProfile;inspect?:(address:string)=>Promise<RpcClient>;verifyDelivery?:(thread:any)=>Promise<void>;observeThread?:(thread:any)=>void;onStopped?:()=>void;
+  borrowLostSocket?:(saved:ManagedRuntime,native:ProcessIdentity)=>Promise<RpcClient>;
+  beforeStop?:()=>void|Promise<void>;
+}
+
+function runtimeOwners(home:string,saved:ManagedRuntime):OwnedProcessRecord[]{
+  return ownedProcesses(home).records.filter(value=>value.proof.launchId===saved.id||saved.kind==='legacy'&&value.proof.launchId===saved.endpoint
+    ||value.role==='codex-runtime'&&value.identity.pid===saved.pid&&value.identity.startedAt===saved.procStart);
+}
 
 export function restartArguments(args:string[]):RestartSelector{
   if(args.length===2&&args[0]==='codex'&&args[1]==='--partner')return{partner:true};
@@ -107,42 +120,42 @@ async function durable(thread:any):Promise<void>{
   throw new BridgeError('history_not_persisted','末轮结束记录尚未落盘，未执行重启；请稍后重试。');
 }
 
-export async function restartCodexRuntime(options:{
-  peer:Peer;endpoint:Endpoint;home:string;connect:(address:string)=>Promise<RpcClient>;
-  start:()=>Promise<string>;guard:()=>void;profile?:SessionProfile;inspect?:(address:string)=>Promise<RpcClient>;verifyDelivery?:(thread:any)=>Promise<void>;observeThread?:(thread:any)=>void;onStopped?:()=>void;onVerifying?:(runtimeId:string,endpoint:string)=>void;onPolicy?:(policy:SessionPolicy,runtimeId:string,endpoint:string)=>void;
+export async function restartCodexRuntime(options:CodexStopOptions&{
+  start:()=>Promise<string>;onVerifying?:(runtimeId:string,endpoint:string)=>void;onPolicy?:(policy:SessionPolicy,runtimeId:string,endpoint:string)=>void;
 }):Promise<CodexRestartResult>{
   const stopped=await stopCodexRuntime(options),id=options.peer.sessionId!;
   try{
     const address=await options.start(),fresh=await options.connect(address);
     const pending=runtimeFor(options.home,{endpoint:address});if(!pending)throw new BridgeError('runtime_missing','新运行时缺少启动记录。');
-    pending.value.sessionVerification={sessionId:id,profile:stopped.profile};saveManagedRuntime(options.home,pending.value);
+    if(!pending.value.sessionVerification){pending.value.sessionVerification={sessionId:id,profile:stopped.profile};saveManagedRuntime(options.home,pending.value);}
     options.onVerifying?.(pending.value.id,address);
     const restored=await resumeSession(fresh,id,{profile:stopped.profile,home:options.endpoint.configHome,cwd:options.peer.cwd});
     const runtime=runtimeFor(options.home,{endpoint:address});if(!runtime?.value.pid)throw new BridgeError('runtime_missing','新运行时缺少已核验的进程记录。');
-    delete runtime.value.sessionVerification;saveManagedRuntime(options.home,runtime.value);
     options.onPolicy?.(restored.policy,runtime.value.id,address);
+    completeRestartProfile(options.home,runtime.value);delete runtime.value.sessionVerification;saveManagedRuntime(options.home,runtime.value);
     return{endpoint:address,oldPid:stopped.oldPid,pid:runtime.value.pid,resumed:restored.resumed,notes:stopped.notes};
   }catch(error){throw new BridgeError('restart_incomplete',`旧托管进程已停止，但原会话 ${id} 未完整恢复；已暂停自动投递。原因：`+describeError(error));}
 }
 
                                               
-export async function stopCodexRuntime(options:{
-  peer:Peer;endpoint:Endpoint;home:string;connect:(address:string)=>Promise<RpcClient>;guard:()=>void;
-  profile?:SessionProfile;inspect?:(address:string)=>Promise<RpcClient>;verifyDelivery?:(thread:any)=>Promise<void>;observeThread?:(thread:any)=>void;onStopped?:()=>void;
-}):Promise<{oldPid:number;notes:string[];profile:SessionProfile}>{
+export async function stopCodexRuntime(options:CodexStopOptions):Promise<{oldPid:number;notes:string[];profile:SessionProfile}>{
   const {peer,endpoint,home,connect,guard}=options,id=peer.sessionId!,record=runtimeFor(home,{endpoint:endpoint.address});
   if(!record)throw new BridgeError('unowned_runtime','没有 nxbridge 托管运行时记录，未执行重启；用户 daemon 或远程宿主需要原生重载。');
   const filename=record.file,saved=record.value;
-  if(saved.pid&&saved.procStart&&await ownedProcessState({pid:saved.pid,startedAt:saved.procStart})==='alive')await verifyDedicatedCodex(saved.endpoint,await processIdentity(saved.pid));
+  if(!options.borrowLostSocket&&saved.pid&&saved.procStart&&await ownedProcessState({pid:saved.pid,startedAt:saved.procStart})==='alive')await verifyDedicatedCodex(saved.endpoint,await processIdentity(saved.pid));
   if(ownedProcesses(home).records.some(r=>r.releasedToUser&&(r.identity.pid===saved.pid||r.proof.launchId===saved.id||r.proof.launchId===saved.endpoint)))throw new BridgeError('shared_runtime','这个 App Server 还有你的窗口在用，nxbridge 不会重启它。请在对应的 Codex 窗口里退出后重新打开。');
   const verify=async()=>{
-    const current=existsSync(filename)?readJson<Runtime>(filename):undefined;
-    if(!current||current.pid!==saved.pid||current.procStart!==saved.procStart||current.endpoint!==saved.endpoint)throw new BridgeError('runtime_changed','运行时归属记录已经变化，未执行重启。');
+    const current=existsSync(filename)?readJson<ManagedRuntime>(filename):undefined;
+    if(!current||current.pid!==saved.pid||current.procStart!==saved.procStart||current.endpoint!==saved.endpoint
+      ||(options.beforeStop||options.borrowLostSocket)&&(current.id!==saved.id||current.owner!==saved.owner||current.peerId!==peer.id||current.sessionId&&current.sessionId!==id))
+      throw new BridgeError('runtime_changed','运行时归属记录已经变化，未执行重启。');
     if(saved.endpoint!==endpoint.address||!saved.pid||!saved.procStart||!liveProcess(saved.pid))throw new BridgeError('unowned_runtime','目标不是当前可核验的 nxbridge 托管进程，未执行重启。');
     const identity=await processIdentity(saved.pid);
     if(identity.startedAt!==saved.procStart||!/^codex(?:\.exe)?$/i.test(identity.name))throw new BridgeError('unowned_runtime','无法核验托管 App Server 的进程代次，未执行重启。');
+    return identity;
   };
-  await verify();const rpc=await(options.inspect??connect)(endpoint.address);
+  const originalNative=await verify();
+  const rpc=options.borrowLostSocket?await options.borrowLostSocket(saved,originalNative):await(options.inspect??connect)(endpoint.address);
   try{
   const inspectThread=(thread:any,allowUnloaded=false)=>{options.observeThread?.(thread);idle(thread,allowUnloaded);};
   await assertCodexRuntimeScope(rpc,id);
@@ -159,7 +172,23 @@ export async function stopCodexRuntime(options:{
   try{
     await assertCodexRuntimeScope(rpc,id);
     inspectThread(await readCodexThread(rpc,id),true);
+    let owners:OwnedProcessRecord[]|undefined;
+    if(options.beforeStop||options.borrowLostSocket){
+      const config=(await rpc.request('config/read',{cwd:peer.cwd},{timeout:3000})).config;
+      const commands=[...mcpCommands(config?.mcp_servers),...(saved.configHome?nxbridgeMcpCommands(home,'codex',saved.configHome):[])];
+      const native=await verify();
+      owners=runtimeOwners(home,saved);
+      await assertRuntimeWorkloadIdle({native,owners,infrastructure:async candidate=>await nxbridgeRuntimeInfrastructure(home,candidate)||configuredMcpInfrastructure(native,commands,candidate)});
+      await assertNoPendingCodexWork(rpc,id,{allowUnloaded:unloaded});
+      if(options.borrowLostSocket&&await options.borrowLostSocket(saved,native)!==rpc)
+        throw new BridgeError('codex_socket_idle_unverified','原连接在空闲核验后发生变化，未停止原会话。');
+      if(!options.borrowLostSocket)await verifyDedicatedCodex(saved.endpoint,native);
+    }
     guard();
+    const preserve=options.beforeStop||options.borrowLostSocket?prepareRestartProfile(home,saved,profile):undefined;
+    if(options.beforeStop){await options.beforeStop();guard();}
+    if(rpc.closed)throw new BridgeError('disconnected','原生连接在停止前断开，未停止原会话。');
+    preserve?.();
     stopSubmitted=true;
     await stopOwnedProcess({pid:saved.pid!,startedAt:saved.procStart!},{timeout:15000});
     options.onStopped?.();
@@ -168,7 +197,7 @@ export async function stopCodexRuntime(options:{
     if(current.pid!==saved.pid||current.procStart!==saved.procStart||current.endpoint!==saved.endpoint)throw new BridgeError('runtime_changed','运行时记录已被其他操作更新，停止自动恢复；原会话 ID 保留。');
     const notes:string[]=[];
     try{await removeOwnedSocket(home,saved.endpoint);}catch(error){notes.push('旧 socket 清理未完成：'+describeError(error));}
-    for(const proof of ownedProcesses(home).records.filter(value=>value.proof.launchId===saved.id||value.proof.launchId===saved.endpoint||value.role==='codex-runtime'&&value.identity.pid===saved.pid).sort((a,b)=>Number(!!(b.windowsJob||b.posixGroup))-Number(!!(a.windowsJob||a.posixGroup))||b.createdAt-a.createdAt))if(await ownedRecordState(proof)==='dead')await retireDeadOwnedProcess(proof);else await releaseOwnedProcess(proof);
+    for(const proof of (owners??runtimeOwners(home,saved)).sort((a,b)=>Number(!!(b.windowsJob||b.posixGroup))-Number(!!(a.windowsJob||a.posixGroup))||b.createdAt-a.createdAt))if(await ownedRecordState(proof)==='dead')await retireDeadOwnedProcess(proof);else await releaseOwnedProcess(proof);
     removeManagedRuntime(record);
     return{oldPid:saved.pid!,notes,profile};
   }catch(error){if(!stopSubmitted)throw error;throw new BridgeError('restart_incomplete',`旧托管进程已收到停止请求，但原会话 ${id} 未完整恢复；已暂停目标自动投递，请检查原宿主后再恢复。原因：`+describeError(error));}

@@ -128,7 +128,7 @@ test('模型和 effort 输入不限定模型列表，拒绝空值；零值及逐
 test('创建时只指定一个字段仍逐字段继承默认值；明确拒绝不拦住原会话',async t=>{
   const f=owned(t);f.broker.config.partnerProfiles={codex:{model:'default',effort:'high'}};
   const fresh=f.store.placeholder('codex',f.c.cwd);f.broker.profiles.set(fresh,{model:'picked'});
-  assert.deepEqual(f.broker.profiles.requested(fresh),{model:'picked',effort:'high'});
+  assert.deepEqual(f.broker.profiles.requested(fresh),{model:'picked',effort:'high',serviceTier:'standard'});
   (f.codex as any).setProfile=async()=>{throw Object.assign(Error('宿主拒绝参数'),{code:-32602});};
   const result=await f.broker.dispatch('partner.profile',{actor,action:'set',model:'rejected'}) as any;
   assert.equal(result.status,'failed');assert.equal(result.delivery_held,false);assert.equal(result.effective.model,'old');
@@ -175,6 +175,32 @@ test('新 Codex 启动和安全权限降级都保留模型与 effort；不采用
   assert.equal(requests[1]!.params.approvalPolicy,ownedCodexPolicy('bypass').approvalPolicy);
   (rpc as any).request=async(method:string)=>method==='thread/start'?{thread:{id:'wrong'},model:'wrong',approvalPolicy:'never',approvalsReviewer:'user',sandbox:{type:'dangerFullAccess'}}:{};
   await assert.rejects(startOwnedCodex(rpc,'/project','bypass',undefined,undefined,{model:'chosen'}),{code:'profile_verification_failed'});
+});
+
+test('Codex 标准档明确覆盖宿主档位，未采用时清理空线程并报告失败',async()=>{
+  const calls:{method:string;params:any}[]=[];
+  const rpc={request:async(method:string,params:any)=>{calls.push({method,params});if(method==='thread/start')return{thread:{id:'new'},serviceTier:params.serviceTier==='default'?'default':null,approvalPolicy:'never',approvalsReviewer:'user',sandbox:{type:'dangerFullAccess'}};if(method==='thread/loaded/list')return{data:[]};return{};}} as RpcClient;
+  await startOwnedCodex(rpc,'/project','bypass',undefined,undefined,{serviceTier:'standard'});
+  assert.equal(calls[0]!.params.serviceTier,'default');
+  calls.length=0;
+  await assert.rejects(startOwnedCodex(rpc,'/project','bypass',undefined,undefined,{serviceTier:'fast'}),{code:'profile_service_tier_unavailable',message:/新会话已撤掉/});
+  assert.equal(calls[0]!.params.serviceTier,'priority');
+  assert.equal(calls.some(call=>call.method==='thread/delete'&&call.params.threadId==='new'),true);
+  assert.equal(calls.filter(call=>call.method==='thread/start').length,1);
+  const request=rpc.request.bind(rpc);
+  rpc.request=async(method,params,options)=>{if(method==='thread/delete')throw Error('无法删除空线程');return request(method,params,options);};
+  await assert.rejects(startOwnedCodex(rpc,'/project','bypass',undefined,undefined,{serviceTier:'fast'}),(error:Error)=>!error.message.includes('新会话已撤掉')&&/空线程尚未确认卸载/.test(error.message));
+});
+
+test('只给原生明确拒绝的新搭档推荐模型附上换模型提示',t=>{
+  const home=temporary(t),store=new Store(':memory:'),profiles=new PartnerProfiles(store,home,DEFAULT_CONFIG);t.after(()=>store.close());
+  const peer=store.placeholder('codex',home);profiles.initialize(peer);
+  const rejection=Object.assign(Error('model gpt-6.2-sol is not available'),{code:-32602});
+  assert.match((profiles.launchError(peer,rejection) as Error).message,/nxbridge config set partners\.codex\.profile_source host/);
+  const network=Object.assign(Error('model gpt-6.2-sol is not available after network timeout'),{code:'timeout'});
+  assert.equal(profiles.launchError(peer,network),network);
+  assert.equal(profiles.launchError({...peer,sessionId:'existing'},rejection),rejection);
+  profiles.set(peer,{model:'gpt-6.2-sol'});assert.equal(profiles.launchError(peer,rejection),rejection);
 });
 
 test('提交边界区分读取失败与提交后回读失败，不让 RPC 缺省 uncertain=false 丢掉不确定性',()=>{
@@ -276,7 +302,7 @@ test('明确指定创建设置时替换已启动预备成员，回收旧后台�
   const choice={actor:sender,selection_id:view.selection_id,action:'create',model:'chosen',effort:'high'};
   const result=await f.broker.dispatch('pair.selection.commit',choice) as any;
   const target=f.store.peer(f.store.pairFor(f.c.id)!.codex);assert.notEqual(target.id,provisional.id);
-  assert.deepEqual(f.broker.profiles.requested(target),{model:'chosen',effort:'high'});
+  assert.deepEqual(f.broker.profiles.requested(target),{model:'chosen',effort:'high',serviceTier:'standard'});
   assert.equal(f.codex.released.some(peer=>peer.id===provisional.id),true);
   assert.deepEqual(await f.broker.dispatch('pair.selection.commit',choice),result);assert.equal(f.store.messages().length,1);assert.equal(f.store.messages()[0]!.body,'唯一的原草稿');
 });
@@ -305,7 +331,7 @@ test('已生效或缺省成员的重复状态事件不产生数据库写入',t=>
 test('新 Codex 的身份登记晚于创建，后台阶段仍可只读核验并解除首轮暂停',async t=>{
   const f=owned(t),peer=f.store.placeholder('codex',f.c.cwd);f.broker.profiles.set(peer,{model:'chosen',effort:'high'});
   f.store.adopt(peer.id,registration('codex','late-codex'));
-  let reads=0;(f.codex as any).readProfile=async()=>{reads++;return{model:'chosen',effort:'high'};};
+  let reads=0;(f.codex as any).readProfile=async()=>{reads++;return{model:'chosen',effort:'high',serviceTier:'standard'};};
   await (f.broker as any).profileCoordination.verifyInitial(f.store.peer(peer.id));
   assert.equal(reads,1);assert.equal(f.broker.profiles.blocks(f.store.peer(peer.id)),false);
 });
@@ -318,7 +344,7 @@ test('首次设置回读的拥塞或能力错误保持等待，不能误报为�
     await (f.broker as any).profileCoordination.verifyInitial(f.store.peer(peer.id));
     assert.equal(f.broker.profiles.intent(peer)?.status,'pending');assert.equal(f.broker.profiles.intent(peer)?.error?.code,code);assert.equal(f.broker.profiles.blocks(f.store.peer(peer.id)),true);
   }
-  (f.codex as any).readProfile=async()=>({model:'chosen',effort:'high'});
+  (f.codex as any).readProfile=async()=>({model:'chosen',effort:'high',serviceTier:'standard'});
   await (f.broker as any).profileCoordination.verifyInitial(f.store.peer(peer.id));assert.equal(f.broker.profiles.blocks(f.store.peer(peer.id)),false);
 });
 

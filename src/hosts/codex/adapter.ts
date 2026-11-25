@@ -6,7 +6,8 @@ import {openSync,closeSync,readSync} from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { codexThreadIdle } from './codex-thread-state.js';
-import { profileChangeFailure } from '../../broker/profiles/partner-profile.js';
+import { profileChangeFailure, type EffectiveModelProfile } from '../../broker/profiles/partner-profile.js';
+import { nativeServiceTier, observedServiceTier } from './codex-service-tier.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawnPosixSupervisor, posixSupervisorExit } from '../../process/posix/posix-supervisor.js';
 import { RpcClient, clearRpcFaults, type RpcMessage } from '../../ipc/rpc.js';
@@ -18,10 +19,11 @@ import {sameDirectory} from '../../shared/files.js';
 import {bridgeHome} from '../../shared/local-paths.js';
 import {delay} from '../../shared/time.js';
 import {removeOwnedSocket,socketDirectory} from '../../ipc/home.js';
+import {codexSocketTargetMissing,currentCodexSocketAlias,proveUnixCodexSocket,type UnixSocketProof} from '../../ipc/unix-socket.js';
 import {spawnCli} from '../../process/host-command.js';
-import {processIdentity} from '../../process/process.js';
+import {processIdentity,type ProcessIdentity} from '../../process/process.js';
 import { assertCodexRuntimeScope, restartCodexRuntime, type CodexRestartResult } from './codex-restart.js';
-import {prepareOwnedLaunch,recordHostLaunch,spawnSelectedHost} from '../host-launch.js';
+import {prepareOwnedLaunch,recordHostLaunch,spawnSelectedHost,type HostLaunch} from '../host-launch.js';
 import { nativeDescendant } from '../../process/process.js';
 import { providerRetryInfo } from '../../broker/health/turn-health.js';
 import {probeAppServer,probePeerRuntime} from '../../broker/health/probe.js';
@@ -31,7 +33,11 @@ import {ownedProcessState} from '../../process/process-stop.js';
 import { managedMarker } from '../../install/installation.js';
 import { managedRuntimes, runtimeFor, saveManagedRuntime, removeManagedRuntime, managedRuntimeState, managedRuntimeNativeState, managedRuntimeToken,createRuntimeToken,localCodexEndpoint,assertManagedRuntimeEndpoint,type ManagedRuntime, type RuntimeRecord } from '../managed-runtimes.js';
 import { launchIndependentWindows } from '../../process/windows/windows-background.js';
-import { requireDedicatedCodex, verifyDedicatedCodex, requireRestoreBootstrap, CODEX_RESTORE_BOOTSTRAP } from './codex-isolation.js';
+import { requireDedicatedCodex, verifyDedicatedCodex, verifyDedicatedCodexArguments, requireRestoreBootstrap, CODEX_RESTORE_BOOTSTRAP } from './codex-isolation.js';
+import {hookTrustFromList} from './codex-hook-trust.js';
+import {configClient} from './stdio-codex.js';
+import {persistentSocketDirectory} from '../../process/posix/persistent-socket-directory.js';
+import {completeRestartProfile,pendingRestartVerification} from './codex-restart-profile.js';
 import { selectSessionLaunch } from '../session-launch.js';
 import { recordManagedSessionLaunch } from '../launch-profiles.js';
 import { restoreState } from '../../broker/pairing/pair-restore.js';
@@ -46,6 +52,13 @@ import { codexParent, codexSubagent, codexUserWindow } from './codex-lineage.js'
 import { codexThreadState } from './codex-thread-state.js';
 import { queueCodexWake } from './queue-wake.js';
 import type { CodexTurnOriginProvider } from './codex-turn-origin.js';
+
+interface PreparedRuntimeLaunch {launch:HostLaunch;authenticatedLoopback:boolean}
+export interface CodexRestartOptions {
+  identityMigration?:boolean;verificationRecovery?:boolean;lostSocketRecovery?:boolean;requesterSession?:string;
+  verifyDelivery?:(thread:CodexThread)=>Promise<void>;beforeStop?:()=>void|Promise<void>;beforeLaunch?:()=>void|Promise<void>;
+}
+interface AppServerConnectionProof {runtimeId:string;image:string;socket:UnixSocketProof}
 
 export interface CodexThread {
   id:string;cwd:string;name?:string;ephemeral?:boolean;parentThreadId?:string|null;forkedFromId?:string|null;threadSource?:string;path?:string;
@@ -159,15 +172,16 @@ async function deliveryStep<T>(work:()=>Promise<T>,signal?:AbortSignal,uncertain
   });}finally{signal.removeEventListener('abort',abort);}
 }
 
-interface CodexRuntimeProfile extends Pick<CodexThread,'model'|'reasoningEffort'> {approvalPolicy?:unknown;approvalsReviewer?:unknown;autoReviewEnabled?:boolean;sandbox?:{type?:string}}
+interface CodexRuntimeProfile extends Pick<CodexThread,'model'|'reasoningEffort'> {serviceTier?:string|null;approvalPolicy?:unknown;approvalsReviewer?:unknown;autoReviewEnabled?:boolean;sandbox?:{type?:string}}
 
 export function threadRegistration(thread:CodexThread,endpoint:string,profile:CodexRuntimeProfile={}):RegisterInput|undefined{
   if(thread.ephemeral)return undefined;
   const parent=codexParent(thread);
   const model=profile.model===undefined?thread.model:profile.model,effort=profile.reasoningEffort===undefined?thread.reasoningEffort:profile.reasoningEffort;
+  const serviceTier=observedServiceTier(profile.serviceTier);
   const evidence:CodexPermissionEvidence=codexRuntimeEvidence(profile);
   return {host:'codex',sessionId:thread.id,cwd:thread.cwd,name:thread.name??'Codex',kind:codexSubagent(thread)?'subagent':thread.forkedFromId?'fork':'root',parentId:parent,
-    ...(model===undefined?{}:{model}),...(effort===undefined?{}:{effort}),
+    ...(model===undefined?{}:{model}),...(effort===undefined?{}:{effort}),...(serviceTier===undefined?{}:{serviceTier}),
     state:codexThreadState(thread),
     endpoint:{mode:'app-server',address:endpoint,epoch:endpoint,pid:null,procStart:null,...(thread.path?{nativeSession:{transcriptPath:thread.path}}:{}),...(Object.keys(evidence).length?{codexPermission:evidence}:{})}};
 }
@@ -184,6 +198,7 @@ export class CodexAdapter extends EventEmitter {
   }
   private requireMember(id?:string):void{if(id&&this.disabledMembers.has(id))throw new BridgeError('member_disabled','此成员的 nxbridge 已关闭，未访问原生宿主。');}
   private clients=new Map<string,RpcClient>();
+  private connectionProofs=new WeakMap<RpcClient,AppServerConnectionProof>();
   rpcMetrics(){return[...this.clients.values()].reduce((sum,rpc)=>({connections:sum.connections+1,responses:sum.responses+rpc.metrics.responses,bytes:sum.bytes+rpc.metrics.bytes,parseMs:sum.parseMs+rpc.metrics.parseMs,largestBytes:Math.max(sum.largestBytes,rpc.metrics.largestBytes),timeouts:sum.timeouts+rpc.metrics.timeouts,rejected:sum.rejected+rpc.metrics.rejected}),{connections:0,responses:0,bytes:0,parseMs:0,largestBytes:0,timeouts:0,rejected:0});}
   private connecting=new Map<string,Promise<RpcClient>>();
   private attached=new Set<string>();
@@ -222,7 +237,16 @@ export class CodexAdapter extends EventEmitter {
     const existing=this.clients.get(endpoint);if(existing&&!existing.closed)return existing;
     const pending=this.connecting.get(endpoint);if(pending)return pending;
     const ready=(async()=>{
-      const rpc=await connectAppServer(endpoint,this.config,this.tokens.get(endpoint),this.home);clearRpcFaults(endpoint);this.clients.set(endpoint,rpc);
+      const proof=await this.prepareConnectionProof(endpoint);
+      const rpc=await connectAppServer(endpoint,this.config,this.tokens.get(endpoint),this.home);
+      if(proof)try{
+        const live=await processIdentity(proof.socket.pid),current=runtimeFor(this.home,{endpoint})?.value;
+        if(!rpc.closed&&current?.id===proof.runtimeId&&current.pid===live.pid&&current.procStart===live.startedAt
+          &&live.startedAt===proof.socket.generation&&live.image===proof.image&&currentCodexSocketAlias(proof.socket))
+          this.connectionProofs.set(rpc,proof);
+      }catch{                                          }
+      if(rpc.closed)throw new BridgeError('disconnected','原生连接在确认进程代次时断开。');
+      clearRpcFaults(endpoint);this.clients.set(endpoint,rpc);
       rpc.on('notification',(message:RpcMessage)=>this.notify(endpoint,message));
       try{const value=await rpc.request('config/read',{includeLayers:true},{timeout:3000}),user=value.layers?.find((layer:any)=>layer.name?.type==='user'&&typeof layer.name.file==='string');if(user)this.configHomes.set(endpoint,path.dirname(user.name.file));this.emit('providerRetries',{address:endpoint,budget:providerRetryInfo(value.config)});}catch{}
       rpc.on('request',(message:RpcMessage)=>{
@@ -241,6 +265,30 @@ export class CodexAdapter extends EventEmitter {
       return rpc;}catch(error){rpc.close();throw error;}
     })();
     this.connecting.set(endpoint,ready);try{return await ready;}finally{this.connecting.delete(endpoint);}
+  }
+  private async prepareConnectionProof(endpoint:string):Promise<AppServerConnectionProof|undefined>{
+    if(process.platform!=='darwin'||!endpoint.startsWith('unix://'))return;
+    try{
+      const runtime=runtimeFor(this.home,{endpoint})?.value;
+      if(runtime?.kind!=='owned'||!runtime.peerId||runtime.state==='failed'||!runtime.pid||!runtime.procStart)return;
+      const native=await processIdentity(runtime.pid);
+      if(!native.image||native.startedAt!==runtime.procStart)return;
+      await verifyDedicatedCodexArguments(endpoint,native);
+      const socket=await proveUnixCodexSocket(endpoint.slice(7),native);
+      if(currentCodexSocketAlias(socket))return{runtimeId:runtime.id,image:native.image,socket};
+    }catch{                               }
+  }
+  private async borrowLostConnection(peer:Peer,endpoint:Endpoint,runtime:ManagedRuntime,native:ProcessIdentity):Promise<RpcClient>{
+    const unavailable=()=>new BridgeError('codex_socket_idle_unverified','Codex 物理连接文件已丢失，无法从既有可信连接核验原生空闲及归属，保留原会话。');
+    const rpc=this.clients.get(endpoint.address),proof=rpc&&this.connectionProofs.get(rpc),identity=endpoint.native??endpoint;
+    if(process.platform!=='darwin'||peer.owner!=='nxbridge'||endpoint.daemon||runtime.kind!=='owned'||runtime.peerId!==peer.id
+      ||runtime.state!=='ready'||runtime.sessionId&&runtime.sessionId!==peer.sessionId||endpoint.runtimeId!==runtime.id
+      ||!rpc||rpc.closed||!proof||proof.runtimeId!==runtime.id||native.pid!==identity.pid||native.startedAt!==identity.procStart
+      ||proof.socket.pid!==native.pid||proof.socket.generation!==native.startedAt||proof.image!==native.image
+      ||!codexSocketTargetMissing(endpoint.address.slice(7),proof.socket))throw unavailable();
+    await verifyDedicatedCodexArguments(endpoint.address,native);
+    if(rpc.closed||this.clients.get(endpoint.address)!==rpc||!codexSocketTargetMissing(endpoint.address.slice(7),proof.socket))throw unavailable();
+    return rpc;
   }
   async discoverLoaded(endpoint:string,rpc=this.clients.get(endpoint)):Promise<void>{
     if(!rpc||rpc.closed)return;let cursor:string|undefined;
@@ -349,28 +397,33 @@ export class CodexAdapter extends EventEmitter {
         if(current.thread?.status?.type!=='notLoaded')return rpc;
       }
       this.invalidated.delete(key);
-      let result:any,subscribed=true,revision=this.nativeStateRevision;
+      let result:any,subscribed=true,revision=this.nativeStateRevision,verifying=false;
       try{
         const runtime=runtimeFor(this.home,{endpoint:endpoint.address})?.value;
         let live:any;
         if(peer.owner==='nxbridge'&&runtime?.kind==='owned'&&runtime.peerId===peer.id)live=(await rpc.request('thread/read',{threadId:peer.sessionId,includeTurns:false})).thread;
         if(peer.owner==='nxbridge'&&runtime?.kind==='owned'&&runtime.peerId===peer.id&&(live?.status?.type==='notLoaded'||runtime.sessionVerification)){
+          verifying=true;
           const original=runtime.sessionVerification?.profile??await readSessionProfile(live?.path??sessionFile(endpoint.configHome??this.configHomes.get(endpoint.address)??'',peer.sessionId!),peer.sessionId!);
           runtime.sessionVerification??={sessionId:peer.sessionId!,profile:original};saveManagedRuntime(this.home,runtime);
-          this.emit('sessionVerifying',{memberId:peer.id,sessionId:peer.sessionId,runtimeId:runtime.id,endpoint:endpoint.address});
           this.verifying.add(key);
           try{
+            this.emit('sessionVerifying',{memberId:peer.id,sessionId:peer.sessionId,runtimeId:runtime.id,endpoint:endpoint.address});
+            const detectedHome=this.configHomes.get(endpoint.address);
+            if(runtime.sessionVerification?.restartSourceId&&runtime.configHome&&detectedHome&&!sameDirectory(detectedHome,runtime.configHome))
+              throw new BridgeError('original_home_changed','替代 Codex 进程使用了不同的配置目录，未加载原会话。');
             revision=this.nativeStateRevision;
             const restored=live?.status?.type==='notLoaded'?await resumeSession(rpc,peer.sessionId!,{profile:original,file:original.file,home:endpoint.configHome??this.configHomes.get(endpoint.address),cwd:peer.cwd}):await verifyResumedSession(rpc,peer.sessionId!,original);
-            delete runtime.sessionVerification;saveManagedRuntime(this.home,runtime);
-            result=restored.resumed;this.emit('sessionPolicy',{memberId:peer.id,sessionId:peer.sessionId,runtimeId:runtime.id,policy:restored.policy});
+            this.emit('sessionPolicy',{memberId:peer.id,sessionId:peer.sessionId,runtimeId:runtime.id,policy:restored.policy});
+            completeRestartProfile(this.home,runtime);delete runtime.sessionVerification;saveManagedRuntime(this.home,runtime);
+            result=restored.resumed;
           }catch(error){this.emit('sessionVerificationFailed',{memberId:peer.id,sessionId:peer.sessionId,runtimeId:runtime.id,error:{code:error instanceof BridgeError?error.code:'policy_verification_failed',message:describeError(error)}});throw error;}finally{this.verifying.delete(key);}
         }else{revision=this.nativeStateRevision;result=await rpc.request('thread/resume',{threadId:peer.sessionId,excludeTurns:true});}
       }
       catch(error){
                                                          
                                            
-        if(!(error instanceof Error)||!['no rollout found','list_turns is not supported yet'].some(reason=>error.message.includes(reason)))throw error;
+        if(verifying||!(error instanceof Error)||!['no rollout found','list_turns is not supported yet'].some(reason=>error.message.includes(reason)))throw error;
         let cursor:string|undefined,loaded=false;
         do{this.requireMember(peer.id);const page=await rpc.request('thread/loaded/list',{limit:100,...(cursor?{cursor}:{})});loaded=(page.data??[]).some((id:any)=>(typeof id==='string'?id:id.id)===peer.sessionId);cursor=page.nextCursor??undefined;}while(cursor&&!loaded);
         if(!loaded)throw error;
@@ -509,13 +562,40 @@ export class CodexAdapter extends EventEmitter {
   async resumeForeground(endpoint:string,configHome:string):Promise<void>{
     this.configHomes.set(endpoint,configHome);await this.connect(endpoint);await this.discoverLoaded(endpoint);
   }
-  async restart(peer:Peer,endpoint:Endpoint,guard:()=>void,options:{identityMigration?:boolean;verificationRecovery?:boolean;requesterSession?:string;verifyDelivery?:(thread:CodexThread)=>Promise<void>}={}):Promise<CodexRestartResult>{
+  async restart(peer:Peer,endpoint:Endpoint,guard:()=>void,options:CodexRestartOptions={}):Promise<CodexRestartResult>{
     this.requireMember(peer.id);
     if(this.restarting.has(peer.id)||this.starting.has(peer.id))throw new BridgeError('restart_in_progress','目标托管运行时正在启动或重启，请稍后重试。');
     const original=runtimeFor(this.home,{endpoint:endpoint.address})?.value,interrupted=options.verificationRecovery?original:undefined;
     if(options.verificationRecovery&&(peer.owner!=='nxbridge'||!interrupted?.dedicated||interrupted.peerId!==peer.id||interrupted.sessionVerification?.sessionId!==peer.sessionId))throw new BridgeError('unowned_runtime','缺少待核验原线程的独占运行时证明，未停止任何进程。');
+    const automatic=options.beforeStop!==undefined||options.lostSocketRecovery===true;
+    if(automatic&&(options.identityMigration||options.verificationRecovery||peer.owner!=='nxbridge'||!peer.sessionId
+      ||original?.kind!=='owned'||original.peerId!==peer.id||!original.configHome||original.sessionVerification||endpoint.daemon))
+      throw new BridgeError('unowned_runtime','当前会话缺少可核验的独立运行时，未自动关闭。');
     const revision=this.nativeStateRevision;
-    const work=restartCodexRuntime({peer,endpoint,home:this.home,connect:address=>this.connect(address),...(interrupted?.sessionVerification?{profile:interrupted.sessionVerification.profile}:{}),verifyDelivery:options.verifyDelivery,onStopped:()=>this.emit('runtimeStopped',endpoint),...(options.identityMigration?{inspect:(address:string)=>connectAppServer(address,this.config,this.tokens.get(address),this.home,{readOnly:true}),observeThread:(thread:CodexThread)=>{const state=threadRegistration(thread,endpoint.address)?.state;if(state)this.emit('state',thread.id,state,endpoint.address);}}:{}),start:()=>this.ensureEndpointInner(peer.cwd,peer.id,peer.sessionId??undefined,endpoint.configHome,options.requesterSession,undefined,original),guard,onVerifying:(runtimeId,address)=>this.emit('sessionVerifying',{memberId:peer.id,sessionId:peer.sessionId,runtimeId,endpoint:address}),onPolicy:(policy,runtimeId)=>this.emit('sessionPolicy',{memberId:peer.id,sessionId:peer.sessionId,runtimeId,policy})});
+    const work=(async()=>{
+      let prepared:PreparedRuntimeLaunch|undefined;
+      if(automatic){
+        guard();
+        if(options.lostSocketRecovery){
+          if(!original!.pid)throw new BridgeError('codex_socket_idle_unverified','物理连接文件已丢失，缺少原生进程证据，保留原会话。');
+          await this.borrowLostConnection(peer,endpoint,original!,await processIdentity(original!.pid));
+        }
+        prepared=await this.prepareRuntimeLaunch(peer.cwd,peer.id,peer.sessionId!,original!.configHome,options.requesterSession,original);
+        const control=await configClient(this.config,this.home,prepared.launch);
+        try{
+          const result=await control.request('hooks/list',{cwds:[peer.cwd]},{timeout:5000});
+          if(hookTrustFromList((result.data??[]).flatMap((row:{hooks?:[]})=>row.hooks??[]))==='required')
+            throw new BridgeError('trust_required','所选 Codex 的 nxbridge hooks 需要重新信任，未停止原会话。');
+        }finally{await control.close();}
+        if(process.platform!=='win32')persistentSocketDirectory(this.home,'ps-XXXXXX/native.sock');
+        if(!prepared.authenticatedLoopback)await socketDirectory(this.home);
+        guard();
+      }
+      return restartCodexRuntime({peer,endpoint,home:this.home,connect:address=>this.connect(address),...(interrupted?.sessionVerification?{profile:interrupted.sessionVerification.profile}:{}),verifyDelivery:options.verifyDelivery,onStopped:()=>this.emit('runtimeStopped',endpoint),...(options.identityMigration?{inspect:(address:string)=>connectAppServer(address,this.config,this.tokens.get(address),this.home,{readOnly:true}),observeThread:(thread:CodexThread)=>{const state=threadRegistration(thread,endpoint.address)?.state;if(state)this.emit('state',thread.id,state,endpoint.address);}}:{}),
+        ...(options.lostSocketRecovery?{borrowLostSocket:(runtime,native)=>this.borrowLostConnection(peer,endpoint,runtime,native)}:{}),
+        beforeStop:options.beforeStop,start:()=>this.ensureEndpointInner(peer.cwd,peer.id,peer.sessionId??undefined,endpoint.configHome,options.requesterSession,options.beforeLaunch,original,prepared),
+        guard,onVerifying:(runtimeId,address)=>this.emit('sessionVerifying',{memberId:peer.id,sessionId:peer.sessionId,runtimeId,endpoint:address}),onPolicy:(policy,runtimeId)=>this.emit('sessionPolicy',{memberId:peer.id,sessionId:peer.sessionId,runtimeId,policy})});
+    })();
     this.restarting.set(peer.id,work);
     try{
       const result=await work;
@@ -543,7 +623,14 @@ export class CodexAdapter extends EventEmitter {
     if(saved.pid!==native.pid||saved.procStart!==native.startedAt){saved.pid=native.pid;saved.procStart=native.startedAt;if(saved.kind==='owned')saveManagedRuntime(this.home,saved);}
     return native;
   }
-  private async ensureEndpointInner(cwd=process.cwd(),peerId?:string,sessionId?:string,configHome?:string,requesterSession?:string,beforeLaunch?:()=>void|Promise<void>,affinity?:Pick<ManagedRuntime,'executable'|'profileId'>):Promise<string>{
+  private async prepareRuntimeLaunch(cwd:string,peerId?:string,sessionId?:string,configHome?:string,requesterSession?:string,affinity?:Pick<ManagedRuntime,'executable'|'profileId'>):Promise<PreparedRuntimeLaunch>{
+    const launch=await prepareOwnedLaunch(await selectSessionLaunch('codex',this.config,{home:this.home,cwd,sessionId,configHome,requesterSession,executable:affinity?.executable,profileId:affinity?.profileId}));
+    if(peerId&&sessionId&&restoreState({host:'codex',sessionId,owner:'nxbridge'} as Peer,launch.configHome)==='gone')throw new BridgeError('session_not_found','原配置目录中没有该 Codex 会话，请先恢复原会话文件或在原生窗口恢复。');
+    const capabilities=await requireDedicatedCodex(launch),authenticatedLoopback=['linux','win32'].includes(process.platform)&&capabilities.authenticatedWebsocket;
+    if(peerId&&sessionId)await requireRestoreBootstrap(launch);
+    return{launch,authenticatedLoopback};
+  }
+  private async ensureEndpointInner(cwd=process.cwd(),peerId?:string,sessionId?:string,configHome?:string,requesterSession?:string,beforeLaunch?:()=>void|Promise<void>,affinity?:Pick<ManagedRuntime,'executable'|'profileId'>,prepared?:PreparedRuntimeLaunch):Promise<string>{
     this.requireMember(peerId);
     let records=managedRuntimes(this.home).filter(r=>peerId?r.value.peerId===peerId:!r.value.peerId&&(!configHome||r.value.configHome&&path.resolve(r.value.configHome)===path.resolve(configHome)));
                                         
@@ -578,6 +665,7 @@ export class CodexAdapter extends EventEmitter {
         if(await managedRuntimeState(this.home,saved)==='dead'){await removeOwnedSocket(this.home,saved.endpoint);removeManagedRuntime(previous);}
       }
       else{
+        if(prepared)throw new BridgeError('runtime_ambiguous','原会话已有另一个存活或尚未核验的运行时，未重复恢复。');
         const failed=saved.state==='failed';
         try{
                                               
@@ -604,16 +692,14 @@ export class CodexAdapter extends EventEmitter {
         }
       }
     }
-    const launch=await prepareOwnedLaunch(await selectSessionLaunch('codex',this.config,{home:this.home,cwd,sessionId,configHome:configHome??previous?.value.configHome,requesterSession,executable:affinity?.executable??previous?.value.executable,profileId:affinity?.profileId??previous?.value.profileId}));
-    if(peerId&&sessionId&&restoreState({host:'codex',sessionId,owner:'nxbridge'} as Peer,launch.configHome)==='gone')throw new BridgeError('session_not_found','原配置目录中没有该 Codex 会话，请先恢复原会话文件或在原生窗口恢复。');
-    const capabilities=await requireDedicatedCodex(launch),authenticatedLoopback=['linux','win32'].includes(process.platform)&&capabilities.authenticatedWebsocket;
-    if(peerId&&sessionId)await requireRestoreBootstrap(launch);
+    const {launch,authenticatedLoopback}=prepared??await this.prepareRuntimeLaunch(cwd,peerId,sessionId,configHome??previous?.value.configHome,requesterSession,{executable:affinity?.executable??previous?.value.executable,profileId:affinity?.profileId??previous?.value.profileId});
     this.requireMember(peerId);
     for(const note of launch.notes)this.emit('diagnostic',note);
                                                       
     const runtimeId=launch.env.NXBRIDGE_OWNED_LAUNCH!.slice('codex:'.length),directory=await socketDirectory(this.home),endpoint=authenticatedLoopback?await new Promise<string>((resolve,reject)=>{const server=net.createServer();server.once('error',reject);server.listen(0,'127.0.0.1',()=>{const port=(server.address() as net.AddressInfo).port;server.close(error=>error?reject(error):resolve('ws://127.0.0.1:'+port));});}):'unix://'+path.join(directory,'cx-'+createHash('sha256').update(runtimeId).digest('hex').slice(0,16)+'.sock');
+    const sessionVerification=peerId&&sessionId?await pendingRestartVerification(this.home,peerId,sessionId,launch.configHome):undefined;
     await beforeLaunch?.();
-    const saved:ManagedRuntime={id:runtimeId,...(peerId?{peerId}:{}),owner:managedMarker(this.home),kind:'owned',state:'starting',endpoint,configHome:launch.configHome,launchMethod:launch.method,createdAt:Date.now(),bootstrapRevision:backgroundState(this.home)?.revision,executable:launch.executable.command,version:launch.version??launch.profile?.version,profileId:launch.profile?.id,sessionId,threadUnloadDelaySecs:0,...(authenticatedLoopback?{authenticatedLoopback:true}:{})};
+    const saved:ManagedRuntime={id:runtimeId,...(peerId?{peerId}:{}),owner:managedMarker(this.home),kind:'owned',state:'starting',endpoint,configHome:launch.configHome,launchMethod:launch.method,createdAt:Date.now(),bootstrapRevision:backgroundState(this.home)?.revision,executable:launch.executable.command,version:launch.version??launch.profile?.version,profileId:launch.profile?.id,sessionId,threadUnloadDelaySecs:0,...(authenticatedLoopback?{authenticatedLoopback:true}:{}),...(sessionVerification?{sessionVerification}:{})};
     saveManagedRuntime(this.home,saved);
     const logfile=path.join(this.home,'run','codex-'+runtimeId+'.log'),retention={...DEFAULT_RETENTION,...this.config.retention};
     let failure:unknown,spawnAttempted=false,wrapper:OwnedProcessRecord|undefined,child:ReturnType<typeof spawnSelectedHost>|undefined;
@@ -642,14 +728,17 @@ export class CodexAdapter extends EventEmitter {
       if(failure)throw failure;await delay(200);
       try{
                                          
-        let identity=authenticatedLoopback?await this.declareRuntimeNative(saved,wrapper):undefined;
+        let identity=authenticatedLoopback||process.platform==='darwin'&&peerId?await this.declareRuntimeNative(saved,wrapper):undefined;
         await this.connect(endpoint);identity??=await this.declareRuntimeNative(saved,wrapper);
         if(!identity)throw new BridgeError('launch_owner_unverified','未确认本次启动的原生宿主。');
         let dedicated=false;try{await verifyDedicatedCodex(endpoint,identity);dedicated=true;}catch(error){this.emit('diagnostic','后台已连接，但独占性尚无法核验；仅允许非破坏性恢复：'+describeError(error));}
-        launch.configHome=this.configHomes.get(endpoint)??launch.configHome;this.configHomes.set(endpoint,launch.configHome);
+        const detectedHome=this.configHomes.get(endpoint);
+        if(sessionVerification?.restartSourceId&&detectedHome&&!sameDirectory(detectedHome,launch.configHome))
+          throw new BridgeError('original_home_changed','替代 Codex 进程使用了不同的配置目录，未加载原会话。');
+        launch.configHome=detectedHome??launch.configHome;this.configHomes.set(endpoint,launch.configHome);
         Object.assign(saved,{state:'ready',pid:identity.pid,procStart:identity.startedAt,configHome:launch.configHome,dedicated});saveManagedRuntime(this.home,saved);recordHostLaunch(this.home,'codex-app-server',launch,identity.pid);return endpoint;
       }catch(error){
-        if(error instanceof BridgeError&&['process_launch_unverified','shared_backend'].includes(error.code))throw error;
+        if(error instanceof BridgeError&&['process_launch_unverified','shared_backend','original_home_changed'].includes(error.code))throw error;
         const nativeExit=child?posixSupervisorExit(child):undefined;
         failure=child&&(child.exitCode!==null||child.signalCode!==null||nativeExit&&(nativeExit.code!==0||nativeExit.signal!==null))?error:undefined;
       }
@@ -682,7 +771,7 @@ export class CodexAdapter extends EventEmitter {
     const registration={...threadRegistration({...thread,name:peer.name},endpoint,result)!,permission:codexPermission(result)};registration.endpoint.configHome=this.configHomes.get(endpoint);const runtime=runtimeFor(this.home,{endpoint})?.value;if(runtime){recordManagedSessionLaunch(this.home,thread.id,thread.cwd,runtime);registration.endpoint.runtimeId=runtime.id;registration.endpoint.pid=runtime.pid??null;registration.endpoint.procStart=runtime.procStart??null;}return registration;
   }
                                        
-  async setProfile(peer:Peer,endpoint:Endpoint,profile:import('../../types.js').ModelProfile,guard:()=>void):Promise<import('../../types.js').ModelProfile>{
+  async setProfile(peer:Peer,endpoint:Endpoint,profile:import('../../types.js').ModelProfile,guard:()=>void):Promise<EffectiveModelProfile>{
     let submitted=false,accepted=false;
     return this.threadOperation(peer,endpoint,async()=>{
       guard();this.requireMember(peer.id);
@@ -691,21 +780,31 @@ export class CodexAdapter extends EventEmitter {
       const rpc=await this.connect(endpoint.address),current=await rpc.request('thread/read',{threadId:peer.sessionId,includeTurns:false});guard();
       if(current.thread?.id!==peer.sessionId)throw new BridgeError('session_changed','模型切换前线程身份已改变。');
       if(!codexThreadIdle(current.thread))throw new BridgeError('session_busy','搭档仍在工作，模型选择将在安全空闲点应用。');
-      submitted=true;await rpc.request('thread/settings/update',{threadId:peer.sessionId,...profile},{mutation:true});accepted=true;guard();
+      const {serviceTier,...settings}=profile;
+      submitted=true;await rpc.request('thread/settings/update',{threadId:peer.sessionId,...settings,...(serviceTier===undefined?{}:{serviceTier:nativeServiceTier(serviceTier)})},{mutation:true});accepted=true;guard();
       const actual=await rpc.request('thread/read',{threadId:peer.sessionId,includeTurns:false});guard();
       if(actual.thread?.id!==peer.sessionId)throw new BridgeError('session_changed','模型切换返回了不同会话。');
-      return{model:actual.thread.model,effort:actual.thread.reasoningEffort};
+      return this.settingsProfile(rpc,peer,actual.thread,guard,serviceTier!==undefined||peer.serviceTier!==undefined);
     }).catch(error=>{throw profileChangeFailure(error,submitted,accepted);});
   }
-  async readProfile(peer:Peer,endpoint:Endpoint,guard:()=>void):Promise<import('../../types.js').ModelProfile>{
+  async readProfile(peer:Peer,endpoint:Endpoint,guard:()=>void):Promise<EffectiveModelProfile>{
     return this.threadOperation(peer,endpoint,async()=>{
       guard();this.requireMember(peer.id);const runtime=runtimeFor(this.home,{endpoint:endpoint.address})?.value;
       if(endpoint.daemon||runtime?.kind!=='owned'||runtime.peerId!==peer.id)throw new BridgeError('process_owned_by_user','只能核对自有后台运行时的设置。');
       const rpc=await this.connect(endpoint.address),actual=await rpc.request('thread/read',{threadId:peer.sessionId,includeTurns:false});guard();
       if(actual.thread?.id!==peer.sessionId)throw new BridgeError('session_changed','设置回读返回了不同会话。');
       if(actual.thread.status?.type==='notLoaded')throw new BridgeError('profile_unverified','原会话尚未由已核验的恢复路径加载，设置等待回读。');
-      return{model:actual.thread.model,effort:actual.thread.reasoningEffort};
+      return this.settingsProfile(rpc,peer,actual.thread,guard,this.modelProfile(peer).serviceTier!==undefined||peer.serviceTier!==undefined);
     });
+  }
+                                                
+  private async settingsProfile(rpc:RpcClient,peer:Peer,thread:CodexThread,guard:()=>void,withTier:boolean):Promise<EffectiveModelProfile>{
+    const profile={model:thread.model??undefined,effort:thread.reasoningEffort??undefined};
+    if(!withTier)return profile;
+    if(!codexThreadIdle(thread))throw new BridgeError('profile_unverified','无法在非空闲线程核对当前服务档位。');
+    const loaded=await rpc.request('thread/resume',{threadId:peer.sessionId,excludeTurns:true});guard();
+    if(loaded.thread?.id!==peer.sessionId)throw new BridgeError('session_changed','档位回读返回了不同会话。');
+    return{...profile,serviceTier:observedServiceTier(loaded.serviceTier)};
   }
                                                  
   async loadedRuntime(sessionId:string,configHome:string):Promise<ManagedRuntime|undefined>{

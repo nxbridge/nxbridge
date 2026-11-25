@@ -104,8 +104,8 @@ async function modNow(input:any,execution?:ModExecution):Promise<unknown>{
     case'send':return request('send',{actor,message:input.message,in_reply_to:input.in_reply_to,auto_reply_to:input.auto_reply_to,auto_reply_text:input.auto_reply_text,reply_expected:input.reply_expected},{mutation:true});
     case'selection-get':case'selection-refresh':return request(input.operation==='selection-get'?'pair.selection.get':'pair.selection.refresh',{actor,selection_id:input.selection_id});
     case'selection-resolve':return request('pair.selection.resolve',{actor,selection_id:input.selection_id},{mutation:true});
-    case'selection-commit':return request('pair.selection.commit',{actor,selection_id:input.selection_id,key:input.key,action:input.action,...(input.model!==undefined?{model:input.model}:{}),...(input.effort!==undefined?{effort:input.effort}:{})},{mutation:true});
-    case'partner-profile':{const action=input.action??'get';return request('partner.profile',{actor,action,...(input.model!==undefined?{model:input.model}:{}),...(input.effort!==undefined?{effort:input.effort}:{})},{mutation:action!=='get'});}
+    case'selection-commit':return request('pair.selection.commit',{actor,selection_id:input.selection_id,key:input.key,action:input.action,...(input.model!==undefined?{model:input.model}:{}),...(input.effort!==undefined?{effort:input.effort}:{}),...(input.serviceTier!==undefined?{serviceTier:input.serviceTier}:{})},{mutation:true});
+    case'partner-profile':{const action=input.action??'get';return request('partner.profile',{actor,action,...(input.model!==undefined?{model:input.model}:{}),...(input.effort!==undefined?{effort:input.effort}:{}),...(input.serviceTier!==undefined?{serviceTier:input.serviceTier}:{})},{mutation:action!=='get'});}
     case'pair-code':return request('pair.code',{actor});
     case'pair-code-commit':{if(input.origin!=='composer'||input.agentId)throw new BridgeError('pairing_human_origin_required','配对码必须由本窗口用户输入。');return request('pair.code.commit',{actor,code:input.code,origin:'composer'},{mutation:true});}
     case'switch':return request('member.switch',{actor,...switchParams(input)},{mutation:true});

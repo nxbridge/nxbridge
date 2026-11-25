@@ -15,7 +15,7 @@ export async function configurationCommand(home:string,args:string[],terminalCon
   const usage=()=>new BridgeError('invalid_arguments','用法：nxbridge config list；config get <键名>；config set <键名> <值>；config unset <键名>。数值和命令数组使用 JSON，字符串可直接传入。');
   if(action==='--help'&&args.length===1)return{usage:usage().message,files:'自动保存写 config.managed.toml，手写 config.toml 优先。',notice:'CLI 写入仅支持独立交互终端；宿主内使用 config 工具或 Claude /nxbridge config，敏感提案由用户在原生窗口输入确认行。'};
   if(action==='list'&&args.length===1)return configurationStatus(home);
-  if(action==='get'&&args.length===2&&key){configurationField(key);const status=configurationStatus(home);return{file:status.file,userFile:status.userFile,warnings:status.warnings,...status.entries.find(entry=>entry.key===key),...(key.startsWith('partners.')&&Object.keys(status.frozen_profiles??{}).length?{frozen_profiles:status.frozen_profiles}:{})};}
+  if(action==='get'&&args.length===2&&key){configurationField(key);const status=configurationStatus(home);return{file:status.file,userFile:status.userFile,warnings:status.warnings,...status.entries.find(entry=>entry.key===key),...(key.startsWith('partners.')?{partner_defaults:status.partner_defaults,...(Object.keys(status.frozen_profiles).length?{frozen_profiles:status.frozen_profiles}:{})}:{})};}
   if((action!=='set'&&action!=='unset')||!key||args.length!==(action==='set'?3:2))throw usage();
   await requireConfigurationTerminal(terminalContext);
   let value:unknown;

@@ -3,17 +3,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import {mkdirSync,readdirSync,readFileSync,rmdirSync,writeFileSync} from 'node:fs';
+import {mkdirSync,readdirSync,readFileSync,rmdirSync,unlinkSync,writeFileSync} from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readModelBody } from './model-http-fixture.js';
-import { CodexAdapter, threadRegistration } from '../hosts/codex/adapter.js';
+import { CodexAdapter, connectAppServer, threadRegistration } from '../hosts/codex/adapter.js';
 import { Broker, type Adapters } from '../broker/coordinator.js';
 import { Store } from '../storage/store.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
 import {atomicJson,readJson} from '../shared/files.js';
 import {delay} from '../shared/time.js';
 import {ensureHome,removeOwnedSocket} from '../ipc/home.js';
+import {codexSocketAlias,codexSocketTargetMissing} from '../ipc/unix-socket.js';
 import {PACKAGE_ROOT} from '../shared/package-location.js';
 import {liveProcess} from '../process/process.js';
 import { FakeAdapter } from '../tests/support/fake-adapter.js';
@@ -172,6 +173,23 @@ await server.connect(new StdioServerTransport());
   const sessions=path.join(codexhome,'sessions'),rolloutIds=new Set(readdirSync(sessions,{recursive:true}).filter((file):file is string=>typeof file==='string'&&file.endsWith('.jsonl')).map(file=>JSON.parse(readFileSync(path.join(sessions,file),'utf8').split('\n')[0]!).payload.id));
   assert.deepEqual([...rolloutIds],[peer.sessionId]);
   await wait(()=>store.peer(peer.id).state==='ready');
+  if(process.platform==='darwin'&&named){
+    const source=store.endpoint(peer.id)!,target=codexSocketAlias(source.address.slice(7));
+    unlinkSync(target);
+    assert.equal(codexSocketTargetMissing(source.address.slice(7)),true);
+    await assert.rejects(connectAppServer(source.address,config,undefined,home,{readOnly:true}),{code:'ENOENT'});
+    assert.equal((await restored.request('thread/read',{threadId:peer.sessionId,includeTurns:false})).thread.id,peer.sessionId);
+    let stopClaims=0;
+    const repair=await codex.restart(store.peer(peer.id),source,()=>{},{
+      lostSocketRecovery:true,beforeStop:()=>{stopClaims++;},
+    });
+    pids.add(repair.pid);addresses.add(repair.endpoint);
+    assert.equal(stopClaims,1);assert.equal(repair.oldPid,source.pid);assert.equal(liveProcess(repair.oldPid),false);
+    assert.equal(repair.resumed.thread.id,peer.sessionId);assert.notEqual(repair.endpoint,source.address);
+    assert.equal(requests.length,beforeRequests+1,'原生空闲恢复不运行新轮次');
+    const fresh=await codex.connect(repair.endpoint);
+    assert.ok(JSON.stringify((await fresh.request('mcpServerStatus/list',{threadId:peer.sessionId,limit:100})).data).includes('RESTART_MCP_V2_TOOL'));
+  }
   const blocked=store.accept(pair,partner,'恢复失败后仍要保留的新消息','restart-failure');
   const invalidConfig=changedConfig+'\n[故意损坏的隔离配置',originalRestart=codex.restart.bind(codex);
                                         

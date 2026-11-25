@@ -4,6 +4,7 @@ import { isDeepStrictEqual } from 'node:util';
 import {BridgeError} from '../../shared/errors.js';
 import type { RpcClient } from '../../ipc/rpc.js';
 import {delay} from '../../shared/time.js';
+import {nativeServiceTier,observedServiceTier} from './codex-service-tier.js';
 
 export interface SessionPolicy {
   source:'persisted'|'conservative';sandbox:unknown;approval:unknown;reviewer:unknown;
@@ -19,6 +20,15 @@ export interface SessionProfile {
 interface Cache extends SessionProfile {dev:number;ino:number;size:number;mtime:number;invalid:boolean}
 const caches=new Map<string,Cache>();
 const fields={model:'model',model_provider:'modelProvider',model_provider_id:'modelProvider',approval_policy:'approvalPolicy',approvals_reviewer:'approvalsReviewer',permission_profile:'permissionProfile',sandbox_policy:'sandbox',cwd:'cwd',runtime_workspace_roots:'runtimeWorkspaceRoots',effort:'reasoningEffort',reasoning_effort:'reasoningEffort',collaboration_mode:'collaborationMode',service_tier:'serviceTier',disabled_plugin_ids:'disabledPluginIds'} as const;
+function knownTier(profile:SessionProfile):string|undefined{
+  const observed=observedServiceTier(profile.live&&Object.hasOwn(profile.live,'serviceTier')?profile.live.serviceTier:profile.settings.serviceTier);
+                                            
+  return observed===undefined?undefined:nativeServiceTier(observed??'standard');
+}
+function verifyResumedTier(profile:SessionProfile,actual:unknown):void{
+  const expected=knownTier(profile);
+  if(expected!==undefined&&observedServiceTier(actual)!==observedServiceTier(expected))throw new BridgeError('profile_verification_failed','恢复后的服务档位与原会话不符，已暂停投递。');
+}
 
                                             
 export async function readSessionProfile(file:unknown,sessionId:string):Promise<SessionProfile>{
@@ -151,7 +161,7 @@ export async function snapshotLiveSession(rpc:RpcClient,id:string,file:string):P
   if(live.thread?.id!==id)throw new BridgeError('session_changed','实时快照返回了其他线程。');
   const previous=await readSessionProfile(file,id);
   const profile=await persistedAfter(rpc,id,file,previous.offset,{approvalPolicy:live.approvalPolicy});
-  profile.live=Object.fromEntries(['model','modelProvider','reasoningEffort','approvalPolicy','approvalsReviewer','cwd','runtimeWorkspaceRoots','activePermissionProfile','sandbox'].filter(key=>live[key]!==undefined).map(key=>[key,live[key]]));
+  profile.live=Object.fromEntries(['model','modelProvider','reasoningEffort','serviceTier','approvalPolicy','approvalsReviewer','cwd','runtimeWorkspaceRoots','activePermissionProfile','sandbox'].filter(key=>live[key]!==undefined).map(key=>[key,live[key]]));
   const active=profile.live.activePermissionProfile?.id;
   if(typeof active==='string'&&active.startsWith('nxbridge_')){
     const plan=permissionPlan(profile),definition='config' in plan.options?plan.options.config?.['permissions.nxbridge_transfer']:undefined;
@@ -162,14 +172,37 @@ export async function snapshotLiveSession(rpc:RpcClient,id:string,file:string):P
   return profile;
 }
 
+                                      
+export function requireExactRestartProfile(profile:SessionProfile):void{
+  const live=profile.live;
+  if(!profile.verified||!profile.complete||!live||!profile.settings.permissionProfile
+    ||typeof live.model!=='string'||!live.model||!Object.hasOwn(live,'reasoningEffort')||knownTier(profile)===undefined
+    ||!['model','reasoningEffort'].every(key=>isDeepStrictEqual(live[key],profile.settings[key])))
+    throw new BridgeError('restart_profile_unverified','原线程缺少可精确保留的实时权限、模型、推理强度或服务档位，未自动停止。');
+}
+
+                                      
+export async function verifyRestartProfileCurrent(profile:SessionProfile):Promise<void>{
+  const current=await readSessionProfile(profile.file,profile.sessionId);
+  if(!current.verified||!current.complete||(current.settingsOffset??0)<(profile.settingsOffset??0)
+    ||(current.settingsOffset??0)>(profile.settingsOffset??0)&&(
+      !samePermission(current.settings.permissionProfile,profile.settings.permissionProfile)
+      ||knownTier(current)!==undefined&&knownTier(current)!==knownTier(profile)
+      ||['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots'].some(key=>!isDeepStrictEqual(current.settings[key],profile.settings[key]))))
+    throw new BridgeError('restart_profile_changed','原会话历史无法核验，或在自动重启快照后写入了不同的设置。已保留消息，等待确认原会话设置。');
+}
+
                                        
 export async function verifyResumedSession(rpc:RpcClient,id:string,original:SessionProfile):Promise<{resumed:any;policy:SessionPolicy;profile:SessionProfile}>{
   const resumed=await rpc.request('thread/resume',{threadId:id,excludeTurns:true});
   const current=await readSessionProfile(original.file??resumed.thread?.path,id),plan=permissionPlan(original);
   const exact=original.settings.permissionProfile&&samePermission(current.settings.permissionProfile,original.settings.permissionProfile);
   if(resumed.thread?.id!==id||!current.verified||!current.complete||!exact&&!samePermission(current.settings.permissionProfile,plan.permission))throw new BridgeError('policy_verification_failed','上次权限核验被中断，当前权限与原始或严格恢复方案不符，消息继续保留。');
+  if(original.live&&(!exact||resumed.activePermissionProfile?.id!==original.live.activePermissionProfile?.id))
+    throw new BridgeError('policy_verification_failed','上次重启后的实时权限或原生命名 profile 已改变，消息继续保留。');
   if((current.settingsOffset??0)<=(original.settingsOffset??0))throw new BridgeError('policy_verification_incomplete','上次恢复尚无新的权限落盘证据，等待安全冷恢复；消息继续保留。');
   for(const key of ['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots'])if(original.settings[key]!==undefined&&!isDeepStrictEqual(resumed[key],original.settings[key]))throw new BridgeError('policy_verification_failed','中断后的运行设置与原会话不符：'+key+'。');
+  verifyResumedTier(original,resumed.serviceTier);
   return{resumed,profile:current,policy:exact?{...plan.policy,source:'persisted',sandbox:current.settings.permissionProfile,unknown:[],narrowed:[],reason:undefined}:plan.policy};
 }
 
@@ -192,17 +225,20 @@ export async function resumeSession(rpc:RpcClient,id:string,options:{file?:strin
     }
   }
   for(const key of ['model','modelProvider','runtimeWorkspaceRoots'])if(saved[key]!==undefined)args[key]=saved[key];
+  const tier=knownTier(original);if(tier!==undefined)args.serviceTier=tier;
   let resumed:any;
   try{resumed=await rpc.request('thread/resume',args,{timeout:30000});}
   catch(error){if(plan.policy.unknown.includes('filesystem')&&/sandbox helper|codex-linux-sandbox|failed to load AGENTS/i.test(String((error as Error).message)))throw new BridgeError('policy_unknown_unstartable','原会话权限未知，原生宿主无法在禁止读取的策略下初始化。消息继续保留；请在正常窗口明确设置权限并完成一次交互后重试。');throw error;}
   if(resumed.thread?.id!==id)throw new BridgeError('session_changed','恢复结果的线程 ID 与原会话不符，未投递。');
   for(const key of ['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots'])if(saved[key]!==undefined&&!isDeepStrictEqual(resumed[key],saved[key]))throw new BridgeError('policy_verification_failed','宿主未保留原会话的 '+key+'，已暂停投递。');
+  verifyResumedTier(original,resumed.serviceTier);
   const file=options.file??resumed.thread.path??original.file;
   if(options.verify===false)return{resumed,policy:plan.policy,profile:original};
   if(typeof file!=='string'||!file)throw new BridgeError('policy_verification_failed','无法读取原生权限生效证据，已暂停投递。');
   let current=await readSessionProfile(file,id),candidate=original.live?.activePermissionProfile?.id?undefined:sandboxCandidate(original);
   const settings:Record<string,unknown>={approvalPolicy:plan.policy.approval};
-  for(const key of ['collaborationMode','serviceTier','disabledPluginIds'])if(saved[key]!==undefined)settings[key]=saved[key];
+  for(const key of ['collaborationMode','disabledPluginIds'])if(saved[key]!==undefined)settings[key]=saved[key];
+  if(tier!==undefined)settings.serviceTier=tier;
   if(candidate)settings.sandboxPolicy=candidate;
   current=await persistedAfter(rpc,id,file,current.offset,settings);
   if(original.live){

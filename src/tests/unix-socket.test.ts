@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {codexSocketTarget,proveUnixCodexSocket,linuxSocketListener,type UnixSocketIo} from '../ipc/unix-socket.js';
+import {codexSocketTarget,codexSocketTargetMissing,currentCodexSocketAlias,proveUnixCodexSocket,linuxSocketListener,type UnixSocketIo} from '../ipc/unix-socket.js';
 import {symlinkSync,lstatSync,writeFileSync} from 'node:fs';
 import path from 'node:path';
 import {ensureHome,removeDanglingCodexSockets,removeOwnedSocket} from '../ipc/home.js';
@@ -33,6 +33,34 @@ test('原生 socket 权限变化不推翻监听归属，非 socket 仍然拒绝'
   assert.equal((await proveUnixCodexSocket(filename,native,f.io)).pid,native.pid);
   f.socket.isSocket=()=>false;
   await assert.rejects(proveUnixCodexSocket(filename,native,f.io),{code:'shared_backend'});
+});
+test('原生目标丢失与入口丢失、权限制约和非原生链接分别判定',async()=>{
+  const f=fixture(),proof=await proveUnixCodexSocket(filename,native,f.io),lstat=f.io.lstat;
+  assert.equal(currentCodexSocketAlias(proof,f.io),true);
+  assert.equal(codexSocketTargetMissing(filename,undefined,f.io),false);
+  let code='EACCES',missingAlias=false;
+  f.io.lstat=file=>{
+    if(file===f.target||missingAlias&&file===filename)throw Object.assign(Error(),{code});
+    return lstat(file);
+  };
+  assert.equal(currentCodexSocketAlias(proof,f.io),false);
+  assert.equal(codexSocketTargetMissing(filename,proof,f.io),false);
+  code='ENOENT';
+  assert.equal(codexSocketTargetMissing(filename,undefined,f.io),true);
+  missingAlias=true;
+  assert.equal(codexSocketTargetMissing(filename,undefined,f.io),false);
+  assert.equal(codexSocketTargetMissing(filename,proof,f.io),true);
+  missingAlias=false;f.entry.ino++;
+  assert.equal(codexSocketTargetMissing(filename,proof,f.io),false);
+  f.io.readlink=()=>f.target+'-other';
+  assert.equal(codexSocketTargetMissing(filename,undefined,f.io),false);
+});
+test('连接前后必须持有同一组入口与监听 inode，真实目录必须私有',async()=>{
+  const f=fixture(),proof=await proveUnixCodexSocket(filename,native,f.io);
+  f.socket.ino++;
+  assert.equal(currentCodexSocketAlias(proof,f.io),false);
+  f.socket.ino--;f.directory.mode=0o770;
+  assert.equal(currentCodexSocketAlias(proof,f.io),false);
 });
 test('旧版直接监听 socket 仍需监听归属，不能只凭命令行认领被替换的端点',async()=>{
   const f=fixture();f.io.lstat=file=>file===filename?f.socket:f.directory;f.io.realpath=file=>file;f.io.listener=async(file,pid)=>file===filename&&pid===42;

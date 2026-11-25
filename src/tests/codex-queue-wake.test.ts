@@ -30,7 +30,7 @@ function fixture(t:TestContext,address='ws://127.0.0.1:48195'){
     identity:async()=>native,
     dedicated:async(value:string)=>{assert.equal(value,address);},
     daemon:async()=>true,
-    unixSocket:async()=>({requested:address.slice(7),resolved:address.slice(7),kind:'direct' as const,pid:native.pid,generation:native.startedAt}),
+    unixSocket:async()=>({requested:address.slice(7),resolved:address.slice(7),kind:'direct' as const,pid:native.pid,generation:native.startedAt,entryStamp:'1:1',socketStamp:'1:1'}),
     live:()=>false,socketVacant:async()=>true,
     control:async()=>assert.fail('共享路由不能启动控制进程'),
     run:async()=>assert.fail('不得退回命令行入队'),

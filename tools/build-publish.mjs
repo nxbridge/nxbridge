@@ -16,7 +16,7 @@ synchronizeModRevision(root);
 synchronizeIdentityRevision(root);
 const documents=[['docs/user-guide.md','README.md'],['LICENSE','LICENSE']].map(([source,name])=>{
   const filename=path.join(root,source);if(!existsSync(filename))throw Error('发布构建缺少必需文件：'+source);
-  return{name,text:readFileSync(filename,'utf8')};
+  return{name,text:readFileSync(filename,'utf8').replaceAll('\r\n','\n')};
 });
                              
 rmSync(output,{recursive:true,force:true});mkdirSync(output);

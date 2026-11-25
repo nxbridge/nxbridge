@@ -31,7 +31,8 @@ export function providerStatusText(health:any):string|undefined{
   const at=new Date(r.at).toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit'}),next=r.kind==='auth'?'需要你检查 Codex 的登录或密钥':'等服务恢复，或到供应商那边查看';
   return r.state==='failed'?`这一轮已停止：${providerCause(r)}，最近一次 ${at}；${next}`:`在等模型服务：${providerCause(r)}，正在自动重试，最近一次 ${at}；${next}`;
 }
-const profileText=(p:{model?:string;effort?:string|number}|undefined)=>[p?.model!==undefined?'模型 '+p.model:'',p?.effort!==undefined?'推理强度 '+p.effort:''].filter(Boolean).join('，');
+const profileText=(p:{model?:string;effort?:string|number;serviceTier?:string|null}|undefined)=>[p?.model!==undefined?'模型 '+p.model:'',p?.effort!==undefined?'推理强度 '+p.effort:'',p?.serviceTier!==undefined?'服务档位 '+(p.serviceTier??'未指定'):''].filter(Boolean).join('，');
+const profileSourceText=(p:any)=>{const view=p.partner_profile;if(view?.delivery_held||!['applied','host'].includes(view?.status))return'';const tags:Record<string,string>={recommended:'nxbridge 推荐',config:'nxbridge 配置',explicit:'此搭档单独指定',host:'宿主配置',frozen:'冻结'};const labels=[['model','模型'],['effort','强度'],['serviceTier','档位']].flatMap(([key,label])=>view.effective?.[key!]!==undefined&&tags[view.sources?.[key!]]?[label+'来自'+tags[view.sources[key!]]]:[]);return labels.length?'（'+labels.join('，')+'）':'';};
                                                         
                                             
 function finalForwardNotice(member:any):string[]{
@@ -56,7 +57,7 @@ function profileNotice(member:any):string[]{
 export function formatStatus(status:any):string{
   const labels:Record<string,string>={ready:'就绪',busy:'工作中',needsHuman:'等待用户',offline:'离线',unknown:'未知',paused:'已暂停',starting:'启动中'};
   const health=(p:any)=>providerStatusText(p.health)?` · ${providerStatusText(p.health)}`:p.health?.state==='networkRetrying'?` · 网络重连中${p.health.retry?.attempt!==undefined?`，第 ${p.health.retry.attempt}/${p.health.retry.max} 次`:''}，从 ${new Date(p.health.retry.since).toLocaleString('zh-CN',{hour12:false})} 开始`:p.health?.state==='silent'?(p.health.progressEvidence===false?' · 进度暂时无法观测（读不到最新一步，不代表卡住）':` · 已 ${Math.floor((Date.now()-p.health.lastProgressAt)/60000)} 分钟未见进展，原因未知`):p.health?.state==='waitingTool'?' · 正在等待工具或命令执行完成':p.health?.state==='failed'?` · 这一轮执行失败：${p.health.error??'原因未知'}`:'';
-  const line=(title:string,p:any)=>`${title}：${p.name} · ${labels[p.state]??p.state}${p.launchFailure?' · 启动失败：'+p.launchFailure.message+'；消息已保留。修复后重试：nxbridge open '+p.host+' --member '+p.id:''}${p.context?.transitioning?' · 正在切换对话，消息等新对话开始后送达':''}${p.model?' · '+p.model:''}${p.effort!==undefined?' / '+p.effort:''}${health(p)}${p.backgroundMode==='child'?' · 托管子进程；接管：'+p.takeoverCommand:''}`;
+  const line=(title:string,p:any)=>`${title}：${p.name} · ${labels[p.state]??p.state}${p.launchFailure?' · 启动失败：'+p.launchFailure.message+'；消息已保留。修复后重试：nxbridge open '+p.host+' --member '+p.id:''}${p.context?.transitioning?' · 正在切换对话，消息等新对话开始后送达':''}${p.model?' · '+p.model:''}${p.effort!==undefined?' / '+p.effort:''}${p.serviceTier!==undefined?' / 服务档位 '+(p.serviceTier??'未指定'):''}${profileSourceText(p)}${health(p)}${p.backgroundMode==='child'?' · 托管子进程；接管：'+p.takeoverCommand:''}`;
   const summary=!status.paired?(status.pair_lost?'原配对 '+status.pair_lost.pair_id+' 被意外解除；原搭档「'+status.pair_lost.partner_name+'」。原因：'+lossReason(status.pair_lost.reason)+(status.pair_lost.actor?'（'+status.pair_lost.actor+'）':'')+'。\n'+lossRestore(status.pair_lost)+'\n不再需要时清除提示：nxbridge unpair --member '+status.self.id:'待配对。首次发信按需配对。'):[
     `${status.paused?'配对已暂停（nxbridge resume'+(status.self?.id?' --member '+status.self.id:'')+' 恢复）':'已配对'}`,
     line('本窗口',status.self),line('搭档',status.partner),

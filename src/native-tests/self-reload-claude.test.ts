@@ -52,8 +52,9 @@ test('实际 Claude 新进程提供搭档模型参数，空闲时自动重载且
   assert.ok(select,'新 Claude 进程没有提供 select_partner');
   assert.deepEqual(select.input_schema.properties.model,{type:'string'});
   assert.deepEqual(select.input_schema.properties.effort,{anyOf:[{type:'string'},{type:'number',minimum:0}]});
+  assert.deepEqual(select.input_schema.properties.service_tier,{type:'string',enum:['standard','fast','flex']});
   assert.equal(select.input_schema.additionalProperties,false);
-  t.diagnostic(JSON.stringify({freshSelectPartnerProfile:true,model:select.input_schema.properties.model,effort:select.input_schema.properties.effort}));
+  t.diagnostic(JSON.stringify({freshSelectPartnerProfile:true,model:select.input_schema.properties.model,effort:select.input_schema.properties.effort,serviceTier:select.input_schema.properties.service_tier}));
   const initial=await status(),c=initial.peers.find((peer:any)=>peer.host==='claude'&&peer.context);assert.ok(c);assert.ok(initial.endpoints.some((endpoint:any)=>endpoint.peerId===c.id&&endpoint.modRevision==='0000000000000000'));
                                                                         
   await wait(async()=>(await status()).endpoints.some((endpoint:any)=>endpoint.peerId===c.id&&endpoint.nativeDecision?.bash==='ask'&&!endpoint.nativeDecision.rule),'普通模式的引擎判定没有登记为 ask');

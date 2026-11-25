@@ -5,7 +5,7 @@ import path from 'node:path';
 import { configurationField } from '../config/config-schema.js';
 import { configurationStatus, ensureConfiguration, loadBridgeConfig, writeConfiguration } from '../config/configuration.js';
 import { configurationCommand } from '../app/commands/config-command.js';
-import { captureFrozenProfile, frozenProfiles, profileDefaults, syncFrozenProfiles } from '../broker/profiles/frozen-profile.js';
+import { captureFrozenProfile, frozenProfiles, profileDefaults, resolveProfileDefaults, syncFrozenProfiles } from '../broker/profiles/frozen-profile.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
 import {type BridgeConfig,type Host} from '../types.js';
 import { temporary } from './support/temporary.js';
@@ -15,16 +15,18 @@ import { formatGlobalStatus, formatStatus } from '../integration/mcp/presentatio
 const frozen=(host:Host):BridgeConfig=>({...DEFAULT_CONFIG,partnerProfiles:{[host]:{source:'frozen'}}});
 const stateFile=(home:string)=>path.join(home,'frozen-profiles.json');
 
-test('缺省继续使用宿主配置，旧 JSON 与新配置键保持兼容，所有搭档配置项需要人工确认',t=>{
+test('新搭档缺省用推荐配置，旧 JSON 与新配置键保持兼容，搭档配置项需要人工确认',t=>{
   const home=temporary(t),legacy=path.join(home,'config.json'),raw='{"questionTimeoutMs":42}';
   writeFileSync(legacy,raw,'utf8');
   const config=loadBridgeConfig(home);
   assert.equal(config.questionTimeoutMs,42);
   for(const host of ['claude','codex'] as const){
-    assert.equal(config.partnerProfiles?.[host]?.source,'host');
-    assert.deepEqual(profileDefaults(home,config,host),{});
+    assert.equal(config.partnerProfiles?.[host]?.source,'recommended');
     for(const key of ['model','effort','profile_source'])assert.equal(configurationField(`partners.${host}.${key}`).safe,false);
   }
+  assert.deepEqual(profileDefaults(home,config,'codex'),{model:'gpt-6.2-sol',effort:'xhigh',serviceTier:'standard'});
+  assert.deepEqual(profileDefaults(home,config,'claude'),{model:'claude-opus-5-5',effort:'xhigh'});
+  assert.equal(configurationField('partners.codex.service_tier').safe,false);
   assert.deepEqual(frozenProfiles(home,config),{});
   assert.equal(existsSync(stateFile(home)),false);
   assert.equal(readFileSync(legacy,'utf8'),raw);
@@ -39,9 +41,20 @@ test('显式默认值逐项覆盖冻结值，数值零不会被当作缺省，�
   assert.deepEqual(defaults({claude:{source:'frozen',model:'explicit-model'}}),{model:'explicit-model',effort:0});
   assert.deepEqual(defaults({claude:{source:'frozen',effort:'max'}}),{model:'native-model',effort:'max'});
   assert.deepEqual(defaults({claude:{source:'frozen',model:'explicit-model',effort:0}}),{model:'explicit-model',effort:0});
-  assert.deepEqual(defaults({claude:{model:'host-model'}}),{model:'host-model'});
-  assert.deepEqual(defaults({}),{});
-  assert.deepEqual(profileDefaults(home,config,'codex'),{});
+  assert.deepEqual(defaults({claude:{source:'host',model:'host-model'}}),{model:'host-model'});
+  assert.deepEqual(defaults({}),{model:'claude-opus-5-5',effort:'xhigh'});
+  assert.deepEqual(profileDefaults(home,config,'codex'),{model:'gpt-6.2-sol',effort:'xhigh',serviceTier:'standard'});
+});
+
+test('档位、模型、推理强度按单字段选取并报告来源',t=>{
+  const home=temporary(t);
+  writeConfiguration(home,[{key:'partners.codex.model',value:'configured'},{key:'partners.codex.service_tier',value:'fast'}],'terminal');
+  const expected=resolveProfileDefaults(home,loadBridgeConfig(home),'codex',{serviceTier:'flex'});
+  assert.deepEqual(expected,{profile:{model:'configured',effort:'xhigh',serviceTier:'flex'},sources:{model:'config',effort:'recommended',serviceTier:'explicit'}});
+  assert.equal((configurationStatus(home).partner_defaults.codex as typeof expected).sources.serviceTier,'config');
+  writeConfiguration(home,[{key:'partners.codex.profile_source',value:'host'},{key:'partners.codex.service_tier'}],'terminal');
+  assert.deepEqual(resolveProfileDefaults(home,loadBridgeConfig(home),'codex'),{profile:{model:'configured'},sources:{model:'config',effort:'host',serviceTier:'host'}});
+  assert.throws(()=>writeConfiguration(home,[{key:'partners.codex.service_tier',value:'default'}],'terminal'),{code:'invalid_config'});
 });
 
 test('首次原生模型持久冻结，延迟 effort 只接受同模型快照且每个字段只捕获一次',t=>{
@@ -116,7 +129,7 @@ test('手写配置重载清理关闭宿主；显式默认值变更保留捕获�
 test('配置状态与 get 显示冻结元数据，查询不捕获，用户覆盖项保持不可自动编辑',async t=>{
   const home=temporary(t),key='partners.claude.profile_source';
   const initial=await configurationCommand(home,['get',key]) as any;
-  assert.equal(initial.value,'host');assert.equal(initial.source,'default');assert.equal(initial.captured,null);
+  assert.equal(initial.value,'recommended');assert.equal(initial.source,'default');assert.equal(initial.captured,null);
   writeFileSync(path.join(home,'config.toml'),'[partners.claude]\nprofile_source="frozen"\n','utf8');
   const pending=configurationStatus(home);assert.deepEqual(pending.frozen_profiles,{});assert.equal(existsSync(stateFile(home)),false);
   captureFrozenProfile(home,loadBridgeConfig(home),'claude',{model:'observed-model',effort:0});
@@ -136,8 +149,8 @@ test('模型和 effort 不设允许列表，空白、非有限数值、无效类
   for(const value of ['', 'snapshot', 0, null])assert.throws(()=>writeConfiguration(home,[{key:'partners.codex.profile_source',value}],'terminal'),{code:'invalid_config'});
   assert.equal(existsSync(path.join(home,'config.managed.toml')),false);
   writeConfiguration(home,[{key:'partners.codex.model',value:'future/vendor-model-v9'},{key:'partners.codex.effort',value:'future-level'},{key:'partners.claude.effort',value:0}],'terminal');
-  assert.deepEqual(profileDefaults(home,loadBridgeConfig(home),'codex'),{model:'future/vendor-model-v9',effort:'future-level'});
-  assert.deepEqual(profileDefaults(home,loadBridgeConfig(home),'claude'),{effort:0});
+  assert.deepEqual(profileDefaults(home,loadBridgeConfig(home),'codex'),{model:'future/vendor-model-v9',effort:'future-level',serviceTier:'standard'});
+  assert.deepEqual(profileDefaults(home,loadBridgeConfig(home),'claude'),{model:'claude-opus-5-5',effort:0});
   for(const raw of ['partners=[]\n','[partners]\ncodex=5\n','[partners.codex]\nmodel=""\n']){
     writeFileSync(path.join(home,'config.toml'),raw,'utf8');assert.throws(()=>loadBridgeConfig(home),{code:'invalid_config'});
   }

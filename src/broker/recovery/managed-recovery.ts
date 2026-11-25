@@ -81,6 +81,14 @@ export function recoveryUserStep(peer:Pick<Peer,'host'|'cwd'>,incident:ManagedIn
       return '等原会话的后台任务和定时任务结束；核验空闲后会自动接着同一会话，消息已保留';
     case 'claude_inbox_delivery_unsettled':
       return '运行 nxbridge status 核对原消息的接收情况；结果不明的发送不会自动重放';
+    case 'session_busy':case 'runtime_workload_active':
+      return;
+    case 'codex_socket_idle_unverified':case 'runtime_workload_unverified':
+      return peer.host==='codex'&&process.platform!=='win32'&&incident.proof.pid?`等后台 Codex 手上的工作做完、它启动的程序也都结束后，在终端运行 \`kill ${incident.proof.pid}\` 结束原来的后台 Codex。nxbridge 确认它退出后会自动接着原会话继续，消息都还在。旧进程还在时不要另开这个会话`:'运行 nxbridge doctor 查看原运行时的进程核验结果';
+    case 'owner_unverified':
+      return 'nxbridge 无法确认这个后台 Codex 是自己启动的，不会替你结束它。运行 nxbridge doctor 查看';
+    case 'delivery_unsettled':
+      return '运行 nxbridge status 核对原消息的接收情况；结果不明的发送不会自动重放';
     default:
       return '运行 nxbridge status 查看原因';
   }

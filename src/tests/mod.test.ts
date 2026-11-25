@@ -1766,17 +1766,17 @@ test('Mod 观测到启动时的实际权限模式和接收设置后主动登记�
 test('Mod 的 partner_profile 和 select_partner 新建参数原样转给后台，子代理不能修改搭档模型',async()=>{
   const h=await harness();await h.run('session.start',{});
   h.response('partner-profile' as any,{member_id:'m',host:'codex',status:'pending',delivery_held:true});
-  const set=await h.run('tool.call',{tool:'mcp__nxbridge__partner_profile',action:'set',model:'gpt-x',effort:'high',tool_use_id:'t1'});
+  const set=await h.run('tool.call',{tool:'mcp__nxbridge__partner_profile',action:'set',model:'gpt-x',effort:'high',service_tier:'fast',tool_use_id:'t1'});
   assert.equal(JSON.parse(set.result).status,'pending');
   const sent=h.calls.filter(c=>c.operation==='partner-profile').at(-1);
-  assert.deepEqual({action:sent.action,model:sent.model,effort:sent.effort},{action:'set',model:'gpt-x',effort:'high'});
+  assert.deepEqual({action:sent.action,model:sent.model,effort:sent.effort,serviceTier:sent.serviceTier},{action:'set',model:'gpt-x',effort:'high',serviceTier:'fast'});
   await h.run('tool.call',{tool:'mcp__nxbridge__partner_profile',tool_use_id:'t2'});
   const read=h.calls.filter(c=>c.operation==='partner-profile').at(-1);assert.equal(read.action,'get');assert.equal('model' in read,false);
   assert.match((await h.run('tool.call',{tool:'mcp__nxbridge__partner_profile',action:'set',model:'x',agentId:'sub'})).deny,/root session only/);
   h.response('selection-commit',{status:'paired',partner_name:'新后台'});
-  await h.run('tool.call',{tool:'mcp__nxbridge__select_partner',selection_id:'s1',action:'create',model:'gpt-x',effort:'low',tool_use_id:'t3'});
+  await h.run('tool.call',{tool:'mcp__nxbridge__select_partner',selection_id:'s1',action:'create',model:'gpt-x',effort:'low',service_tier:'flex',tool_use_id:'t3'});
   const commit=h.calls.filter(c=>c.operation==='selection-commit').at(-1);
-  assert.deepEqual({action:commit.action,model:commit.model,effort:commit.effort},{action:'create',model:'gpt-x',effort:'low'});
+  assert.deepEqual({action:commit.action,model:commit.model,effort:commit.effort,serviceTier:commit.serviceTier},{action:'create',model:'gpt-x',effort:'low',serviceTier:'flex'});
   await h.run('tool.call',{tool:'mcp__nxbridge__select_partner',selection_id:'s2',key:'k',tool_use_id:'t4'});
   const choose=h.calls.filter(c=>c.operation==='selection-commit').at(-1);assert.equal('model' in choose,false);assert.equal('effort' in choose,false);
 });

@@ -14,7 +14,7 @@ import { managedRegistration, managedCodexRegistration, managedDescendant, clear
 import { codexRuntimeChild, codexRuntimeEndpoint } from '../hosts/codex/codex-lineage.js';
 import { addManagedConflict, clearManagedConflict } from './recovery/managed-conflicts.js';
 import {observeBrokerReachable,brokerOutageDiagnostic} from './broker-outage.js';
-import { CodexAdapter, codexContextReceipts, type CodexContextReceipt, type CodexThread } from '../hosts/codex/adapter.js';
+import { CodexAdapter, codexContextReceipts, type CodexContextReceipt, type CodexThread, type CodexRestartOptions } from '../hosts/codex/adapter.js';
 import { readCodexHistory, type HistoryCheckpoint } from '../hosts/codex/codex-history.js';
 import {ClaudeAdapter} from '../hosts/claude/adapter.js';
 import {liveProcess} from '../process/process.js';
@@ -34,7 +34,7 @@ import { References } from './delivery/references.js';
 import { SubagentCompletions } from './subagent-completions.js';
 import { CodexFinalForwards } from './codex-final-forwards.js';
 import { runtimeProfile } from './profiles/runtime-profile.js';
-import { type PartnerProfiles, modelProfileSchema, hasProfile } from './profiles/partner-profile.js';
+import { type PartnerProfiles, codexProfileSchema, hasProfile } from './profiles/partner-profile.js';
 import { PartnerProfileCoordination } from './profiles/coordination.js';
 import { frozenProfileStatus, profileDefaults, syncFrozenProfiles } from './profiles/frozen-profile.js';
 import { modelError, modelPeerName, modelStatus, referenceDeny } from '../integration/mcp/model-output.js';
@@ -278,6 +278,7 @@ export class Broker {
     this.memberLifecycle=new BrokerLifecycleCoordinator({store,config,adapters,home},{profileCoordination:this.profileCoordination,deletedSessions:this.deletedSessions,takeovers:this.takeovers,managedRecovery:this.managedRecovery,transfers:this.transfers,runtimeHealth:this.runtimeHealth,deliveryHealth:this.deliveryHealth,daemons:this.daemons,codexDirect:this.codexDirect},{
       stopped:()=>this.stopped,
       migrateCodexIdentity:(...args)=>this.migrateCodexIdentity(...args),
+      restartCodexTransport:(peer,endpoint,options)=>this.restartCodex({peer_id:peer.id},{endpoint,options}),
       pumpAfterCurrent:()=>{const pumping=this.pumping;return pumping?pumping.then(()=>this.pump()):this.pump();},
     });
     this.modReads=new ModReadServer(home,(actor,operation,receipt,endpointEpoch,health)=>this.modRead(actor,operation,receipt,endpointEpoch,health),(input,actor,receipt,endpointEpoch,admit)=>this.modWrite(input,actor,receipt,endpointEpoch,admit));
@@ -352,8 +353,9 @@ export class Broker {
       if(matches.length>1)return;
       const peer=await this.windowRecovery.register(r),ep=this.runtimeEndpoint(peer.id);if(ep)this.deletedSessions.observe(peer,ep);this.background('codex_observe:'+peer.id,()=>this.observeActiveCodex(peer));
     });
-    on(adapters.codex,'sessionPolicy',({memberId,sessionId,policy,runtimeId})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.sessionId===sessionId&&this.store.pairFor(peer.id)&&(!hostingRecord(this.store,peer)?.verificationRuntimeId||hostingRecord(this.store,peer)?.verificationRuntimeId===runtimeId))writeHosting(this.store,peer,{policy,verifying:false,verified:true,verificationError:undefined});});
-    on(adapters.codex,'sessionVerifying',({memberId,sessionId,runtimeId,endpoint})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.owner==='nxbridge'&&peer.sessionId===sessionId&&this.store.pairFor(peer.id))writeHosting(this.store,peer,{verifying:true,verified:false,verificationRuntimeId:runtimeId,verificationEndpoint:endpoint,verificationError:undefined});});
+                                            
+    adapters.codex.on('sessionPolicy',({memberId,sessionId,policy,runtimeId})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.sessionId===sessionId&&this.store.pairFor(peer.id)&&(!hostingRecord(this.store,peer)?.verificationRuntimeId||hostingRecord(this.store,peer)?.verificationRuntimeId===runtimeId))writeHosting(this.store,peer,{policy,verifying:false,verified:true,verificationError:undefined});});
+    adapters.codex.on('sessionVerifying',({memberId,sessionId,runtimeId,endpoint})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.owner==='nxbridge'&&peer.sessionId===sessionId&&this.store.pairFor(peer.id))writeHosting(this.store,peer,{verifying:true,verified:false,verificationRuntimeId:runtimeId,verificationEndpoint:endpoint,verificationError:undefined});});
     on(adapters.codex,'sessionVerificationFailed',({memberId,sessionId,runtimeId,error})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.owner==='nxbridge'&&peer.sessionId===sessionId&&this.store.pairFor(peer.id)&&hostingRecord(this.store,peer)?.verificationRuntimeId===runtimeId)writeHosting(this.store,peer,{verificationError:error});});
     on(adapters.codex,'state',(id:string,state:PeerState,address?:string)=>{
       if(state==='offline'&&address){const runtime=runtimeFor(this.home,{endpoint:address})?.value;if(runtime?.peerId)clearManagedConflict(this.store,runtime.peerId,runtime.id,id);}
@@ -363,7 +365,7 @@ export class Broker {
       if(p&&['busy','needsHuman'].includes(state))return this.observeActiveCodex(this.store.peer(p.id),newActivity);
     });
     on(adapters.codex,'permission',(id:string,permission:Peer['permission'],address?:string)=>{const p=this.runtimePeer(id,address);if(p&&this.enabled(p.id))this.store.updatePeer(p.id,{permission});});
-    on(adapters.codex,'profile',(id:string,input:RegisterInput,address?:string)=>{const p=this.runtimePeer(id,address);if(p&&this.enabled(p.id)){const profile=runtimeProfile(p,input);this.profiles.observed(this.store.updatePeer(p.id,{model:profile.model,effort:profile.effort}),input);}});
+    on(adapters.codex,'profile',(id:string,input:RegisterInput,address?:string)=>{const p=this.runtimePeer(id,address);if(p&&this.enabled(p.id)){const profile=runtimeProfile(p,input);this.profiles.observed(this.store.updatePeer(p.id,{model:profile.model,effort:profile.effort,serviceTier:profile.serviceTier}),input);}});
     on(adapters.codex,'interrupted',(id:string,address?:string,turnId?:string)=>{const p=this.runtimePeer(id,address);if(p&&this.enabled(p.id)&&!this.recoveredCodexInterrupt(p,turnId)){this.questions.cancelPeer(p.id);this.store.updatePeer(p.id,{state:'paused'});}});
     on(adapters.codex,'turnStarted',(id:string,address?:string)=>{const p=this.runtimePeer(id,address);if(p&&this.enabled(p.id)&&(p.state!=='paused'||p.kind==='subagent'))this.store.updatePeer(p.id,{state:'busy'});});
     on(adapters.codex,'runtimeStopped',(runtime:Endpoint)=>this.retireCodexRuntime(runtime));
@@ -751,9 +753,10 @@ export class Broker {
     this.store.setSetting(key,null);const release=this.memberLifecycle.queueRetirements([intent.peerId]);this.background('implicit-retirement:'+intent.peerId,()=>this.memberLifecycle.releaseOwned(release));
   }
   private async applySelection(raw:unknown):Promise<unknown>{
-    const p=z.object({actor:actorSchema,selection_id:text,key:text.optional(),action:z.enum(['choose','create','cancel','unpair','adopt','wait']).optional(),...modelProfileSchema.shape}).parse(raw);
-    if(hasProfile(p)&&p.action!=='create')throw new BridgeError('invalid_arguments','model/effort 只能在新建后台搭档（action=create）时指定；要改当前的后台搭档，用 partner_profile。');
+    const p=z.object({actor:actorSchema,selection_id:text,key:text.optional(),action:z.enum(['choose','create','cancel','unpair','adopt','wait']).optional(),...codexProfileSchema.shape}).parse(raw);
+    if(hasProfile(p)&&p.action!=='create')throw new BridgeError('invalid_arguments','模型、推理强度和服务档位只能在新建后台搭档（action=create）时指定；要改当前的后台搭档，用 partner_profile。');
     const root=this.actor(p.actor);if(!['root','fork'].includes(root.kind)||p.actor.via)throw new BridgeError('subagent_denied','搭档选择只能由当前原生主窗口提交。');
+    if(p.serviceTier!==undefined&&root.host!=='claude')throw new BridgeError('invalid_arguments','service_tier 只能用于新建 Codex 后台搭档。');
     const view=this.store.selections.view(p.actor,p.selection_id,this.config) as {status:string;reason?:string;hosting_action?:string;candidates?:{key:string;member_id:string;former_partner?:true;continuation_of?:string}[]};
     if(view.candidates?.some(candidate=>candidate.key===p.key&&candidate.former_partner))await this.refreshDeletedHistory(root);
     if(view.reason==='pair_lost'&&['cancel','wait','unpair'].includes(p.action??'')){
@@ -767,7 +770,7 @@ export class Broker {
     }
     if(this.store.selections.committed(p.actor,p.selection_id)){const sender=this.actor(p.actor),pair=this.store.pairFor(sender.id);if(pair)await this.finalizeSelection(sender,pair);return pair?{...await this.selectionDelivery(view,this.store.peer(pair[otherHost(sender.host)])) as object,selection_id:p.selection_id}:view;}
     if(view.status==='selection_declined'||view.status==='unpaired')return view;
-    if(p.action==='create'){this.requireIndependentBackground();profileDefaults(this.home,this.config,otherHost(root.host),modelProfileSchema.parse(p));}
+    if(p.action==='create'){this.requireIndependentBackground();profileDefaults(this.home,this.config,otherHost(root.host),codexProfileSchema.parse(p));}
     if(!p.action||p.action==='choose'){
       const candidate=view.candidates?.find(c=>c.key===p.key);
       if(!candidate)throw new BridgeError('selection_expired','候选标识无效，请重新选择。');
@@ -789,7 +792,7 @@ export class Broker {
       }
     }
     const sender=this.actor(p.actor),previous=this.store.pairFor(sender.id),result=this.store.selections.commit(p.actor,p,this.config,intent=>this.selectionSend(intent,false));
-    const selectedPair=this.store.pairFor(sender.id);if(p.action==='create'&&hasProfile(p)&&selectedPair)this.profiles.set(this.store.peer(selectedPair[otherHost(sender.host)]),modelProfileSchema.parse(p));
+    const selectedPair=this.store.pairFor(sender.id);if(p.action==='create'&&hasProfile(p)&&selectedPair)this.profiles.set(this.store.peer(selectedPair[otherHost(sender.host)]),codexProfileSchema.parse(p));
     const adopted=view.candidates?.find(candidate=>candidate.key===p.key)?.continuation_of,lease=adopted?this.takeovers.get(adopted):undefined;if(adopted&&lease?.adopted)await this.memberLifecycle.returnTakeover(adopted,lease.id);await this.finalizeSelection(sender,previous);const pair=this.store.pairFor(sender.id);
     return pair?{...await this.selectionDelivery(result,this.store.peer(pair[otherHost(sender.host)])) as object,selection_id:p.selection_id}:result;
   }
@@ -864,7 +867,7 @@ export class Broker {
   }
   private syncPartnerProfile(id:string):Promise<void>{return this.profileCoordination.synchronize(id);}
   private async partnerProfile(raw:unknown):Promise<unknown>{
-    const p=targetSchema.extend({host:host.optional(),action:z.enum(['get','set','reset']).default('get'),...modelProfileSchema.shape}).parse(raw);
+    const p=targetSchema.extend({host:host.optional(),action:z.enum(['get','set','reset']).default('get'),...codexProfileSchema.shape}).parse(raw);
     if(p.actor){const caller=this.actor(p.actor);if(!['root','fork'].includes(caller.kind)||p.actor.via)throw new BridgeError('subagent_denied','只有主会话能修改搭档的模型和推理强度。');if(p.host&&p.host===caller.host)throw new BridgeError('invalid_target','这里只能修改你的搭档的模型和推理强度，不能改自己的。');}
     const pair=this.targetPair(p),targetHost=p.actor?otherHost(p.actor.host):p.host;
     if(!targetHost)throw new BridgeError('invalid_arguments','在终端里要指明改哪一方：nxbridge partner-profile codex 或 nxbridge partner-profile claude。');
@@ -1174,7 +1177,7 @@ export class Broker {
     };
     const withHealth=(peer:Peer)=>{
       let result:unknown={...peer,diagnosticUnavailable:true};
-      this.store.faults.sync('status:'+peer.id,()=>{const children=this.subagentCompletions.status(peer),forward=this.finalForwards.status(peer);result={...describePeer(peer),partner_profile:this.profiles.view(peer),...(children?{childCompletions:{...children,hold:this.pairAnomalies.evidence(peer).subagentHold??null}}:{}),...(forward?{final_forward:forward}:{})};});return result;
+      this.store.faults.sync('status:'+peer.id,()=>{const children=this.subagentCompletions.status(peer),forward=this.finalForwards.status(peer),transport=this.memberLifecycle.transportStatus(peer);result={...describePeer(peer),partner_profile:this.profiles.view(peer),...(transport?{transport_migration:transport}:{}),...(children?{childCompletions:{...children,hold:this.pairAnomalies.evidence(peer).subagentHold??null}}:{}),...(forward?{final_forward:forward}:{})};});return result;
     };
     if(!actor){const pairs=this.store.pairs();return{pairs,...(pairs.length<=1?{pair:pairs[0]??null}:{}),peers:this.store.peers().map(withHealth),lostPairs:this.store.faults.map('status_loss',this.store.peers(),peer=>peer.id,peer=>{const loss=pairLossView(this.store,peer,this.config);return loss?[{...loss,member_id:peer.id,member_name:peer.name}]:[];}).flat(),bindings:this.store.bindings.all(),endpoints:this.store.endpoints(),messages:this.store.messages(100),questions:this.store.questions(),degraded:this.store.faults.status(),communicationTips:this.store.faults.map('status_tips',this.store.peers(),peer=>peer.id,p=>{const stats=this.communicationTips.summary(p.id);return stats?[{peerId:p.id,host:p.host,...stats}]:[];}).flat(),capabilities:{compatibilityWake:this.config.compatibilityWake,hookObserved:this.store.setting('lastHook')??null,...capability}};}
     const peer=this.actor(actor),pair=this.store.pairFor(peer.id);
@@ -1371,7 +1374,7 @@ export class Broker {
           if(!this.enabled(id))return SKIPPED;
           if(availability.state==='blocked'){
             this.memberLifecycle.delayRetry(id,5000);
-            if(availability.deliveryIssue!=='claude_inbox_missing'){this.store.deactivate(id,endpoint.epoch);this.store.updatePeer(id,{state:'offline'});}
+            if(!availability.deliveryIssue){this.store.deactivate(id,endpoint.epoch);this.store.updatePeer(id,{state:'offline'});}
             return SKIPPED;
           }
           if(endpoint.mode==='embedded'){
@@ -1786,12 +1789,14 @@ export class Broker {
       if(direct?.attempts.length||direct?.continuation?.uncertain||wake?.attempts||unsettled)throw new BridgeError('delivery_unsettled','子代理仍有未确认的消息、输入或唤醒预约，未执行重启；先核对宿主接收状态，不会自动重发。');
     }
   }
-  private async restartCodex(selector:RestartSelector={}):Promise<unknown>{
+  private async restartCodex(selector:RestartSelector={},transport?:{endpoint:Endpoint;options:CodexRestartOptions}):Promise<unknown>{
     const {pair,peer}=this.restartTarget(selector);
+    if(transport&&peer.owner!=='nxbridge')throw new BridgeError('session_changed','原会话已由用户窗口管理，未自动停止。');
     if(peer.owner==='user')return{restarted:false,session_id:peer.sessionId,text:manualCodexRestart(peer)};
     if(this.memberLifecycle.isRestarting(peer.id))throw new BridgeError('restart_in_progress','目标会话正在重启，请勿重复提交。');
     const endpoint=this.store.endpoint(peer.id);
     if(!endpoint||endpoint.mode!=='app-server')throw new BridgeError('unowned_runtime','目标没有可核验的独立 App Server，未执行重启；请通过原生方式恢复原会话。');
+    if(transport&&(endpoint.epoch!==transport.endpoint.epoch||endpoint.address!==transport.endpoint.address))throw new BridgeError('session_changed','连接迁移前原端点已改变，未自动停止。');
     const verifiedUnknown=new Map<string,{attempts:number;updatedAt:number}>();
     const guard=(checkDelivery=true,beforeReconcile=false)=>this.restartGuard(peer,endpoint,pair,checkDelivery,selector,{verifiedUnknown,beforeReconcile});
     const verifyDelivery=async(thread:CodexThread)=>{
@@ -1807,7 +1812,12 @@ export class Broker {
                                             
       await this.pumping;await this.memberLifecycle.preparation(peer.id);guard(false,true);
       await this.reconcile(peer.id);guard(false);
-      const result=await this.adapters.codex.restart(peer,endpoint,guard,{requesterSession:codexRequester(this.store,peer),verifyDelivery});
+      const custody=()=>{
+        const current=this.store.peer(peer.id),currentPair=this.store.pairFor(peer.id);
+        if(this.stopped||current.owner!=='nxbridge'||current.sessionId!==peer.sessionId||currentPair?.id!==pair?.id||currentPair?.paused||!this.enabled(peer.id)||pair&&!this.enabled(pair.claude)||this.takeovers.get(peer.id)||this.memberLifecycle.isRetiring(peer.id))throw new BridgeError('session_changed','原生进程退出后配对、会话或归属已改变，未继续自动启动。');
+      };
+      const result=await this.adapters.codex.restart(peer,endpoint,guard,{...transport?.options,requesterSession:codexRequester(this.store,peer),verifyDelivery,...(transport?{beforeLaunch:async()=>{custody();await transport.options.beforeLaunch?.();custody();}}:{})});
+      if(transport)custody();
       if(this.store.peer(peer.id).state==='paused')this.store.updatePeer(peer.id,{state:'ready'});
       this.store.deactivate(peer.id,endpoint.epoch);
       this.pairAnomalies.restarted(this.store.peer(peer.id));if(pair)this.runtimeHealth.refreshNoticeConditions(pair,'codex_restarted');
@@ -1816,7 +1826,11 @@ export class Broker {
       const response={restarted:true,session_id:peer.sessionId,old_pid:result.oldPid,pid:result.pid,notes:result.notes??[],text:`Codex 已用新运行时恢复原会话 ${peer.sessionId}（进程 ${result.oldPid} → ${result.pid}）。历史、模型 ${result.resumed.model} 和推理强度 ${result.resumed.reasoningEffort??'默认'} 保持；后续调用加载当前 MCP、插件和技能。`+(result.notes?.length?'\n'+result.notes.join('\n'):'')};
       return response;
     }catch(error){
-      if(error instanceof BridgeError&&error.code==='restart_incomplete')this.store.updatePeer(peer.id,{state:'paused',pauseReason:'restart_incomplete'});
+      if(error instanceof BridgeError&&error.code==='restart_incomplete'){
+        const current=this.store.peer(peer.id);
+        if(!transport)this.store.updatePeer(peer.id,{state:'paused',pauseReason:'restart_incomplete'});
+        else if(current.owner==='nxbridge'&&current.sessionId===peer.sessionId&&current.state!=='paused')this.store.updatePeer(peer.id,{state:'offline',pauseReason:undefined});
+      }
       if(!(error instanceof BridgeError))throw new BridgeError('restart_verification_failed','无法完成宿主核验，未发出停止请求。原因：'+describeError(error));
       throw error;
     }finally{releaseRestart();queueMicrotask(()=>void this.pump());}

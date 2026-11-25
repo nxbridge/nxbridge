@@ -207,7 +207,7 @@ nxbridge doctor      # 检查安装和运行状态
 nxbridge doctor --current  # 在 Claude 或 Codex 里只检查本窗口的配对
 nxbridge adopt codex       # 把 Codex 会话交给后台接着跑（同一会话、同一搭档）
 nxbridge release codex     # 把后台 Codex 会话长期交给你自己的窗口
-nxbridge partner-profile codex --model <模型>  # 查看或修改后台搭档的模型和推理强度
+nxbridge partner-profile codex --model <模型>  # 查看或修改后台搭档的模型、推理强度和服务档位
 ```
 
 有多组配对时：
@@ -241,19 +241,32 @@ nxbridge 在后台启动的 Codex 默认不需要你批准（见“后台搭档�
 
 nxbridge 不会替你批准。
 
-### 后台搭档的模型和推理强度
+### 后台搭档的模型、推理强度和服务档位
 
-默认情况下，nxbridge 新建的后台搭档用 Codex 或 Claude 自己的默认设置，这份设置和你平时用的 Codex、Claude 共用。默认模型一变（比如你在别的地方切换过），之后新建的后台搭档也会跟着变。不想这样时，有两种做法：
+默认情况下，nxbridge 新建的后台搭档用 nxbridge 推荐的设置，不受你平时 Codex、Claude 配置的影响：
 
-- **固定下来：** 把 `partners.codex.profile_source` 设成 `frozen`。下一个新建的后台 Codex 实际用的模型和推理强度会被记下（新建时单独指定过的值不算），以后新建的都沿用，不再跟着默认设置变。改回 `host` 就恢复跟随。Claude 用 `partners.claude.profile_source`。
-- **直接指定：** 设置 `partners.codex.model` 和 `partners.codex.effort`（Claude 是 `partners.claude.*`），新建的后台搭档就用这两个值。只设其中一项也可以。
+| | 模型 | 推理强度 | 服务档位 |
+|---|---|---|---|
+| 后台 Codex | gpt-6.2-sol | xhigh | 标准 |
+| 后台 Claude | Opus 5.5 | xhigh | （Claude 没有这一项） |
+
+想用别的设置，有两种方式：
+
+- **让 AI 指定：** 告诉 Claude 或 Codex 想用什么，它新建后台搭档时会照此指定，也可以之后再改。
+- **遵循你自己的配置：** 把 `partners.codex.profile_source` 设成 `host`，新建的后台 Codex 就按你的 Codex `config.toml` 来；Claude 用 `partners.claude.profile_source`。改回 `recommended` 就恢复推荐设置。
+
+也可以在 nxbridge 配置里直接写明某一项：`partners.codex.model`、`partners.codex.effort`、`partners.codex.service_tier`，Claude 是 `partners.claude.model` 和 `partners.claude.effort`。写明的项优先于上面的默认值。
+
+服务档位有三种：`standard` 标准，`fast` 优先处理（更快，费用更高），`flex` 弹性处理（费用更低，可能更慢）。
+
+推荐的模型在你的模型服务里用不了时，新建会报错并说明原因，不会换成别的模型，按上面任一方式换一个就行。
 
 这几项都属于敏感设置：可以让 Claude 或 Codex 帮你提出改动，再由你亲手确认（见下面的“配置”）。已经在运行的后台搭档不受这些设置影响。
 
-要改正在用的后台搭档，直接告诉 Claude 或 Codex 想换成什么模型或推理强度，或者在终端运行：
+要改正在用的后台搭档，直接告诉 Claude 或 Codex 想换成什么，或者在终端运行：
 
 ```sh
-nxbridge partner-profile codex --model <模型> --effort <推理强度>
+nxbridge partner-profile codex --model <模型> --effort <推理强度> --service-tier <standard|fast|flex>
 ```
 
 - 搭档正在工作时不会被打断，等这一轮做完再换。
@@ -524,13 +537,15 @@ AI 只能帮你关闭，不能替你打开。重新打开需要你亲手操作�
 - **回收：** 处理好原因后（比如关掉还连着它的窗口），运行 `nxbridge retire --member <成员ID>` 让 nxbridge 重新核验后回收。这条命令只回收已经解除配对、由 nxbridge 启动的成员，确认不了时照样保留进程，并在输出里列出核验了什么、哪一步没通过。
 - **只剩记录：** 从来没真正启动起来的后台搭档只剩一条记录，nxbridge 不会自动反复重试。
 
-### Claude 窗口突然收不到消息（macOS / Linux）
+### 提示接收消息的连接文件不见了（macOS / Linux）
 
 状态栏提示“本窗口接收消息的连接文件不见了”，通常是系统清理临时文件时（比如 macOS 磁盘快满时）把这个文件删掉了。会话本身没有问题，只是外面的消息进不来了，这个文件也没法从外面补回来。
 
 等这个 Claude 空闲时退出它，在原来的目录、用原来的方式加 `--resume <会话 ID>` 重新打开（状态栏里写着具体的会话 ID）。nxbridge 接回原来的搭档后，积压的消息会自动补发，Codex 不用重发。
 
-nxbridge 在后台启动的 Claude 把连接文件放在 nxbridge 自己的目录里，不会被这样删掉。更新前就已经在运行的后台 Claude 如果遇到这种情况，会在空闲时自动恢复；没法确认能安全重启的，会在状态里说明。
+nxbridge 在后台启动的 Claude 把连接文件放在 nxbridge 自己的目录里，不会被这样删掉。更新前就在运行的后台 Claude，会在空闲时自动重启一次（会话不变），搬到 nxbridge 的目录；Claude 版本太旧、不支持指定位置时，仍放在原来的位置。
+
+后台 Codex 的连接文件位置是 Codex 自己定死的，在 macOS 上搬不走。被删时 nxbridge 会在它空闲时自动重启恢复；确认不了它是否空闲时，状态栏会告诉你怎么手动结束原来的进程。你自己打开的 Codex 窗口遇到同样的情况，状态栏会提示你空闲时退出，再用 `codex --no-daemon resume <会话 ID>` 重新打开。
 
 ### 新开的 Codex 窗口还没开始对话
 

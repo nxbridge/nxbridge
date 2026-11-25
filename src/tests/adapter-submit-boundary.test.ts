@@ -40,7 +40,7 @@ test('POSIX 自有 Claude 恢复将持久收件地址附加到原会话 ID',{ski
   const home=temporary(t),configHome=path.join(home,'claude'),projects=path.join(configHome,'projects'),program=path.join(home,'claude.cjs'),argumentsFile=path.join(home,'arguments.json');
   const sessionId='00000000-0000-4000-8000-000000000001';
   mkdirSync(projects,{recursive:true});writeFileSync(path.join(projects,sessionId+'.jsonl'),'','utf8');
-  writeFileSync(program,`const args=process.argv.slice(2);if(args[0]==='--version')console.log('2.1.332 (Claude Code)');else{require('node:fs').writeFileSync(${JSON.stringify(argumentsFile)},JSON.stringify(args));process.exitCode=1;}`,'utf8');
+  writeFileSync(program,`const args=process.argv.slice(2);if(args[0]==='--version')console.log('2.1.332 (Claude Code)');else if(args.at(-1)==='--nxbridge-capability-probe'){console.error("error: unknown option '--nxbridge-capability-probe'");process.exitCode=1;}else{require('node:fs').writeFileSync(${JSON.stringify(argumentsFile)},JSON.stringify(args));process.exitCode=1;}`,'utf8');
   const store=new Store(':memory:'),peer={...store.placeholder('claude',home),sessionId},adapter=new ClaudeAdapter({...DEFAULT_CONFIG,claudeHome:configHome,claudeBinary:program},home);
   t.after(()=>{adapter.close();store.close();});
   await assert.rejects(adapter.wake(peer));

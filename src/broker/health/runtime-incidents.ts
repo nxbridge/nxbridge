@@ -19,6 +19,11 @@ export function missingClaudeInboxModelText(peer:Peer,self=false):string{
   const action=peer.owner==='nxbridge'?'nxbridge attempts a bounded same-session restart at safe idle; if blocked, inspect recovery in nxbridge status.':`Tell the user: at idle exit ${self?'this Claude window':'that Claude window'}, then use its original launch in its cwd with --resume ${peer.sessionId}.`;
   return`${subject} ${action} Safely unsent messages flush after re-registration; messages kept, do not resend. Uncertain sends are never replayed.`;
 }
+export function missingCodexSocketModelText(peer:Peer,self=false):string{
+  const subject=self?'Your Codex protected socket pathname is missing; new native connections cannot reach this process.':'Codex partner protected socket pathname is missing (possibly OS temporary cleanup); its process is alive.';
+  const action=peer.owner==='nxbridge'?'nxbridge attempts a bounded same-session restart only with verified idle work and its original attested live connection; inspect recovery if held.':`Tell user: at idle exit that Codex window, then in its original cwd and launch environment run codex --no-daemon resume ${peer.sessionId}.`;
+  return`${subject} ${action} Messages are kept; do not resend. Uncertain sends are never replayed.`;
+}
 const delays=[1000,2000,4000,8000,15000,30000,60000];
 const key=(id:string)=>'runtimeIncident:'+id;
 const scope=(peer:Peer,endpoint?:Endpoint)=>JSON.stringify([peer.sessionId,endpoint?.runtimeId??endpoint?.native?.procStart??endpoint?.procStart??endpoint?.epoch]);
@@ -47,13 +52,17 @@ export class RuntimeIncidents {
   canAttempt(peer:Peer,endpoint?:Endpoint):boolean{
     const value=this.current(peer,endpoint);if(!value)return true;
                                         
-    if(value.code==='claude_inbox_missing')return true;
+    if(['claude_inbox_missing','codex_socket_target_missing'].includes(value.code))return true;
     return value.state==='recovering'||(value.retryAt??Infinity)<=this.now();
   }
   failed(peer:Peer,endpoint:Endpoint|undefined,error:unknown,messageIds:string[]=[]):IncidentStatus{
     const before=this.storage.setting<Incident>(key(peer.id)),identity=scope(peer,endpoint),cause=faultCause(error),same=before&&!before.closed&&before.scope===identity;
     if(cause.code==='claude_inbox_missing'){
       Object.assign(cause,{layer:'transport',causeClass:'configuration',userText:peer.owner==='nxbridge'?'后台 Claude 接收消息的连接文件不见了（可能被系统清理删掉），正在空闲时自动重启恢复':'本窗口接收消息的连接文件不见了（可能被系统清理删掉），收不到 Codex 的消息，会话本身正常',action:peer.owner==='nxbridge'?{owner:'runtime',text:'在安全空闲点自动恢复同一会话；待发消息保留，结果不明的发送不重放。'}:{owner:'user',text:`空闲时退出本窗口，在原目录加 --resume ${peer.sessionId} 重新打开，积压的消息会自动补发`}});
+      if(same&&before.code===cause.code&&!before.successAt)return this.current(peer,endpoint)!;
+    }
+    if(cause.code==='codex_socket_target_missing'){
+      Object.assign(cause,{layer:'transport',causeClass:'configuration',userText:peer.owner==='nxbridge'?'后台 Codex 接收消息的连接文件不见了（可能被系统清理删掉），正在空闲时自动重启恢复':'这个 Codex 窗口接收消息的连接文件不见了（可能被系统清理删掉），消息发不进去，会话本身正常',action:peer.owner==='nxbridge'?{owner:'runtime',text:'只在核验原连接和全部工作空闲后恢复同一会话；待发消息保留，结果不明的发送不重放。'}:{owner:'user',text:`空闲时退出这个 Codex 窗口，在原目录用原来的方式重新打开原会话（codex --no-daemon resume ${peer.sessionId}），积压的消息会自动补发`}});
       if(same&&before.code===cause.code&&!before.successAt)return this.current(peer,endpoint)!;
     }
     const attempts=(same?before.attempts:0)+1,since=same?before.since:this.now();

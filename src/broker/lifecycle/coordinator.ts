@@ -14,7 +14,7 @@ import {returnLegacyTakeover} from '../recovery/legacy-takeover.js';
 import {type ManagedConflict,clearManagedConflict} from '../recovery/managed-conflicts.js';
 import {reconcileManagedCodexConflict} from '../../hosts/managed-registration.js';
 import {claudeAutoHolds,claudeAutoKey,observeClaudeAuto,type ClaudeAutoFallback} from '../../hosts/claude/claude-auto-mode.js';
-import {claudeChild,childHandoff,type ClaudeChildRecord} from '../../hosts/claude/claude-child.js';
+import {claudeChild,childCall,childHandoff,type ClaudeChildRecord} from '../../hosts/claude/claude-child.js';
 import {nativeOwnership} from '../../process/owned-native.js';
 import {ownedProcesses} from '../../process/owned-processes.js';
 import {probeProcesses,liveProcess} from '../../process/process.js';
@@ -31,6 +31,9 @@ import {sameDirectory} from '../../shared/files.js';
 import {delay} from '../../shared/time.js';
 import {randomUUID} from 'node:crypto';
 import {SKIPPED} from '../fault-boundary.js';
+import {TransportMigrations,ownedTransportPaths,type TransportMigration} from '../recovery/transport-migration.js';
+import type {CodexRestartOptions} from '../../hosts/codex/adapter.js';
+import {codexSocketAlias} from '../../ipc/unix-socket.js';
 
 interface LifecycleEnvironment {readonly store:Store;readonly config:BridgeConfig;readonly adapters:Adapters;readonly home:string;}
 interface LifecycleServices {
@@ -48,6 +51,7 @@ interface LifecycleHooks {
   stopped():boolean;
   migrateCodexIdentity(peer:Peer,endpoint:Endpoint,error:BridgeError):Promise<void>;
   pumpAfterCurrent():Promise<void>;
+  restartCodexTransport(peer:Peer,endpoint:Endpoint,options:CodexRestartOptions):Promise<unknown>;
 }
 export type StoredLaunchProof=ManagedIncident['proof']&{sessionId:string;restorePairId?:string};
 
@@ -68,7 +72,8 @@ export class BrokerLifecycleCoordinator {
   private parkChecks=new Map<string,number>();
   private fastObserving?:Promise<void>;
   private restarting=new Set<string>();
-  constructor(private readonly environment:LifecycleEnvironment,private readonly services:LifecycleServices,private readonly hooks:LifecycleHooks){}
+  readonly transportMigrations:TransportMigrations;
+  constructor(private readonly environment:LifecycleEnvironment,private readonly services:LifecycleServices,private readonly hooks:LifecycleHooks){this.transportMigrations=new TransportMigrations(environment.store);}
   private enabled(id:string):boolean{const peer=this.environment.store.getPeer(id);return !!peer&&memberEnabled(this.environment.store,peer);}
   private requireEnabled(peer:Peer):void{requireMemberEnabled(this.environment.store,peer);}
   private async pumpStage(stage:string,work:()=>unknown|Promise<unknown>):Promise<boolean>{return this.environment.store.faults.run(stage,work);}
@@ -92,7 +97,7 @@ export class BrokerLifecycleCoordinator {
   clearBackoff(id:string):void{this.clearRetryDelay(id);this.recoveryFailures.delete(id);}
   launchInputsChanged(id?:string):void{if(id===undefined)this.parkChecks.clear();else this.parkChecks.delete(id);}
 
-  async prepare(peer:Peer,extraReason?:string,provisional?:{peerId:string;sessionId:string;authorize?:()=>void;beforeCreate?:()=>void},claimedAttempt?:string):Promise<void>{
+  async prepare(peer:Peer,extraReason?:string,provisional?:{peerId:string;sessionId:string;authorize?:()=>void;beforeCreate?:()=>void},claimedAttempt?:string,migration?:TransportMigration):Promise<void>{
     const {store,adapters}=this.environment;
     this.requireEnabled(peer);
     try{this.services.profileCoordination.profiles.initialize(peer);}catch(error){store.updatePeer(peer.id,{state:'offline',launchFailure:{at:Date.now(),...(error instanceof BridgeError?{code:error.code}:{}),message:describeError(error).slice(0,1200)}});throw error;}
@@ -120,6 +125,7 @@ export class BrokerLifecycleCoordinator {
       if(this.services.takeovers.get(peer.id))throw new BridgeError('foreground_active','前台接管仍在使用原后台，未启动另一运行时。');
       if(!provisional&&peer.owner==='nxbridge'&&peer.sessionId){
         if(hostingRecord(store,peer)?.phase==='adopting')return;
+        if(migration){this.transportMigrations.launchGuard(migration);return;}
         const incident=this.recoveryIncident(peer);
                                                      
         if(claimedAttempt){
@@ -170,7 +176,7 @@ export class BrokerLifecycleCoordinator {
           for(const old of store.endpoints(peer.id))if(old.mode==='app-server'&&old.address!==address)store.deactivate(peer.id,old.epoch);
         }
       }else if(peer.owner==='nxbridge'){
-        const saved=store.setting<ManagedIncident['proof']&{sessionId:string}>('managedLaunchProof:'+peer.id),affinity={...(saved?.sessionId===peer.sessionId?saved:{}),configHome:partnerConfigHome(store,peer)};
+        const saved=store.setting<ManagedIncident['proof']&{sessionId:string}>('managedLaunchProof:'+peer.id),interrupted=this.transportMigrations.get(peer.id),affinity={...(saved?.sessionId===peer.sessionId?saved:{}),configHome:partnerConfigHome(store,peer),...(interrupted?.sessionId===peer.sessionId&&interrupted.attempts&&['unknown','restarting'].includes(interrupted.state)?{modelProfile:interrupted.profile}:{})};
         guard();await adapters.claude.wake(peer,undefined,undefined,beforeLaunch,affinity);guard();const registration=await adapters.claude.discover(peer.sessionId);
         if(!registration)throw new BridgeError('plugin_unavailable','恢复的 Claude 尚未发布同一会话的 inbox。');
         store.adopt(peer.id,registration);
@@ -181,12 +187,12 @@ export class BrokerLifecycleCoordinator {
       await work;if(provisional)guard();
       if(peer.host==='codex')this.rememberManagedLaunch(peer.id);
       this.retryAt.delete(peer.id);this.recoveryAt.delete(peer.id);this.recoveryFailures.delete(peer.id);
-      const incident=this.services.managedRecovery.get(peer.id);if(incident?.state==='recovering')this.services.managedRecovery.settled(incident);
+      const incident=this.services.managedRecovery.get(peer.id);if(!migration&&incident?.state==='recovering')this.services.managedRecovery.settled(incident);
       const saved=store.setting<StoredLaunchProof>('managedLaunchProof:'+peer.id);
       if(saved?.nativeLaunchId&&saved.sessionId===peer.sessionId&&saved.restorePairId===store.pairFor(peer.id)?.id)store.setSetting('managedLaunchProof:'+peer.id,null);
       if(store.peer(peer.id).launchFailure)store.updatePeer(peer.id,{launchFailure:undefined});
     }
-    catch(error){if(peer.owner==='nxbridge'&&this.enabled(peer.id)&&!isCodexIdentityError(error)){store.updatePeer(peer.id,{state:'offline',launchFailure:{at:Date.now(),...(error instanceof BridgeError?{code:error.code}:{}),message:describeError(error).slice(0,1200)}});if(error instanceof BridgeError&&error.code==='bootstrap_policy_unsupported'&&store.pairFor(peer.id)){const key=(error as BridgeError&{bootstrapProbeKey?:string}).bootstrapProbeKey;writeHosting(store,peer,{verifying:false,reason:error.code,userStep:error.message,bootstrapProbeKey:key,nextAt:key?Number.MAX_SAFE_INTEGER:Date.now()+30000});}}throw error;}
+    catch(failure){const error=this.services.profileCoordination.profiles.launchError(store.getPeer(peer.id)??peer,failure);if(peer.owner==='nxbridge'&&this.enabled(peer.id)&&!isCodexIdentityError(error)){store.updatePeer(peer.id,{state:'offline',launchFailure:{at:Date.now(),...(error instanceof BridgeError?{code:error.code}:{}),message:describeError(error).slice(0,1200)}});if(error instanceof BridgeError&&error.code==='bootstrap_policy_unsupported'&&store.pairFor(peer.id)){const key=(error as BridgeError&{bootstrapProbeKey?:string}).bootstrapProbeKey;writeHosting(store,peer,{verifying:false,reason:error.code,userStep:error.message,bootstrapProbeKey:key,nextAt:key?Number.MAX_SAFE_INTEGER:Date.now()+30000});}}throw error;}
     finally{this.preparing.delete(peer.id);}
   }
   ownedClaudeLaunchReady(peer:Peer):boolean{
@@ -255,8 +261,13 @@ export class BrokerLifecycleCoordinator {
       if(peer.host==='codex'&&hostingRecord(store,peer)?.phase==='adopting'){await this.services.transfers.adopt(peer);return true;}
       if(peer.owner==='nxbridge'){
         const active=store.endpoint(peer.id);
-        if(peer.host==='claude'&&active&&(await this.services.runtimeHealth.probeRuntime(peer)).deliveryIssue==='claude_inbox_missing'){
+        const issue=active?(await this.services.runtimeHealth.probeRuntime(peer)).deliveryIssue:undefined;
+        if(peer.host==='claude'&&active&&issue==='claude_inbox_missing'){
           await this.repairClaudeInbox(peer,active,extraReason);
+          const restored=store.endpoint(peer.id);return !!restored&&restored.epoch!==active.epoch;
+        }
+        if(peer.host==='codex'&&active&&issue==='codex_socket_target_missing'){
+          await this.restartCodexTransport(peer,active,undefined,extraReason);
           const restored=store.endpoint(peer.id);return !!restored&&restored.epoch!==active.epoch;
         }
         await this.prepare(peer,extraReason);
@@ -276,7 +287,10 @@ export class BrokerLifecycleCoordinator {
       if(peer.owner==='nxbridge'&&peer.sessionId)incident=this.recoveryIncident(peer);
       if(incident){
         if(recoveryPrecondition(error))this.services.managedRecovery.blocked(incident,error,parkLaunchFailure(error,this.environment.home,this.environment.config,peer,incident.configHome,incident.proof));
-        else if(!['recovery_backoff','recovery_exhausted','recovery_rate_limited','recovery_not_exhausted'].includes((error as BridgeError).code))this.services.managedRecovery.settled(incident,error,!!incident.attempts.length&&['runtime_launch_unconfirmed','claude_start_pending','claude_child_pending','claude_release_pending','recovery_uncertain','timeout'].includes((error as BridgeError).code));
+        else if(!['recovery_backoff','recovery_exhausted','recovery_rate_limited','recovery_not_exhausted'].includes((error as BridgeError).code)){
+          const migration=this.transportMigrations.get(peer.id),interrupted=migration?.sessionId===peer.sessionId&&migration.attempts>0&&['unknown','restarting'].includes(migration.state);
+          this.services.managedRecovery.settled(incident,error,(!!incident.attempts.length||interrupted)&&['runtime_launch_unconfirmed','claude_start_pending','claude_child_pending','claude_release_pending','recovery_uncertain','process_identity_unknown','timeout'].includes((error as BridgeError).code));
+        }
         this.publishRecovery(this.services.managedRecovery.get(peer.id)!,peer,'recovery held: '+describeError(error));return false;
       }
       const failures=(this.recoveryFailures.get(peer.id)??0)+1,wait=Math.min(60000,1000*2**Math.min(failures-1,6));
@@ -497,15 +511,28 @@ export class BrokerLifecycleCoordinator {
                                          
     const child=process.platform==='linux'&&peer.host==='claude'?claudeChild(this.environment.home,id):undefined;
     if(peer.owner==='nxbridge'&&child&&['handoff','user'].includes(child.phase))return;
+    if(peer.owner==='nxbridge')this.transportMigrations.reconcile(id);
     for(const endpoint of store.endpoints(id))if(endpoint.active&&!endpoint.daemon&&endpoint.pid&&!liveProcess(endpoint.pid))store.deactivate(id,endpoint.epoch);
     const endpoint=store.endpoint(id);
     if(endpoint?.pendingContext)return;
     let restore:(()=>Promise<unknown>)|undefined;
     if(peer.owner==='nxbridge'){
-      const availability=endpoint&&peer.host==='claude'?await this.services.runtimeHealth.probeRuntime(peer):undefined;
+      const availability=endpoint?await this.services.runtimeHealth.probeRuntime(peer):undefined;
       if(availability?.deliveryIssue==='claude_inbox_missing'){
         this.services.managedRecovery.ready(id,false);
         await this.repairClaudeInbox(peer,endpoint!);return;
+      }
+      if(availability?.deliveryIssue==='codex_socket_target_missing'){
+        this.services.managedRecovery.ready(id,false);
+        await this.restartCodexTransport(peer,endpoint!);return;
+      }
+      if(endpoint&&peer.sessionId){
+        const migration=this.observeTransport(peer,endpoint);
+        if(migration&&this.transportMigrations.due(migration)){
+          if(peer.host==='claude')await this.repairClaudeInbox(peer,endpoint,undefined,migration);
+          else await this.restartCodexTransport(peer,endpoint,migration);
+          return;
+        }
       }
       this.services.managedRecovery.ready(id,!!endpoint&&peer.state!=='offline'&&(!availability||availability.state==='reachable'));
       if(!peer.sessionId){if(hasPending&&!peer.launchFailure)restore=()=>this.prepare(peer);}
@@ -514,28 +541,88 @@ export class BrokerLifecycleCoordinator {
     if(restore){this.restoringMembers.add(id);try{await restore();}finally{this.restoringMembers.delete(id);}}
   }
 
+  private observeTransport(peer:Peer,endpoint:Endpoint):TransportMigration|undefined{
+    const {home,store}=this.environment,child=peer.host==='claude'?claudeChild(home,peer.id):undefined;
+    const runtime=peer.host==='codex'?runtimeFor(home,{endpoint:endpoint.address})?.value:undefined;
+    const owners=ownedProcesses(home).records,paths=ownedTransportPaths(home,peer,endpoint,owners,child,runtime);
+    return this.transportMigrations.observe(peer,store.pairFor(peer.id)?.id??'',endpoint,paths);
+  }
+  transportStatus(peer:Peer):unknown{
+    const value=this.transportMigrations.get(peer.id),migration=value?.sessionId===peer.sessionId?value:undefined;
+    const endpoint=this.environment.store.endpoint(peer.id);
+    let limitation:unknown;
+    if(process.platform==='darwin'&&peer.host==='codex'&&endpoint?.address.startsWith('unix://')){
+      try{limitation={code:'native_fixed_directory',path:codexSocketAlias(endpoint.address.slice(7)),reason:'Codex 原生保护 socket 固定在系统临时目录；当前接口不能迁到持久目录。路径丢失后只在核验安全空闲和原连接后恢复同一会话。'};}catch{}
+    }
+    return migration||limitation?{...(migration?{id:migration.id,state:migration.state,source:migration.source,paths:migration.paths,attempts:migration.attempts,max_attempts:1,code:migration.code,reason:migration.reason,next_at:migration.nextAt,replacement:migration.replacement}:{}),...(limitation?{limitation}:{})}:undefined;
+  }
+  private async restartCodexTransport(peer:Peer,endpoint:Endpoint,migration?:TransportMigration,extraReason?:string):Promise<void>{
+    const {store}=this.environment,pair=store.pairFor(peer.id);
+    if(!pair||pair.paused||peer.owner!=='nxbridge'||!peer.sessionId||this.restarting.has(peer.id)||this.retiring.has(peer.id)||this.services.takeovers.get(peer.id))return;
+    const engine=this.services.managedRecovery,incident=migration?undefined:this.recoveryIncident(peer);
+    if(!migration&&!extraReason&&!engine.due(incident!))return;
+    const hold=(code:string,message:string)=>{
+      if(migration)this.transportMigrations.hold(migration,code,message);
+      else{engine.blocked(incident!,new BridgeError(code,message));this.publishRecovery(incident!,peer,message);}
+    };
+    if(peer.state!=='ready'){hold('session_busy','原会话仍在工作，等待安全空闲后处理连接。');return;}
+    if(store.restartUnsettled(peer.id)||store.questions(true).some(question=>question.from===peer.id||question.to===peer.id)){hold('delivery_unsettled','原会话还有问题或未结算的消息，未自动停止。');return;}
+    const runtime=runtimeFor(this.environment.home,{endpoint:endpoint.address})?.value;
+    if(runtime?.kind!=='owned'||runtime.peerId!==peer.id||endpoint.daemon){hold('owner_unverified','该原生连接没有独立的 nxbridge 启动归属，未停止共享后台或用户窗口。');return;}
+    const custody=()=>{
+      const current=store.peer(peer.id),currentPair=store.pairFor(peer.id);
+      if(this.hooks.stopped()||current.owner!=='nxbridge'||current.sessionId!==peer.sessionId||currentPair?.id!==pair.id||currentPair.paused||!this.enabled(peer.id)||!this.enabled(pair.claude)||this.services.takeovers.get(peer.id)||this.retiring.has(peer.id)||store.setting('managedSessionConflict:'+peer.id))throw new BridgeError('session_changed','连接处理期间原会话、配对或归属已改变，未继续启动。');
+    };
+    this.restoringMembers.add(peer.id);
+    try{
+      await this.hooks.restartCodexTransport(peer,endpoint,{
+        lostSocketRecovery:!migration,
+        beforeStop:()=>{
+          custody();const current=store.peer(peer.id),ep=store.endpoint(peer.id);
+          if(!ep||ep.epoch!==endpoint.epoch||current.state!=='ready'||store.restartUnsettled(peer.id)||store.questions(true).some(question=>question.from===peer.id||question.to===peer.id))throw new BridgeError('session_busy','原会话在停止前开始工作或连接已改变，已保留原进程。');
+          if(migration)this.transportMigrations.claim(migration,current,ep,pair.id);else engine.claim(incident!,extraReason);
+        },
+        beforeLaunch:async()=>{
+          custody();await this.assertNoLiveSessionHolder(peer);custody();
+          if(migration){this.transportMigrations.launching(migration);this.transportMigrations.launchGuard(migration);}
+          else if(engine.get(peer.id)?.state!=='recovering')throw new BridgeError('incident_changed','原连接恢复预约已改变，未重复启动。');
+        },
+      });
+      const replacement=store.endpoint(peer.id);
+      if(migration){if(replacement)this.observeTransport(store.peer(peer.id),replacement);}
+      else{engine.settled(incident!);this.publishRecovery(incident!,store.peer(peer.id),'restored same Codex session at verified idle; uncertain messages were not replayed');}
+    }catch(error){
+      if(migration)this.transportMigrations.failed(migration,error);
+      else{
+        if(incident!.attempts.length&&['restart_incomplete','timeout','runtime_launch_unconfirmed'].includes((error as BridgeError).code))engine.settled(incident!,error,true);
+        else if(!['recovery_exhausted','recovery_rate_limited','recovery_uncertain','recovery_not_exhausted'].includes((error as BridgeError).code))engine.blocked(incident!,error);
+        this.publishRecovery(engine.get(peer.id)!,store.peer(peer.id),'Codex socket recovery held: '+describeError(error));
+      }
+    }finally{this.restoringMembers.delete(peer.id);}
+  }
+
                                              
-  private async repairClaudeInbox(peer:Peer,endpoint:Endpoint,extraReason?:string):Promise<void>{
+  private async repairClaudeInbox(peer:Peer,endpoint:Endpoint,extraReason?:string,migration?:TransportMigration):Promise<void>{
     const {store,home,adapters}=this.environment,pair=store.pairFor(peer.id),current=store.peer(peer.id);
     if(this.hooks.stopped()||!pair||pair.paused||current.owner!=='nxbridge'||current.sessionId!==peer.sessionId||store.endpoint(peer.id)?.epoch!==endpoint.epoch||this.restarting.has(peer.id)||this.retiring.has(peer.id)||this.services.takeovers.get(peer.id))return;
     peer=current;
-    const incident=this.recoveryIncident(peer),engine=this.services.managedRecovery;
-    if(!extraReason&&!engine.due(incident))return;
-    const blocked=(code:string,message:string)=>{engine.blocked(incident,new BridgeError(code,message));this.publishRecovery(incident,peer,message);};
-    if(claudeChild(home,peer.id)){
-                                                                 
-      blocked('claude_inbox_idle_unverified','此托管 Claude 缺少完整的空闲及定时任务快照，未停止原会话；下一次正常启动会改用持久目录中的消息连接。');return;
-    }
-    if(peer.state!=='ready')return;
+    const incident=migration?undefined:this.recoveryIncident(peer),engine=this.services.managedRecovery;
+    if(!migration&&!extraReason&&!engine.due(incident!))return;
+    const blocked=(code:string,message:string)=>{
+      if(migration)this.transportMigrations.hold(migration,code,message,code==='claude_inbox_migration_unsupported');
+      else{engine.blocked(incident!,new BridgeError(code,message));this.publishRecovery(incident!,peer,message);}
+    };
+    if(peer.state!=='ready'){if(migration)blocked('session_busy','等待原会话空闲后迁移，当前连接继续使用。');return;}
     const health=endpoint.nativeHealth,background=endpoint.nativeBackground;
     if(!health){blocked('claude_inbox_idle_unverified','缺少原生轮次的空闲快照，未停止原会话；等待原生窗口发布完整空闲证据。');return;}
-    if(!['ready','failed'].includes(health.state)||health.tools.length)return;
+    if(!['ready','failed'].includes(health.state)||health.tools.length){if(migration)blocked('session_busy','原会话仍在工作，等待完整空闲快照后迁移。');return;}
     if(background?.tasks===undefined||background.crons===undefined){blocked('claude_inbox_idle_unverified','无法核验后台任务和定时任务，未停止原会话；等待原生窗口发布完整空闲快照。');return;}
-    if(background.tasks||background.crons){blocked('claude_inbox_scheduled_work','原会话还有后台任务或定时任务，自动重启会丢失运行中的工作，已保留原会话。');return;}
+    if(background.tasks||background.crons||background.observedAt<health.lastProgressAt){blocked('claude_inbox_scheduled_work','等待原会话的后台任务、定时任务和当前轮次结束后自动处理，已保留原会话。');return;}
     if(store.restartUnsettled(peer.id)){blocked('claude_inbox_delivery_unsettled','原会话还有未结算的投递，未停止或重放；请核对 nxbridge status 中原消息的接收情况。');return;}
     if(store.questions(true).some(q=>q.from===peer.id||q.to===peer.id))return;
-    const proof=nativeOwnership(home,peer.id);
-    if(!proof||proof.phase!=='bound'||proof.releasedToUser||proof.sessionId!==peer.sessionId||proof.native?.pid!==endpoint.pid||proof.native.startedAt!==endpoint.procStart){blocked('claude_inbox_owner_unverified','无法核验原生后台的启动归属，未停止任何进程。');return;}
+    const proof=nativeOwnership(home,peer.id),child=claudeChild(home,peer.id);
+    const childOwned=!!child&&child.phase==='active'&&child.sessionId===peer.sessionId&&child.native?.pid===endpoint.pid&&child.native.startedAt===endpoint.procStart&&!!child.worker;
+    if(child?!childOwned:!proof||proof.phase!=='bound'||proof.releasedToUser||proof.sessionId!==peer.sessionId||proof.native?.pid!==endpoint.pid||proof.native.startedAt!==endpoint.procStart){blocked('claude_inbox_owner_unverified','无法核验原生后台的启动归属，未停止任何进程。');return;}
     const pairId=store.pairFor(peer.id)!.id;
     const guard=()=>{
       const current=store.peer(peer.id),pair=store.pairFor(peer.id);
@@ -543,20 +630,35 @@ export class BrokerLifecycleCoordinator {
     };
     this.restarting.add(peer.id);this.restoringMembers.add(peer.id);
     try{
-      guard();this.rememberManagedLaunch(peer.id);
-                                             
-      const attempt=engine.claim(incident,extraReason);
-      await adapters.claude.release(peer,agent=>{
-        guard();const current=store.peer(peer.id),ep=store.endpoint(peer.id),source=nativeOwnership(home,peer.id);
-        if(agent.status!=='idle'||agent.pid!==endpoint.pid||ep?.epoch!==endpoint.epoch||current.state!=='ready'||!ep.nativeHealth||!['ready','failed'].includes(ep.nativeHealth.state)||ep.nativeHealth.tools.length||ep.nativeBackground?.tasks!==0||ep.nativeBackground.crons!==0||store.restartUnsettled(peer.id)||store.questions(true).some(q=>q.from===peer.id||q.to===peer.id))throw new BridgeError('session_busy','后台尚有工作、审批或未结算投递，等待安全空闲点恢复消息连接。');
-        if(source?.id!==proof.id||source.native?.pid!==endpoint.pid||source.native.startedAt!==endpoint.procStart)throw new BridgeError('process_record_changed','消息连接恢复前原生进程代次已改变，未停止后继会话。');
+      guard();const profile=await adapters.claude.preflightRestart(peer,endpoint);guard();
+      if(migration&&profile)this.transportMigrations.rememberProfile(migration,profile);
+      this.rememberManagedLaunch(peer.id);
+      let attemptId:string|undefined;
+      await adapters.claude.release(peer,async agent=>{
+        const idle=()=>{
+          guard();const current=store.peer(peer.id),ep=store.endpoint(peer.id),source=nativeOwnership(home,peer.id),worker=claudeChild(home,peer.id);
+          if(agent.status!=='idle'||agent.pid!==endpoint.pid||ep?.epoch!==endpoint.epoch||current.state!=='ready'||!ep.nativeHealth||!['ready','failed'].includes(ep.nativeHealth.state)||ep.nativeHealth.tools.length||ep.nativeBackground?.tasks!==0||ep.nativeBackground.crons!==0||ep.nativeBackground.observedAt<ep.nativeHealth.lastProgressAt||store.restartUnsettled(peer.id)||store.questions(true).some(q=>q.from===peer.id||q.to===peer.id))throw new BridgeError('session_busy','后台尚有工作、审批或未结算投递，等待安全空闲点恢复消息连接。');
+          if(childOwned){
+            if(worker?.worker?.pid!==child!.worker!.pid||worker.worker.startedAt!==child!.worker!.startedAt||worker.native?.pid!==endpoint.pid||worker.native.startedAt!==endpoint.procStart)throw new BridgeError('process_record_changed','Claude worker 或原生进程代次已改变，未停止。');
+          }else if(source?.id!==proof!.id||source.native?.pid!==endpoint.pid||source.native.startedAt!==endpoint.procStart)throw new BridgeError('process_record_changed','消息连接恢复前原生进程代次已改变，未停止后继会话。');
+        };
+        idle();await adapters.claude.assertIdleWorkload(peer,endpoint);idle();
+                                       
+        if(migration)this.transportMigrations.claim(migration,store.peer(peer.id),store.endpoint(peer.id)!,pairId);
+        else attemptId=engine.claim(incident!,extraReason).id;
       });
       guard();store.deactivate(peer.id,endpoint.epoch);store.updatePeer(peer.id,{state:'offline'});
-      await this.prepare(store.peer(peer.id),undefined,undefined,attempt.id);
-      this.publishRecovery(engine.get(peer.id)!,store.peer(peer.id),'restored same session after missing inbox; only safely unsent messages will flush');
+      if(migration)this.transportMigrations.launching(migration);
+      await this.prepare(store.peer(peer.id),undefined,undefined,attemptId,migration);
+      const replacement=store.endpoint(peer.id);if(migration&&replacement)this.observeTransport(store.peer(peer.id),replacement);
+      if(!migration)this.publishRecovery(engine.get(peer.id)!,store.peer(peer.id),'restored same session after missing inbox; only safely unsent messages will flush');
     }catch(error){
-      if(!['recovery_exhausted','recovery_rate_limited','recovery_uncertain'].includes((error as BridgeError).code))engine.settled(incident,error,['timeout','claude_release_pending','claude_start_pending','claude_child_pending','runtime_launch_unconfirmed'].includes((error as BridgeError).code));
-      this.publishRecovery(engine.get(peer.id)!,store.peer(peer.id),'message connection recovery held: '+describeError(error));
+      if(migration){if((error as BridgeError).code==='claude_inbox_migration_unsupported')blocked((error as BridgeError).code,describeError(error));else this.transportMigrations.failed(migration,error);}
+      else{
+        if(!incident!.attempts.length||recoveryPrecondition(error)||['runtime_workload_active','runtime_workload_unverified','session_busy'].includes((error as BridgeError).code))engine.blocked(incident!,error);
+        else if(!['recovery_exhausted','recovery_rate_limited','recovery_uncertain'].includes((error as BridgeError).code))engine.settled(incident!,error,['timeout','claude_release_pending','claude_start_pending','claude_child_pending','runtime_launch_unconfirmed'].includes((error as BridgeError).code));
+        this.publishRecovery(engine.get(peer.id)!,store.peer(peer.id),'message connection recovery held: '+describeError(error));
+      }
     }finally{this.restarting.delete(peer.id);this.restoringMembers.delete(peer.id);}
   }
   schedulePairedRecovery(id:string,hasPending:boolean):Promise<boolean>{

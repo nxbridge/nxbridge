@@ -6,7 +6,7 @@ export const host=z.enum(['claude','codex']);
 export const actorSchema=z.object({host,memberId:text.optional(),sessionId:text,callId:text,via:z.string().optional(),turnId:text.optional(),binding:z.object({key:text,epoch:text}).optional()});
 export const targetSchema=z.object({actor:actorSchema.optional(),pair_id:text.optional(),peer_id:text.optional(),session_id:text.optional(),native:z.object({host,pid:z.number().int().positive(),procStart:text}).optional()});
 export const restartSchema=targetSchema.extend({partner:z.literal(true).optional()});
-export const profileSchema=z.object({model:z.string().min(1).nullable().optional(),effort:z.union([z.string().min(1),z.number().finite()]).nullable().optional()});
+export const profileSchema=z.object({model:z.string().min(1).nullable().optional(),effort:z.union([z.string().min(1),z.number().finite()]).nullable().optional(),serviceTier:z.string().min(1).nullable().optional()});
 export const processSchema=z.object({pid:z.number().int().positive(),procStart:text});
                                          
 export const hookClientSchema=z.object({hook_pid:z.number().int().positive(),config_home:text,cwd:text,started_at:z.number().finite(),elapsed_ms:z.number().finite().nonnegative(),input:z.record(z.string(),z.unknown())}).strict();

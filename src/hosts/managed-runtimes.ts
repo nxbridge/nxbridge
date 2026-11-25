@@ -15,7 +15,7 @@ export interface ManagedRuntime {
   endpoint:string;pid?:number;procStart?:string;wrapperPid?:number;wrapperProcStart?:string;
   configHome?:string;launchMethod?:string;createdAt:number;error?:string;failureCode?:string;launchSettled?:boolean;bootstrapRevision?:string;
   dedicated?:boolean;executable?:string;version?:string;sessionId?:string;profileId?:string;authenticatedLoopback?:boolean;
-  sessionVerification?:{sessionId:string;profile:SessionProfile};
+  sessionVerification?:{sessionId:string;profile:SessionProfile;restartSourceId?:string};
   threadUnloadDelaySecs?:number;bootId?:string;
 }
 export interface RuntimeRecord {file:string;value:ManagedRuntime}

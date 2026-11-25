@@ -8,7 +8,7 @@ import {BridgeError} from '../shared/errors.js';
 import {type BridgeConfig,type Host} from '../types.js';
 import { CONFIG_FIELDS, configurationField, configValue, legacyDocument, normalizeConfiguration, withConfigValue } from './config-schema.js';
 import { configLocation, parseConfiguration } from '../storage/toml-document.js';
-import { frozenProfileStatus, syncFrozenProfiles } from '../broker/profiles/frozen-profile.js';
+import { freezesProfile, frozenProfileStatus, resolveProfileDefaults, syncFrozenProfiles } from '../broker/profiles/frozen-profile.js';
 
 export interface ConfigurationDocument {
   filename:string;userFile:string;source:'toml'|'legacy-json'|'default';text:string;userText:string;
@@ -88,11 +88,12 @@ export function commitConfiguration(prepared:PreparedConfiguration,origin:Config
 }
 export function configurationStatus(home:string){
   const current=readConfiguration(home),frozen=frozenProfileStatus(home,current.config),captured=frozen.profiles,last=path.join(home,'config-last-change.json');let lastChange:unknown=null;
+  const partnerDefaults=Object.fromEntries((['codex','claude'] as const).map(host=>[host,frozen.warnings.length&&freezesProfile(current.config,host)?null:resolveProfileDefaults(home,current.config,host)]));
   if(existsSync(last))try{
     const raw=JSON.parse(readFileSync(last,'utf8'));
     if(raw&&typeof raw==='object')lastChange={at:typeof raw.at==='number'?raw.at:null,origin:['terminal','migration','setup','claude-user','codex-user','claude-model','codex-model'].includes(raw.origin)?raw.origin:null,keys:Array.isArray(raw.keys)?raw.keys.filter((key:unknown)=>typeof key==='string'&&CONFIG_FIELDS.some(field=>field.key===key)):[],migrated:raw.migrated===true};
   }catch{                             }
-  return{file:current.filename,userFile:current.userFile,source:current.source,warnings:[...current.warnings,...frozen.warnings],lastChange,frozen_profiles:captured,entries:CONFIG_FIELDS.map(field=>{
+  return{file:current.filename,userFile:current.userFile,source:current.source,warnings:[...current.warnings,...frozen.warnings],lastChange,frozen_profiles:captured,partner_defaults:partnerDefaults,entries:CONFIG_FIELDS.map(field=>{
     const user=configValue(current.userDocument,field.key)!==undefined,managed=configValue(current.document,field.key);
     return{key:field.key,value:redactConfigValue(field.key,configValue(current.config,field.internal)),source:user?'user-toml':managed!==undefined?(current.source==='legacy-json'?'legacy-json':'managed-toml'):'default',safe:field.safe,editable:!field.immutable&&!user,...(user&&managed!==undefined?{shadowed:redactConfigValue(field.key,managed)}:{}),...(field.key.endsWith('.profile_source')?{captured:captured[field.key.split('.')[1] as Host]??null}:{})};
   })};

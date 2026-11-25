@@ -101,7 +101,7 @@ const firstPromptText = wait => wait?.reason === "awaiting_first_prompt" ? `Code
                                                         
                     
                                                          
-const profileWanted = view => [view?.requested?.model !== undefined ? '模型 ' + view.requested.model : '', view?.requested?.effort !== undefined ? '推理强度 ' + view.requested.effort : ''].filter(Boolean).join('，');
+const profileWanted = view => [view?.requested?.model !== undefined ? '模型 ' + view.requested.model : '', view?.requested?.effort !== undefined ? '推理强度 ' + view.requested.effort : '', view?.requested?.serviceTier !== undefined ? '服务档位 ' + view.requested.serviceTier : ''].filter(Boolean).join('，');
 const profileHeldText = view => !view?.delivery_held || !profileWanted(view) ? undefined
   : view.status === 'pending' ? `后台 Codex 正在换成${profileWanted(view)}，换好后再收新消息（一直停在这里时运行 nxbridge partner-profile codex --reset）`
   : view.status === 'applied' ? `后台 Codex 正在重新核对${profileWanted(view)}是否仍然生效，核对完再收新消息（一直停在这里时运行 nxbridge partner-profile codex --reset）`

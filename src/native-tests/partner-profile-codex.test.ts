@@ -48,8 +48,8 @@ test('真实自有 Codex：默认与显式选择、原会话双字段切换、�
   }});
   await new Promise<void>(resolve=>model.listen(0,'127.0.0.1',resolve));
   const provider='partner_profile_local',nativeFile=path.join(codexHome,'config.toml');
-  const nativeConfig=(profile:ModelProfile)=>stringify({model:profile.model,model_reasoning_effort:profile.effort,model_provider:provider,approval_policy:'never',sandbox_mode:'read-only',web_search:'disabled',check_for_update_on_startup:false,analytics:{enabled:false},features:{apps:false,remote_plugin:false,code_mode:false},model_providers:{[provider]:{name:'搭档配置原生隔离验收',base_url:`http://127.0.0.1:${(model.address() as AddressInfo).port}/v1`,wire_api:'responses',requires_openai_auth:false,request_max_retries:0,stream_max_retries:0}}});
-  const defaults={model:'gpt-6.1-sol',effort:'xhigh'},selected={model:'gpt-5.1-codex',effort:'medium'};
+  const nativeConfig=(profile:ModelProfile)=>stringify({model:profile.model,model_reasoning_effort:profile.effort,service_tier:'flex',model_provider:provider,approval_policy:'never',sandbox_mode:'read-only',web_search:'disabled',check_for_update_on_startup:false,analytics:{enabled:false},features:{apps:false,remote_plugin:false,code_mode:false},model_providers:{[provider]:{name:'搭档配置原生隔离验收',base_url:`http://127.0.0.1:${(model.address() as AddressInfo).port}/v1`,wire_api:'responses',requires_openai_auth:false,request_max_retries:0,stream_max_retries:0}}});
+  const defaults={model:'gpt-6.1-sol',effort:'xhigh'},selected={model:'gpt-5.1-codex',effort:'medium',serviceTier:'standard'};
   const initialNative=nativeConfig({model:'gpt-5.1-codex',effort:'low'});writeFileSync(nativeFile,initialNative,'utf8');
   config={...DEFAULT_CONFIG,implicit:'on-demand',compatibilityWake:'strict',syncTipMinutes:0,contextTipTokens:[],idleNoticeMinutes:0,codexHome,...(process.env.NXBRIDGE_TEST_CODEX_BINARY?{codexBinary:process.env.NXBRIDGE_TEST_CODEX_BINARY}:{}),partnerProfiles:{codex:{source:'frozen',...defaults}}};
   const database=path.join(home,'profile-state.db');
@@ -84,20 +84,23 @@ test('真实自有 Codex：默认与显式选择、原会话双字段切换、�
       assert.equal(completed.get(started.turn.id).status,'completed');
       const request=bodies.slice(before).find(body=>JSON.stringify(body.input).includes(marker));assert.ok(request,'原生轮次没有到达本地模型');
       assert.equal(request.model,expected.model);assert.equal(request.reasoning?.effort,expected.effort);
+      if(expected.serviceTier!==undefined)assert.equal(request.service_tier,expected.serviceTier==='standard'?undefined:expected.serviceTier);
     }finally{rpc.off('notification',onNotification);}
   };
   const primary=await create('default'),first=await native(primary.peerId);
   assert.equal(first.value.model,defaults.model);assert.equal(first.value.reasoningEffort,defaults.effort);
+  assert.equal(first.value.serviceTier,'flex');
   assert.equal(first.value.modelProvider,provider);assert.equal(sameDirectory(first.value.cwd,root),true);
   const baseline=invariants(first.value),capture=frozenProfiles(home,config).codex!;
   assert.equal(capture.model,defaults.model);assert.equal(capture.effort,defaults.effort);
   assert.equal(readFileSync(nativeFile,'utf8'),initialNative);
-  await run(primary.peerId,'PROFILE_DEFAULT_TURN',defaults);
+  await run(primary.peerId,'PROFILE_DEFAULT_TURN',{...defaults,serviceTier:'flex'});
   const originalPermission=normalizedPermission((await readSessionProfile(first.value.thread.path,primary.sessionId)).settings.permissionProfile);
   assert.ok(originalPermission,'原生权限需要有持久基线');
   const changed=await broker!.dispatch('partner.profile',{actor:primary.actor,action:'set',...selected}) as any;
   assert.equal(changed.status,'applied',JSON.stringify(changed));assert.deepEqual(changed.requested,selected);
   const hot=await native(primary.peerId);assert.equal(hot.value.model,selected.model);assert.equal(hot.value.reasoningEffort,selected.effort);
+  assert.equal(hot.value.serviceTier,'default');
   assert.deepEqual(invariants(hot.value),baseline,'切换模型不得更换会话、提供方、目录或权限');
   await run(primary.peerId,'PROFILE_CHANGED_TURN',selected);
   assert.deepEqual(frozenProfiles(home,config).codex,capture,'成员选择不能改写首次冻结的宿主默认值');
@@ -113,8 +116,10 @@ test('真实自有 Codex：默认与显式选择、原会话双字段切换、�
   assert.equal(bodies.length,beforeRestart,'重启恢复不得调用模型');
   const recovered=await native(primary.peerId);assert.deepEqual(invariants(recovered.value),baseline);
   assert.equal(recovered.value.model,selected.model);assert.equal(recovered.value.reasoningEffort,selected.effort);
+  assert.equal(recovered.value.serviceTier,'default');
   const restored=await readSessionProfile(recovered.value.thread.path,primary.sessionId);
   assert.equal(restored.settings.model,selected.model);assert.equal(restored.settings.reasoningEffort,selected.effort);
+  assert.equal(restored.settings.serviceTier,'default');
   assert.deepEqual(normalizedPermission(restored.settings.permissionProfile),originalPermission);
   assert.equal(store!.pairFor(primary.peerId)?.id,primary.pairId);
   await run(primary.peerId,'PROFILE_RECOVERED_TURN',selected);
@@ -127,5 +132,11 @@ test('真实自有 Codex：默认与显式选择、原会话双字段切换、�
   assert.deepEqual(explicitView.requested,picked);assert.equal(explicitView.source,'explicit');
   await run(explicit.peerId,'PROFILE_PICKED_TURN',picked);
   assert.deepEqual(frozenProfiles(home,config).codex,capture);assert.equal(readFileSync(nativeFile,'utf8'),driftedNative);assert.deepEqual(errors,[]);
+  config.partnerProfiles!.codex={source:'recommended'};
+  const recommended=await create('recommended'),recommendation={model:'gpt-6.2-sol',effort:'xhigh',serviceTier:'standard'};
+  assert.equal((await native(recommended.peerId)).value.serviceTier,'default');
+  const recommendedView=await broker!.dispatch('partner.profile',{host:'codex',peer_id:recommended.peerId,action:'get'}) as any;
+  assert.deepEqual(recommendedView.effective,recommendation);assert.equal(recommendedView.sources.serviceTier,'recommended');
+  await run(recommended.peerId,'PROFILE_RECOMMENDED_OVERRIDES_NATIVE_FLEX',recommendation);
   t.diagnostic(JSON.stringify({session:primary.sessionId,default:defaults,selected,picked,provider,modelRequests:bodies.length,realModelCalls:0,brokerDatabaseReopened:true,nativeRuntimeRestarted:true}));
 });

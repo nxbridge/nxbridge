@@ -11,7 +11,7 @@ export interface UnixSocketIo {
   identity:(pid:number)=>Promise<ProcessIdentity>;listener:(file:string,pid:number)=>Promise<boolean>;
 }
 const uid=()=>process.geteuid?.()??process.getuid?.()??-1;
-const filesystem=()=>({realpath:realpathSync.native,lstat:lstatSync,readlink:readlinkSync,uid:uid()});
+const filesystem=():Pick<UnixSocketIo,'realpath'|'lstat'|'readlink'|'uid'>=>({realpath:realpathSync.native,lstat:lstatSync,readlink:readlinkSync,uid:uid()});
 const stamp=(stat:SocketStat)=>[stat.dev,stat.ino].join(':');
 
                                                                     
@@ -48,7 +48,43 @@ export async function unixSocketListener(filename:string,pid:number):Promise<boo
   return false;
 }
 
-export interface UnixSocketProof {requested:string;resolved:string;kind:'direct'|'codex-alias';pid:number;generation:string}
+export interface UnixSocketProof {requested:string;resolved:string;kind:'direct'|'codex-alias';pid:number;generation:string;entryStamp:string;socketStamp:string}
+
+                                       
+export function codexSocketTargetMissing(filename:string,proof?:UnixSocketProof,io=filesystem()):boolean{
+  try{
+    const target=codexSocketTarget(filename,io);
+    if(proof&&(proof.kind!=='codex-alias'||proof.requested!==filename||proof.resolved!==target))return false;
+    try{
+      const entry=io.lstat(filename);
+      if(!entry.isSymbolicLink()||entry.uid!==io.uid||codexSocketAlias(filename,io)!==target||proof&&stamp(entry)!==proof.entryStamp)return false;
+    }catch(error){
+      if(!proof||(error as NodeJS.ErrnoException).code!=='ENOENT')return false;
+    }
+    try{io.lstat(target);return false;}catch(error){return(error as NodeJS.ErrnoException).code==='ENOENT';}
+  }catch{return false;}
+}
+
+                                                     
+export function codexSocketPathMissing(filename:string,io=filesystem()):boolean{
+  try{
+    const entry=io.lstat(filename);
+    if(!entry.isSymbolicLink()||entry.uid!==io.uid)return false;
+    const target=codexSocketAlias(filename,io);
+    try{io.lstat(target);return false;}catch(error){return(error as NodeJS.ErrnoException).code==='ENOENT';}
+  }catch(error){return(error as NodeJS.ErrnoException).code==='ENOENT';}
+}
+
+                                               
+export function currentCodexSocketAlias(proof:UnixSocketProof,io=filesystem()):boolean{
+  if(proof.kind!=='codex-alias')return false;
+  try{
+    const entry=io.lstat(proof.requested),directory=io.lstat(path.dirname(proof.resolved)),socket=io.lstat(proof.resolved);
+    return entry.isSymbolicLink()&&entry.uid===io.uid&&codexSocketAlias(proof.requested,io)===proof.resolved
+      &&directory.isDirectory()&&directory.uid===io.uid&&(directory.mode&0o777)===0o700
+      &&socket.isSocket()&&socket.uid===io.uid&&stamp(entry)===proof.entryStamp&&stamp(socket)===proof.socketStamp;
+  }catch{return false;}
+}
                                                  
 export async function proveUnixCodexSocket(filename:string,native:ProcessIdentity,io:UnixSocketIo={...filesystem(),identity:processIdentity,listener:unixSocketListener}):Promise<UnixSocketProof>{
   const details:Record<string,unknown>={requested:filename,expectedPid:native.pid,expectedGeneration:native.startedAt};
@@ -68,7 +104,7 @@ export async function proveUnixCodexSocket(filename:string,native:ProcessIdentit
     const after=await io.identity(native.pid);details.observedGeneration=after.startedAt;
     if(after.startedAt!==native.startedAt||after.image!==native.image)throw new Error('监听核验期间进程代次或映像改变');
     if(stamp(io.lstat(filename))!==entryStamp||stamp(io.lstat(resolved))!==socketStamp||io.realpath(filename)!==resolved)throw new Error('监听核验期间端点或链接改变');
-    return{requested:filename,resolved,kind:alias?'codex-alias':'direct',pid:native.pid,generation:native.startedAt};
+    return{requested:filename,resolved,kind:alias?'codex-alias':'direct',pid:native.pid,generation:native.startedAt,entryStamp,socketStamp};
   }catch(error){
     throw Object.assign(new BridgeError('shared_backend','无法核验专用 App Server socket：'+describeError(error)+'；核验信息：'+JSON.stringify(details)),{socketProof:details});
   }

@@ -139,7 +139,7 @@ nxbridge open claude
 nxbridge adopt codex [--session <会话ID>]       # 把 Codex 会话转到后台托管（同一会话、同一配对）
 nxbridge retire --member <成员ID>              # 重新核验并回收已解除配对、由 nxbridge 启动的残留后台
 nxbridge release codex                          # 把后台 Codex 会话长期交给你自己的窗口
-nxbridge partner-profile codex|claude [--model <模型>] [--effort <推理强度>] [--reset]   # 查看或修改后台搭档的模型和推理强度
+nxbridge partner-profile codex|claude [--model <模型>] [--effort <推理强度>] [--service-tier <档位>] [--reset]   # 查看或修改后台搭档的模型、推理强度和服务档位（档位只限 Codex）
 nxbridge pause
 nxbridge resume
 nxbridge restart codex [--session <会话ID>]
@@ -316,18 +316,44 @@ Codex 一轮工作长时间未见进展时，`status`、`/nxbridge` 和 Claude �
 - 后台服务和桥接进程都死掉时，Claude 端由 Mod 每 15 秒不经协调器独立检查。协调器连续 120 秒不可达（已卸载或启动预约进行中时不计；Claude 端两次观察间隔超过 60 秒则重新计时，Codex hook 观察稀疏时跨间隔累计；启动预约读不出时照常给出诊断任务，启动仍由 `bootstrap` 核验）即为一次断线（`broker_outage`，按 `epoch` 计；协调器稳定可达 120 秒后才结束这次断线，降级不影响结束：降级另有提醒，5 分钟无活动的降级记录自动过期），同一 nxbridge 目录下所有窗口通过 `run/broker-outage.db` 的短事务比较交换只认领一次，只有用户自己的窗口（`owner=user`）有资格认领，nxbridge 自己的无界面后台会话不会被叫醒：认领的那个窗口收到 `wake:true` 的唤醒，任务是先运行一次 `nxbridge doctor`（只诊断，不启动协调器）；确认协调器离线就运行一次 `nxbridge bootstrap`（先核验再启动，失败代价低）；仍不可达或反复崩溃时读 `run/broker.log` 末尾，把原因和用户要做的一步报告给用户，不改数据库、不结束进程、不循环重试；其他窗口只附加、不唤醒。认领后 60 秒内未入队即视为放弃，换别的窗口；已入队但确认没写入正文（写入前出错、插件重载或切换对话丢失租约、消费时任务已撤回）、入队后超时或认领者退出时释放给别的窗口，排除名单有时限；正文已交给 AI 或结果不明的从不重放。上一次唤醒后 1 小时内同一 nxbridge 目录不再唤醒，只附加说明，避免协调器反复崩溃时循环叫醒。断线记录库损坏时保留原文件、不再自动唤醒，普通提醒照常。协调器恢复后，每个窗口只附加一条恢复说明，不唤醒。Codex 端在下一次受信任的 hook 事件里收到同一断线的任务，与 Claude 端共用同一个认领；Codex 完全空闲、没有任何事件时，要等它下次有动作才会知道。
 - 后台启动失败时，发信结果、`status`/`doctor` 和一次运行时提醒给出具体原因和重试命令，已接受的消息保留。
 
-### Claude 接收消息的连接文件丢失
+### 消息连接文件丢失与迁移
 
-Unix 上，Claude 用一个 socket 文件接收别的会话发来的消息，nxbridge 收回执用的 socket 也放在同一个目录（Claude 只接受同一目录或它默认目录里的回信地址）。没有指定时，Claude 把它放在 `XDG_RUNTIME_DIR`、`CLAUDE_CODE_TMPDIR` 或 `/tmp` 下的 `cc-socks` 目录。macOS 默认没有 `XDG_RUNTIME_DIR`，于是落在 `/tmp`。有用户在 macOS 上遇到过：磁盘快满时，系统清理删掉了 `/tmp` 里放了约 3 天的文件，其中就有 Claude 的这个 socket。Claude 进程还在，socket 路径却没了，外面再也连不进来。具体是哪个系统程序、按什么条件清理，还没有查清。Windows 用命名管道，不受影响。
+Unix 上，Claude 用一个 socket 文件接收别的会话发来的消息，nxbridge 收回执用的 socket 也放在同一个目录（Claude 只接受同一目录或它默认目录里的回信地址）。没有指定时，Claude 把它放在 `XDG_RUNTIME_DIR`、`CLAUDE_CODE_TMPDIR` 或 `/tmp` 下的 `cc-socks` 目录。macOS 默认没有 `XDG_RUNTIME_DIR`，于是落在 `/tmp`。Codex 的 socket 固定放在 `/tmp/codex-daemon-<uid>/`：`--listen` 指定的路径只是指向它的链接，所有支持的版本都这样，也没有环境变量能改。
 
-- **nxbridge 启动的后台 Claude 不放在临时目录。** 启动时用 `--messaging-socket-path` 把 socket 放进 nxbridge 自己的持久目录 `~/.nxbridge/run`；路径太长时改用主目录下一个固定的短目录，不退回临时目录。长期运行的后台控制 socket 也一样。只改这次启动的参数，不改环境变量和全局设置。
+有用户在 macOS 上遇到过：磁盘快满时，系统清理删掉了 `/tmp` 里放了约 3 天的文件，其中就有 Claude 的这个 socket。Claude 进程还在，socket 路径却没了，外面再也连不进来。具体是哪个系统程序、按什么条件清理，还没有查清。Windows 用命名管道，不受影响。
+
+**放在哪里**
+
+- **nxbridge 启动的后台 Claude 不放在临时目录。** 启动时用 `--messaging-socket-path` 把 socket 放进 nxbridge 自己的持久目录 `~/.nxbridge/run`；路径太长时改用主目录下一个固定的短目录，不退回临时目录。只改这次启动的参数，不改环境变量和全局设置。
+- 这个参数不是所有 Claude 都认识（实测 2.1.145 不认识，2.1.308、2.1.316、2.1.328 认识）。启动前用所选的 Claude 实际试一下，不按版本号推断；不认识时仍按 Claude 的默认位置启动。
+- 长期运行的后台控制 socket（托管子进程、后台 Codex 的监督进程）也放在持久目录。
+- 后台 Codex：Linux 和 Windows 上新启动的后台 Codex 在支持时改用带令牌认证的本机 WebSocket，不经过 socket 文件。macOS 上不这样做：令牌文件同一用户可读，会让 Codex 沙箱里的命令绕过沙箱对这个目录的限制。所以 macOS 上后台 Codex 的 socket 只能留在 `/tmp`，`status` 里记为 `native_fixed_directory`。
+- 设了很长的 `NXBRIDGE_HOME`、超出 Unix socket 路径长度限制时，后台服务自己的 `broker.sock` 仍放在临时目录；改用较短的 `NXBRIDGE_HOME` 可以避免。默认位置不受影响。
+- 系统清理按什么条件删文件还没有查清，所以没有用定期刷新时间戳的办法保护留在临时目录里的 socket。
+
+**更新后自动迁移**
+
+- 更新后，nxbridge 自己启动、socket 还在临时目录的后台（Claude 的收件 socket、托管子进程和监督进程的控制 socket）会自动迁到持久目录。正在监听的 socket 没法原地搬，只能在同一会话里重启一次。
+- 只在确认安全时重启：
+  - 归属和进程代次核验无误；
+  - 空闲：没有正在执行的工具，后台任务和定时任务都是 0，没有未结算的投递，也没有待回答的问题；
+  - 这个后台启动的程序都已结束。能核实是宿主按配置启动的 MCP 这类服务（命令和参数与配置一致、父进程是宿主），或 nxbridge 自己的进程，不算在内，重启后会重新启动。核实不了身份的按未知处理：先等待，并在 `status` 里写明；
+  - 停掉之前，先确认能按原来的方式重新启动。
+
+  条件不满足时，原会话照常使用，之后再检查。
+- 每个后台只尝试一次，不占用崩溃自动恢复的次数。重启后 socket 仍在临时目录时记为 `not_migratable`，不再尝试；所选 Claude 不认识指定位置的参数时记为 `unsupported`，不重启。
+- 迁移进度只在 `status` / `doctor` 的 `transport_migration` 里显示（`pending`、`blocked`、`restarting`、`ready`、`unsupported`、`not_migratable`、`unknown`，附原因），不占状态栏，也不提醒模型。
+- Windows 上没有要迁移的 socket，不会因此重启。你自己打开的窗口不迁移。
+
+**丢失之后**
+
 - **nxbridge 自己收回执的 socket 被删时，在原地址重建**，之前发出的消息的回执仍能送回。原地址上出现了别的文件时不碰它，直接报错。
 - **只有确认 Claude 进程还在（同一进程代次）、socket 路径确实不存在时，才按“消息连接丢失”处理。** 配对、会话和工作状态都保留，窗口里的 Mod 照常读取状态；暂停投递，已接受、还没提交的消息留着，结果不明的发送不会重放。路径是链接、不归当前用户或不是 socket 时，仍按不可信拒收。
-- **用户自己打开的窗口：** 状态栏提示“本窗口接收消息的连接文件不见了（可能被系统清理删掉），收不到 Codex 的消息，会话本身正常”，并给出做法：空闲时退出本窗口，在原目录用原来的方式加 `--resume <会话 ID>` 重新打开。同一会话重新登记后，积压的消息自动补发。发信的 Codex 同时收到说明，不用重发。nxbridge 不会关掉用户的窗口。
-- **原生后台 Claude（`--bg`）自动恢复。** 先核验归属和进程代次，再确认空闲：没有正在执行的工具，后台任务和定时任务都是 0，没有未结算的投递，也没有待回答的问题。满足后停掉原进程，在同一会话重新拉起，用的是“托管搭档自动恢复”的 3 次额度。还有后台任务或定时任务时保留原会话，每 30 秒重新检查，结束后再恢复；一直运行的 `/loop` 会让提示一直挂着。
-- **托管子进程方式运行的后台 Claude 不自动重启。** 它报告不了定时任务，无法证明重启不会丢掉正在跑的工作，所以只在状态里说明。新启动的托管子进程已经用持久目录；之前启动的，下一次正常启动时改用持久目录。
+- **用户自己打开的 Claude 窗口：** 状态栏提示“本窗口接收消息的连接文件不见了（可能被系统清理删掉），收不到 Codex 的消息，会话本身正常”，并给出做法：空闲时退出本窗口，在原目录用原来的方式加 `--resume <会话 ID>` 重新打开。同一会话重新登记后，积压的消息自动补发。发信的 Codex 同时收到说明，不用重发。nxbridge 不会关掉用户的窗口。
+- **nxbridge 启动的后台 Claude 自动恢复**（原生后台和托管子进程都一样）：按上面“只在确认安全时重启”的条件，停掉原进程，在同一会话重新拉起，用“托管搭档自动恢复”的 3 次额度。托管子进程的空闲和定时任务数取自它每轮结束时的报告。还有后台任务、定时任务或它启动的程序在跑时，保留原会话，每 30 秒重新检查，结束后再恢复；一直运行的 `/loop` 会让提示一直挂着。
+- **nxbridge 启动的后台 Codex 自动恢复：** nxbridge 和它之间已有的连接在 socket 被删后仍然可用。通过这条连接确认 Codex 空闲、它启动的程序也都结束后，在同一会话重启，新进程会重新建立 socket。连接已经断开、确认不了空闲时不会去停它，状态栏提示你：等它的工作和它启动的程序都结束后，在终端用 `kill <PID>` 结束原来的后台 Codex；nxbridge 确认它退出后，接着原会话继续。旧进程还在时不要另开这个会话。
+- **用户自己打开的 Codex 窗口：** 状态栏提示“这个 Codex 窗口接收消息的连接文件不见了（可能被系统清理删掉），消息发不进去，会话本身正常”，并给出做法：空闲时退出这个 Codex 窗口，在原目录用 `codex --no-daemon resume <会话 ID>` 重新打开，积压的消息会自动补发。
 - 状态栏上，配对暂停、等待人工处理、正在恢复等提示排在前面，这些处理完后才显示消息连接丢失。
-- 因为清理条件还没有查清，没有用定期刷新时间戳的办法保护用户窗口的 socket。
 
 ### 唤醒策略
 
@@ -437,37 +463,37 @@ nxbridge setup --clear-claude-command
 - **派活前核对：** 新会话第一份工作之前，后台必须拿到 Mod 登记的实际事实：原生权限模式为 bypassPermissions，或者模式未知（原生 SessionStart 不带模式）而引擎对一条不匹配任何规则的 Bash 探测命令的判定（`$.tool.check`，不运行、不弹窗）为 allow 且没有规则；需要接收设置时还要求实际生效值为 accept。已知的非全部放行模式、ask / deny、被托管或项目设置降级（`permissions.disableBypassPermissionsMode`）或接收设置被更严格的来源覆盖，都按明确的启动前提处理，同一会话重试，不重复启动、不带着需要人批准的模式继续。
 - Linux / WSL 以 root 运行时，Claude 拒绝 `--dangerously-skip-permissions`（原生错误：cannot be used with root/sudo privileges），nxbridge 把它作为明确的启动前提报告（`claude_bypass_root_unsupported`），不设置 `IS_SANDBOX` 之类的绕过，也不降级为手动模式。
 
-### 后台搭档的模型和推理强度
+### 后台搭档的模型、推理强度和服务档位
 
-只作用于 nxbridge 自己启动的后台搭档。你自己打开的窗口不受影响，也不能在这里修改。
+只作用于 nxbridge 自己启动的后台搭档。你自己打开的窗口不受影响，也不能在这里修改。服务档位（`service_tier`）只有 Codex 有。
 
-新建后台搭档时，模型和推理强度分开决定，每一项按下面的顺序取第一个有值的：
+新建后台搭档时，模型、推理强度和服务档位分开决定，每一项按下面的顺序取第一个有值的：
 
-1. 这次创建时指定的值：AI 新建后台搭档（`select_partner` 的 `create`）时传入。命令行没有单独的新建命令；后台 Codex 和 Linux / WSL 托管子进程的 Claude 可以新建后用 `nxbridge partner-profile` 修改，Windows 原生后台 Claude 不能中途修改，要在新建时指定或用下面的配置默认值。
-2. 配置 `partners.<codex|claude>.model` / `partners.<codex|claude>.effort`。
-3. `partners.<codex|claude>.profile_source` 为 `frozen` 时已经记下的值。
-4. 宿主自己的默认设置（Codex 的 `config.toml`、Claude 的 settings）。这也是不做任何设置时的行为。
+1. **这次创建时指定的值（模型自定义）：** AI 新建后台搭档（`select_partner` 的 `create`）时传入，服务档位用 `service_tier`。命令行没有单独的新建命令；后台 Codex 和 Linux / WSL 托管子进程的 Claude 可以新建后用 `nxbridge partner-profile` 修改，Windows 原生后台 Claude 不能中途修改，要在新建时指定或用下面的配置。
+2. **nxbridge 配置里写明的值：** `partners.<codex|claude>.model`、`partners.<codex|claude>.effort`、`partners.codex.service_tier`。
+3. **`partners.<codex|claude>.profile_source` 决定的默认值：**
+   - `recommended`（默认）：nxbridge 推荐的值，不受 Codex 的 `config.toml` 和 Claude 设置影响。后台 Codex 用 `gpt-6.2-sol`、推理强度 `xhigh`、标准服务档位；后台 Claude 用 `claude-opus-5-5`、推理强度 `xhigh`。`config.toml` 里设了 `fast` 或 `flex` 时，也会明确按标准档启动。
+   - `host`（遵循配置）：用宿主自己的设置（Codex 的 `config.toml`、Claude 的 settings）。这份设置和你自己的 Codex / Claude 共用，默认模型一变，之后新建的后台搭档也跟着变。
+   - `frozen`：记下下一个新建搭档实际用上的值，以后新建的都沿用。记下的值存在 nxbridge 私有状态里；改回别的值会清除它。
 
-**`profile_source`（默认 `host`）：**
-
-- `host`：新建的后台搭档用宿主当前的默认设置。这份设置和你自己的 Codex / Claude 共用，默认模型一变（比如在别的地方切换过），之后新建的后台搭档也跟着变。
-- `frozen`：改成它之后，下一个新建的这类后台搭档实际用上的模型和推理强度会被记下来，以后新建的这类搭档都沿用，不再跟着宿主的默认设置变。记的是宿主启动后报告的实际值，不解析 `config.toml`。新建时单独指定的值不会被记下：指定了模型的那个搭档整个不参与记录；只指定推理强度时，只记它实际用的模型。配置默认值实际生效后可以被记下。
-- 记下的值存在 nxbridge 私有状态里，不写配置文件。`nxbridge config get`、`config list` 和 `status` 会显示记下的值和记录时间。
-- 改回 `host` 会清除记下的值。想换成别的值，可以先改回 `host` 再改成 `frozen`，或者直接设 `model` / `effort`（设了的那一项优先）。
-- 这个设置只管新建。已经在运行的后台搭档、接回的之前的会话，都按会话自己的设置接着跑；恢复和重启时沿用会话记录里的模型和推理强度。
+- 服务档位可选 `standard`（标准）、`fast`（优先处理，更快，费用更高）和 `flex`（弹性处理，费用更低，可能更慢）。Codex 收到的分别是 `default`、`priority` 和 `flex`。
+- 新建的后台 Codex 在接手第一项任务前，先核对 Codex 实际采用的服务档位。Codex 没有采用时，撤掉这个还没开始工作的会话，消息留着不发，报 `profile_service_tier_unavailable`。
+- nxbridge 推荐的模型在你的模型服务里用不了时，报告宿主给出的原因，不改用别的模型。可以新建时指定别的模型，或把 `profile_source` 改成 `host`。
+- `status`、`doctor` 和 `config get` / `config list` 按项显示实际值和来源：nxbridge 推荐、nxbridge 配置、此搭档单独指定、宿主配置、冻结。
+- 这些设置只管新建。已经在运行的后台搭档、接回的之前的会话，都按会话自己的设置接着跑；恢复和重启时沿用会话记录里的模型、推理强度和服务档位，并核对实际值。
 
 **修改已有的后台搭档：**
 
 ```sh
-nxbridge partner-profile codex --model <模型> --effort <推理强度>
+nxbridge partner-profile codex --model <模型> --effort <推理强度> --service-tier <standard|fast|flex>
 nxbridge partner-profile claude --effort high
 nxbridge partner-profile codex --reset
 ```
 
-- AI 也可以用 `partner_profile` 工具查看或修改当前配对的后台搭档。选什么模型由 AI 和你决定，nxbridge 不内置模型列表，以宿主实际接受并报告的为准；宿主不接受时报错，不改用别的模型。
+- AI 也可以用 `partner_profile` 工具查看或修改当前配对的后台搭档。选什么模型由 AI 和你决定，nxbridge 只有上面的推荐默认值，不内置模型列表，以宿主实际接受并报告的为准；宿主不接受时报错，不改用别的模型。
 - 改动先记下，等搭档这一轮做完、空闲时才生效，不打断正在做的事。结果分项说明哪些已经生效（以宿主报告的实际值为准）、哪些还在等、哪些不支持。
 - 换模型后，这个会话的提示缓存要重新建立，接下来几轮的花费会高一些。
-- 后台 Codex：在同一会话里切换，从下一轮开始生效。
+- 后台 Codex：模型、推理强度和服务档位都在同一会话里切换，从下一轮开始生效。
 - 后台 Claude：托管子进程（Linux / WSL）在同一会话里切换；推理强度 `max` 只能在新建时指定，不能中途切换。原生后台（Windows 默认）暂时不支持修改已经在运行的会话，因为 Claude 能做到这一点的命令会同时改掉你所有新会话的默认模型；会说明原因，可以改为新建一个指定了模型的后台搭档。
 - 宿主明确拒绝（例如模型名不对）时，搭档继续用原来的设置，结果里写明原因。切换结果不明（超时、断线），或者核对发现实际值和指定的不一致时，先暂停给它投递新消息，直到核对清楚或用 `--reset` 清除为止，避免它在既不是你指定、也不知道是什么的设置下继续工作。
 - `--reset` 清除这个搭档单独记下的选择；正在运行的会话保持当前的设置，之后恢复和重启也沿用会话自己记录的设置。配置里的默认值只用于以后新建的搭档。
@@ -762,8 +788,9 @@ max_references = 1024
 | `collaboration.subagent_send` | `deny` 要求所有外部通信由主会话完成；Codex 子代理不论此项都不能对外通信 | 敏感 |
 | `hosts.{codex,claude}.command / binary / home` | 启动命令、程序路径、配置目录 | 敏感 |
 | `hosts.codex.endpoint / auth_token_env` | 现有 App Server 地址；认证 token 所在的环境变量名（只存名字，不存值） | 敏感 |
-| `partners.{codex,claude}.model / effort` | 新建后台搭档默认用的模型和推理强度；不设时跟随宿主自己的默认设置 | 敏感 |
-| `partners.{codex,claude}.profile_source` | `host`（默认）跟随宿主当前设置；`frozen` 记下下一个新建搭档实际用的模型和推理强度，以后新建都沿用 | 敏感 |
+| `partners.{codex,claude}.model / effort` | 新建后台搭档用的模型和推理强度，写明时优先于 `profile_source` 的默认值 | 敏感 |
+| `partners.codex.service_tier` | 新建后台 Codex 用的服务档位：`standard`、`fast` 或 `flex`，写明时优先于 `profile_source` 的默认值 | 敏感 |
+| `partners.{codex,claude}.profile_source` | `recommended`（默认）用 nxbridge 推荐的值；`host` 遵循宿主自己的配置；`frozen` 记下下一个新建搭档实际用的值，以后新建都沿用 | 敏感 |
 | `hosts.claude.sdk_user_prompt` | 默认 `false`。设为 `true` 时，经 Claude SDK 提交、又不来自 Claude 桌面端或 VS Code 的主会话输入（例如 Paseo 这类自带界面的工具）也算本人输入，用于 nxbridge 的新工作阶段、解除中断，以及用户活动和空闲判断。Claude 本身照常处理这些输入，与这个设置无关。每次遇到这类输入时重新读取配置，改完从下一条输入起生效。配置确认、开关和配对仍只认原有的本人来源，被拒时提示改用系统终端的 `nxbridge` 命令。打开后，脚本或工具通过 SDK 运行的 Claude（如 `claude -p`）发出的输入也会算作本人输入 | 敏感 |
 
 协作提醒的阈值 `collaboration.sync_tip_minutes`、`collaboration.idle_notice_minutes` 见“协作提醒与异常检测”。

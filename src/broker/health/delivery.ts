@@ -2,7 +2,7 @@ import {randomUUID} from 'node:crypto';
 import {type Pair,type Peer} from '../../types.js';
 import {HealthNoticePolicy,noticeCanWake,noticeTier} from './notice-policy.js';
 import {type RuntimeAvailability,type DeliveryCounts,unsettledCount,type RuntimeNotice,type HealthStorage,deliveryHealthKey} from './contracts.js';
-import {missingClaudeInboxModelText} from './runtime-incidents.js';
+import {missingClaudeInboxModelText,missingCodexSocketModelText} from './runtime-incidents.js';
 interface DeliveryIncident {id:string;active:boolean;reasons:string[];notices:RuntimeNotice[];checkedAt:number;scope?:string;revision?:number;alertAdmitted?:boolean;restartSignature?:string;since?:number;dependencySince?:number;unverified?:{since:number;lastAt:number;count:number}}
 const countsText=(c:DeliveryCounts)=>((Object.entries({unsent:c.accepted,sending:c.sending,'queued-unread':c.runtimeQueued,held:c.held,unknown:c.unknown}).filter(([,count])=>count).map(([label,count])=>`${label}=${count}`).join(', '))||'none');
 const waitingIdle=(notice:RuntimeNotice)=>notice.source==='idle_unanswered'&&!notice.admitted&&notice.state==='denied'&&notice.error==='condition resolved before delivery';
@@ -81,8 +81,9 @@ export class DeliveryHealth {
       }
       const cause=availability.incident,hard=cause!==undefined&&!['transient','unknown'].includes(cause.causeClass),age=Math.max(0,Math.min(now-incident.since,now-(incident.dependencySince??now))),tier=dependent&&(hard||age>=300000)?3:1;
       const reason=cause?.code??(availability.state==='reachable'?'awaiting context receipt':availability.reasons[0]??'runtime availability unverified');
-      const message=cause?.code==='claude_inbox_missing'?missingClaudeInboxModelText(partner):`Partner delivery remains unconfirmed for ${Math.floor(age/60000)}min (${reason}); pending: ${unsettled?countsText(counts):'awaiting partner reply'}. Continue independent work; inspect the held dependency if it still blocks you.`;
-      const action=cause?.code==='claude_inbox_missing'&&cause.action?{owner:cause.action.owner,text:partner.owner==='nxbridge'?'Inspect managed recovery; nxbridge restarts the same session only at safe idle.':`Tell user to resume Claude session ${partner.sessionId} in its original cwd at idle.`}:cause?.action;
+      const missing=cause?.code==='claude_inbox_missing'||cause?.code==='codex_socket_target_missing';
+      const message=cause?.code==='claude_inbox_missing'?missingClaudeInboxModelText(partner):cause?.code==='codex_socket_target_missing'?missingCodexSocketModelText(partner):`Partner delivery remains unconfirmed for ${Math.floor(age/60000)}min (${reason}); pending: ${unsettled?countsText(counts):'awaiting partner reply'}. Continue independent work; inspect the held dependency if it still blocks you.`;
+      const action=missing&&cause?.action?{owner:cause.action.owner,text:partner.owner==='nxbridge'?'Inspect managed recovery; nxbridge restarts the same session only at safe idle.':`Tell user to resume ${partner.host} session ${partner.sessionId} in its original cwd at idle.`}:cause?.action;
       const alert=incident.notices.findLast(notice=>notice.incidentId===incident.id&&notice.kind==='runtime');
       if(alert&&!alert.admitted){Object.assign(alert,{message,tier,scope,since:incident.since,layer:cause?.layer??'delivery',causeClass:cause?.causeClass??'unknown',action});if(alert.state==='denied'&&alert.error==='condition resolved before delivery'){alert.state='pending';delete alert.error;}}
       else if(!alert){

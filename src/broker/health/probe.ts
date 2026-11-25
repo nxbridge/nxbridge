@@ -9,6 +9,7 @@ import {runtimeFor,assertManagedRuntimeEndpoint,type ManagedRuntime} from '../..
 import {remainingTime} from '../../shared/time-budget.js';
 import {type RuntimeAvailability} from './contracts.js';
 import {verifyClaudeInbox} from '../../hosts/claude/claude-inbox.js';
+import {codexSocketPathMissing} from '../../ipc/unix-socket.js';
 export async function probeSocket(address:string,timeout=600):Promise<boolean>{
   return new Promise(resolve=>{
     const socket=net.createConnection(address),finish=(ok:boolean)=>{clearTimeout(timer);socket.destroy();resolve(ok);};
@@ -61,6 +62,9 @@ export async function probePeerRuntime(peer:Peer,endpoint:Endpoint|undefined,hom
   const results=await probeProcesses(identities,remainingTime(deadline,1500));
   for(let i=0;i<results.length;i++)if(results[i]==='dead')reasons.push(identities[i]!.label+' exited or PID generation changed');else if(results[i]==='unknown')unknown.push(identities[i]!.label+' PID generation unverifiable');
   let deliveryIssue:RuntimeAvailability['deliveryIssue'];
+  if(process.platform!=='win32'&&peer.host==='codex'&&native&&results[0]==='alive'&&endpoint.address.startsWith('unix://')&&codexSocketPathMissing(endpoint.address.slice(7))){
+    deliveryIssue='codex_socket_target_missing';reasons.push('Codex native process alive; protected socket pathname missing');
+  }
   if(endpoint.mode==='claude-inbox'){
     let valid=true;
     if(process.platform!=='win32'&&native&&results[0]==='alive')try{verifyClaudeInbox(endpoint.address);}catch(error){

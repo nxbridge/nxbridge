@@ -22,13 +22,14 @@ import { ownedProcesses, releaseOwnedProcess } from '../../process/owned-process
 import { ownedProcessState } from '../../process/process-stop.js';
 import type { NativeOwnership } from '../../process/owned-native.js';
 import { restoreState } from '../../broker/pairing/pair-restore.js';
-import { ownedClaudeArgs, ownedClaudeInboxArgs } from '../owned-launch-policy.js';
+import { ownedClaudeArgs, claudeInboxLaunchArgs } from '../owned-launch-policy.js';
 import { requireClaudeBypassConsent } from './claude-autonomy.js';
 import type { HostLaunch } from '../host-launch.js';
 import { claudeProfileArgs } from '../../broker/profiles/profile-arguments.js';
 import { profileChangeFailure } from '../../broker/profiles/partner-profile.js';
-import type { PermissionClass } from '../../types.js';
+import type { PermissionClass,ModelProfile } from '../../types.js';
 import {claudeRegistration} from './identity.js';
+import {assertRuntimeWorkloadIdle,configuredMcpInfrastructure,mcpCommands,nxbridgeMcpCommands,nxbridgeRuntimeInfrastructure} from '../../process/runtime-workload.js';
 
 export class ClaudeAdapter extends EventEmitter {
   modelProfile:(peer:Peer)=>import('../../types.js').ModelProfile=()=>({});
@@ -38,6 +39,7 @@ export class ClaudeAdapter extends EventEmitter {
   private replySockets=new ClaudeReplySockets(receipt=>this.emit('receipt',receipt));
   private registrationProbes=new Map<string,{until:number;work:Promise<NativeOwnership|undefined>}>();
   private nativeRestartWaits=new Map<string,{launchId:string;at:number}>();
+  private restartLaunches=new Map<string,{sessionId:string;launch:HostLaunch;inboxArgs:string[];profile?:ModelProfile}>();
   constructor(private config:BridgeConfig,private home=bridgeHome()){super();}
   probe(peer:Peer,endpoint?:Endpoint):Promise<RuntimeAvailability>{return probePeerRuntime(peer,endpoint,this.home);}
   private childMode():boolean{return claudeBackgroundMode(claudeBackground(this.home,this.config))==='child';}
@@ -47,7 +49,8 @@ export class ClaudeAdapter extends EventEmitter {
     try{
       launch.env.NXBRIDGE_OWNED_LAUNCH='claude:'+intent.id;launch.env.NXBRIDGE_MANAGED_PEER=peer.id;
       this.requireMember(peer);
-      const output=await runCli('claude',[...args,...ownedClaudeInboxArgs(this.home)],{cwd:peer.cwd,home:this.home,config:this.config,launch,timeout:30000,beforeSpawn:async()=>{await beforeLaunch?.();await beforeCreate?.();},onSpawn:()=>{submitted=true;}});
+      const prepared=this.restartLaunches.get(peer.id),inboxArgs=prepared?.sessionId===peer.sessionId&&prepared.launch===launch?prepared.inboxArgs:await claudeInboxLaunchArgs(this.home,launch);
+      const output=await runCli('claude',[...args,...inboxArgs],{cwd:peer.cwd,home:this.home,config:this.config,launch,timeout:30000,beforeSpawn:async()=>{await beforeLaunch?.();await beforeCreate?.();},onSpawn:()=>{submitted=true;this.restartLaunches.delete(peer.id);}});
       recordHostLaunch(this.home,'claude-background',launch);
       const result={...intent,handle:nativeLaunchHandle(output)};saveNativeOwnership(result);return result;
     }catch(error){failNativeLaunch(intent,error,!submitted);throw error;}
@@ -138,10 +141,15 @@ export class ClaudeAdapter extends EventEmitter {
     const registration=claudeRegistration({record,pid:agent.pid},record.messagingSocketPath);registration.endpoint.configHome=directory;
     return{...registration,state:agent.status==='waiting'?'needsHuman':agent.status==='busy'?'busy':'ready'};
   }
-  async wake(peer:Peer,_endpoint?:Endpoint,_signal?:AbortSignal,beforeLaunch?:()=>void|Promise<void>,affinity?:{configHome?:string;executable?:string;profileId?:string}):Promise<void>{
+  async wake(peer:Peer,_endpoint?:Endpoint,_signal?:AbortSignal,beforeLaunch?:()=>void|Promise<void>,affinity?:{configHome?:string;executable?:string;profileId?:string;modelProfile?:ModelProfile}):Promise<void>{
     this.requireMember(peer);
     requireClaudeBackground(this.home,this.config);
-    if(this.childMode()||peer.sessionId&&findClaudeChild(this.home,peer.sessionId)){await ensureClaudeChild(this.home,this.config,peer,beforeLaunch);return;}
+    if(this.childMode()||peer.sessionId&&findClaudeChild(this.home,peer.sessionId)){
+      const prepared=this.restartLaunches.get(peer.id);
+      const baseline=affinity?.modelProfile;
+      await ensureClaudeChild(this.home,this.config,peer,beforeLaunch,undefined,undefined,prepared?.sessionId===peer.sessionId?prepared.profile:baseline);
+      this.restartLaunches.delete(peer.id);return;
+    }
     let binding=nativeOwnership(this.home,peer.id);
     if(binding?.sessionId&&binding.sessionId!==peer.sessionId)throw new BridgeError('session_changed','后台启动记录属于后继会话，未恢复旧会话或覆盖启动记录。');
     const agents=await this.list(peer.sessionId??undefined,affinity?.configHome??binding?.configHome);
@@ -177,7 +185,7 @@ export class ClaudeAdapter extends EventEmitter {
       }
     }
     this.nativeRestartWaits.delete(peer.id);
-    const launch=await prepareOwnedLaunch(await selectSessionLaunch('claude',this.config,{home:this.home,cwd:peer.cwd,sessionId:peer.sessionId??undefined,configHome:affinity?.configHome??binding?.configHome,executable:binding?.executable??affinity?.executable,profileId:binding?.profileId??affinity?.profileId}));
+    const prepared=this.restartLaunches.get(peer.id),launch=prepared?.sessionId===peer.sessionId?prepared.launch:await prepareOwnedLaunch(await selectSessionLaunch('claude',this.config,{home:this.home,cwd:peer.cwd,sessionId:peer.sessionId??undefined,configHome:affinity?.configHome??binding?.configHome,executable:binding?.executable??affinity?.executable,profileId:binding?.profileId??affinity?.profileId}));
     if(restoreState(peer,launch.configHome)==='gone')throw new BridgeError('session_not_found','原配置目录中没有该 Claude 会话，请先在原生窗口恢复原会话。');
     let intent:NativeOwnership={...await beginNativeLaunch(this.home,peer,launch.configHome),executable:launch.executable.command,profileId:launch.profile?.id,hostVersion:launch.profile?.version};saveNativeOwnership(intent);
     intent=await this.submitLaunch(peer,intent,launch,['--resume',peer.sessionId!,'--bg'],beforeLaunch);
@@ -211,9 +219,43 @@ export class ClaudeAdapter extends EventEmitter {
     const registration=claudeRegistration({record,pid:agent.pid},record.messagingSocketPath);
     return{...registration,endpoint:{...registration.endpoint,configHome:proof.configHome},state:agent.status==='waiting'?'needsHuman':agent.status==='busy'?'busy':'ready'};
   }
+  async preflightRestart(peer:Peer,endpoint:Endpoint):Promise<ModelProfile|undefined>{
+    this.requireMember(peer);requireClaudeBackground(this.home,this.config);
+    const child=claudeChild(this.home,peer.id),binding=nativeOwnership(this.home,peer.id);
+    const launch=await prepareOwnedLaunch(await selectSessionLaunch('claude',this.config,{home:this.home,cwd:peer.cwd,sessionId:peer.sessionId??undefined,configHome:child?.configHome??binding?.configHome??endpoint.configHome,executable:child?.executable??binding?.executable,profileId:child?.profileId??binding?.profileId}));
+    if(restoreState(peer,launch.configHome)==='gone')throw new BridgeError('session_not_found','原配置目录中没有该 Claude 会话，未停止原进程。');
+    if(child?.launchSourcePermission!==undefined||endpoint.nativePermission?.mode==='bypassPermissions')requireClaudeBypassConsent(launch.configHome,peer.cwd);
+    const inboxArgs=await claudeInboxLaunchArgs(this.home,launch,true);
+                                                 
+    const actual=child?await childCall<ModelProfile>(this.home,child,'profile.get'):undefined,profile=actual?{model:actual.model,...(actual.effort!==undefined?{effort:actual.effort}:{})}:undefined;this.requireMember(peer);
+    this.restartLaunches.set(peer.id,{sessionId:peer.sessionId!,launch,inboxArgs,profile});
+    return profile;
+  }
+  async assertIdleWorkload(peer:Peer,endpoint:Endpoint):Promise<void>{
+    if(!endpoint.pid||!endpoint.procStart)throw new BridgeError('runtime_workload_unverified','缺少原生进程代次，未停止 Claude。');
+    const native=await processIdentity(endpoint.pid);
+    if(native.startedAt!==endpoint.procStart)throw new BridgeError('process_record_changed','原生 Claude 代次已改变，未停止。');
+    const child=claudeChild(this.home,peer.id),binding=nativeOwnership(this.home,peer.id),identities=[child?.worker,child?.wrapper,child?.native,binding?.native].filter(Boolean);
+    const owners=ownedProcesses(this.home).records.filter(record=>!record.releasedToUser&&(record.peerId===peer.id&&(!record.sessionId||record.sessionId===peer.sessionId))&&(record.proof.launchId===binding?.id||identities.some(identity=>identity!.pid===record.identity.pid&&identity!.startedAt===record.identity.startedAt)||record.native?.pid===native.pid&&record.native.startedAt===native.startedAt));
+    const configHome=endpoint.configHome??child?.configHome??binding?.configHome;
+    const commands=configHome?nxbridgeMcpCommands(this.home,'claude',configHome):[];
+    for(const file of [configHome&&path.join(configHome,'.claude.json'),path.join(peer.cwd,'.mcp.json')]){
+      if(!file)continue;
+      try{const config=readJson<any>(file);commands.push(...mcpCommands(config.mcpServers),...mcpCommands(config.projects?.[peer.cwd]?.mcpServers));}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw new BridgeError('runtime_workload_unverified','无法读取原会话的 MCP 启动配置，未停止 Claude。');}
+    }
+    await assertRuntimeWorkloadIdle({native,owners,infrastructure:async candidate=>await nxbridgeRuntimeInfrastructure(this.home,candidate)||configuredMcpInfrastructure(native,commands,candidate)});
+  }
   async release(peer:Peer,beforeStop?:(agent:any)=>void|Promise<void>):Promise<void>{
     if(peer.owner!=='nxbridge')throw new BridgeError('process_owned_by_user','用户窗口不由 nxbridge 停止。');
-    const child=claudeChild(this.home,peer.id)??(peer.sessionId?findClaudeChild(this.home,peer.sessionId):undefined);if(child){await stopClaudeChild(this.home,child);return;}
+    const child=claudeChild(this.home,peer.id)??(peer.sessionId?findClaudeChild(this.home,peer.sessionId):undefined);if(child){
+      if(beforeStop){
+        const current=await childCall(this.home,child,'status'),health=current.health;
+        if(current.sessionId!==peer.sessionId||current.phase!=='active'||current.human||!health||!['ready','failed'].includes(health.state)||health.tools.length||current.native?.pid!==child.native?.pid||current.native?.startedAt!==child.native?.startedAt)throw new BridgeError('session_busy','托管 Claude 仍在工作或身份无法核验，未自动停止。');
+        await beforeStop({status:'idle',pid:current.native?.pid,worker:current});
+        await stopClaudeChild(this.home,current,undefined,{native:current.native!,lastEventAt:health.lastEventAt});
+      }else await stopClaudeChild(this.home,child);
+      return;
+    }
     let binding=nativeOwnership(this.home,peer.id);
     if(binding?.phase==='failed'){forgetNativeOwnership(binding);return;}
     const sessionId=peer.sessionId??binding?.sessionId,records=ownedProcesses(this.home).records.filter(value=>value.role==='claude-native'&&value.peerId===peer.id&&(!sessionId||value.sessionId===sessionId));

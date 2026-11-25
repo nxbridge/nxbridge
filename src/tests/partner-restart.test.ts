@@ -7,6 +7,14 @@ import { registration } from './support/registration.js';
 import { temporary } from './support/temporary.js';
 import { restartArguments } from '../hosts/codex/codex-restart.js';
 import type { Endpoint, Peer, DeliveryState } from '../types.js';
+import {BridgeError} from '../shared/errors.js';
+
+for(const automatic of [false,true])test('原生重启未完成时，自动连接恢复交给原会话恢复，人工重启保留显式暂停：'+automatic,async t=>{
+  const f=fixture(t);f.store.pair(f.c.id,f.x.id);f.store.updatePeer(f.x.id,{owner:'nxbridge'});
+  (f.codex as any).restart=async()=>{throw new BridgeError('restart_incomplete','原进程退出后启动尚未完成');};
+  await assert.rejects((f.broker as any).restartCodex({peer_id:f.x.id},automatic?{endpoint:f.store.endpoint(f.x.id),options:{beforeStop:()=>{}}}:undefined),{code:'restart_incomplete'});
+  assert.equal(f.store.peer(f.x.id).state,automatic?'offline':'paused');assert.equal(f.store.peer(f.x.id).sessionId,'x');
+});
 
 test('搭档重启只接受独立 Claude 的当前托管配对，预检目标不能换成其他成员',async t=>{
   assert.deepEqual(restartArguments(['codex','--partner']),{partner:true});
