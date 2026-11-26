@@ -76,6 +76,14 @@ test('status 文本：后台做完一轮的状态按对去重，正常汇报和�
   assert.doesNotMatch(text(),/后台 Codex|后台搭档/);
 });
 
+test('status 文本：后台 Codex 重启没完成时写明原因，服务档位对不上时带上原来和现在的档位',()=>{
+  const text=(extra:any)=>formatStatus({paired:true,self:{id:'c',host:'claude',name:'Claude',state:'ready'},partner:{id:'x',host:'codex',name:'Codex',state:'paused',pause_reason:'restart_incomplete',...extra},pending:0,questions:0});
+  assert.match(text({pause_detail:{code:'service_tier_mismatch',saved:'standard',live:'fast'}}),/服务档位和原来对不上（原来 standard，现在 fast），为免改用别的档位已暂停投递，消息已保留/);
+  assert.match(text({pause_detail:{code:'service_tier_unverified'}}),/没能确认服务档位和原来一致/);
+  assert.match(text({}),/后台 Codex 的重启没有完整完成，已暂停投递，消息已保留/);
+  assert.doesNotMatch(formatStatus({paired:true,self:{id:'c',host:'claude',name:'Claude',state:'ready'},partner:{id:'x',host:'codex',name:'Codex',state:'ready'},pending:0,questions:0}),/重启/);
+});
+
 test('读不到最新一步时状态只说进度暂时无法观测，不说没有进展；有进度证据时照旧',()=>{
   const status=(health:any)=>formatStatus({paired:true,self:{id:'c',host:'claude',name:'Claude',state:'busy'},partner:{id:'x',host:'codex',name:'Codex',state:'busy',health},pending:0,questions:0});
   const silent={state:'silent',turnId:'t',lastProgressAt:Date.now()-11*60000,tools:[]};

@@ -67,7 +67,7 @@ test('退订等待正在提交的唤醒完成，取消等待不提前释放原�
   const adapter=new CodexAdapter(DEFAULT_CONFIG,temporary(t)),store=new Store(':memory:');t.after(()=>{adapter.close();store.close();});
   const peer=store.register(registration('codex','inflight')),endpoint=store.endpoint(peer.id)!;let finish!:()=>void,entered!:()=>void,unsubscribed=0;
   const pending=new Promise<void>(resolve=>finish=resolve),started=new Promise<void>(resolve=>entered=resolve);
-  const rpc={closed:false,close:()=>{},request:async(method:string)=>{if(method==='turn/start'){entered();await pending;}if(method==='thread/unsubscribe')unsubscribed++;return{thread:{id:peer.sessionId,cwd:peer.cwd,status:{type:'idle'}},turn:{id:'turn'}};}};
+  const rpc={closed:false,close:()=>{},request:async(method:string,_params:unknown,options?:{beforeSend?:()=>void})=>{options?.beforeSend?.();if(method==='turn/start'){entered();await pending;}if(method==='thread/unsubscribe')unsubscribed++;return{thread:{id:peer.sessionId,cwd:peer.cwd,status:{type:'idle'}},turn:{id:'turn'}};}};
   adapter.connect=async()=>rpc as any;(adapter as any).clients.set(endpoint.address,rpc);
   const abort=new AbortController(),work=adapter.wake(peer,endpoint,abort.signal);await started;
   const rejected=assert.rejects(work,(error:any)=>error.uncertain===true);abort.abort();await rejected;

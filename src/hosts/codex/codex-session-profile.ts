@@ -1,10 +1,10 @@
 import { createReadStream, globSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import {BridgeError} from '../../shared/errors.js';
+import {BridgeError,RuntimeRecoveryHold,describeError} from '../../shared/errors.js';
 import type { RpcClient } from '../../ipc/rpc.js';
 import {delay} from '../../shared/time.js';
-import {nativeServiceTier,observedServiceTier} from './codex-service-tier.js';
+import {CodexServiceTierError,nativeServiceTier,observedServiceTier} from './codex-service-tier.js';
 
 export interface SessionPolicy {
   source:'persisted'|'conservative';sandbox:unknown;approval:unknown;reviewer:unknown;
@@ -13,6 +13,7 @@ export interface SessionPolicy {
 export interface SessionProfile {
   sessionId:string;file?:string;offset:number;settingsOffset?:number;complete:boolean;verified:boolean;meta:Record<string,any>;settings:Record<string,any>;
   live?:Record<string,any>;livePermissionConfig?:Record<string,unknown>;
+  appliedServiceTier?:{offset:number;present:boolean;value?:string|null};
   turn?:{id:string;state:'running'|'ready'|'paused';at:number};
   usage?:{inputTokens:number;at:number};
   compaction?:{id:string;at:number};
@@ -21,13 +22,26 @@ interface Cache extends SessionProfile {dev:number;ino:number;size:number;mtime:
 const caches=new Map<string,Cache>();
 const fields={model:'model',model_provider:'modelProvider',model_provider_id:'modelProvider',approval_policy:'approvalPolicy',approvals_reviewer:'approvalsReviewer',permission_profile:'permissionProfile',sandbox_policy:'sandbox',cwd:'cwd',runtime_workspace_roots:'runtimeWorkspaceRoots',effort:'reasoningEffort',reasoning_effort:'reasoningEffort',collaboration_mode:'collaborationMode',service_tier:'serviceTier',disabled_plugin_ids:'disabledPluginIds'} as const;
 function knownTier(profile:SessionProfile):string|undefined{
-  const observed=observedServiceTier(profile.live&&Object.hasOwn(profile.live,'serviceTier')?profile.live.serviceTier:profile.settings.serviceTier);
+  const live=profile.live&&Object.hasOwn(profile.live,'serviceTier'),applied=profile.appliedServiceTier;
+                                             
+  const value=live&&profile.live!.serviceTier===null&&applied?(applied.present?applied.value:null):live?profile.live!.serviceTier:profile.settings.serviceTier;
+  const observed=observedServiceTier(value);
                                             
   return observed===undefined?undefined:nativeServiceTier(observed??'standard');
 }
-function verifyResumedTier(profile:SessionProfile,actual:unknown):void{
+async function verifyResumedTier(rpc:RpcClient,id:string,profile:SessionProfile,resumed:any,current:SessionProfile,file?:string,guard?:()=>void):Promise<SessionProfile>{
   const expected=knownTier(profile);
-  if(expected!==undefined&&observedServiceTier(actual)!==observedServiceTier(expected))throw new BridgeError('profile_verification_failed','恢复后的服务档位与原会话不符，已暂停投递。');
+  if(expected===undefined||observedServiceTier(resumed.serviceTier)===observedServiceTier(expected))return current;
+  const saved=observedServiceTier(expected)!;
+  const mismatch=(value:string|null|undefined)=>new CodexServiceTierError({code:value===undefined?'service_tier_unverified':'service_tier_mismatch',saved,...(typeof value==='string'?{live:value}:{})});
+  if(resumed.serviceTier!==null)throw mismatch(observedServiceTier(resumed.serviceTier));
+  if(!file)throw new CodexServiceTierError({code:'service_tier_unverified',saved});
+  let actual:Awaited<ReturnType<typeof readLiveServiceTier>>;
+  try{actual=await readLiveServiceTier(rpc,id,resumed,current,guard);}
+  catch(error){if(error instanceof RuntimeRecoveryHold)throw error;throw new CodexServiceTierError({code:'service_tier_unverified',saved},describeError(error));}
+  if(actual.serviceTier!==observedServiceTier(expected))throw mismatch(actual.profile?.appliedServiceTier?.present?actual.serviceTier:undefined);
+  resumed.serviceTier=nativeServiceTier(actual.serviceTier!);
+  return actual.profile!;
 }
 
                                             
@@ -66,6 +80,12 @@ export async function readSessionProfile(file:unknown,sessionId:string):Promise<
             const value=row.type==='turn_context'?row.payload:row.type==='event_msg'&&row.payload?.type==='thread_settings_applied'&&row.payload.thread_id===sessionId?row.payload.thread_settings:undefined;
             if(!value||typeof value!=='object')continue;
             cache.settingsOffset=cache.offset;
+            if(row.type==='event_msg'){
+              const tier=observedServiceTier(value.service_tier);
+              cache.appliedServiceTier={offset:cache.offset,present:Object.hasOwn(value,'service_tier'),...(tier===undefined?{}:{value:tier})};
+                                               
+              if(!cache.appliedServiceTier.present)delete cache.settings.serviceTier;
+            }
             for(const [source,target] of Object.entries(fields))if(Object.hasOwn(value,source))cache.settings[target]=value[source];
                                                          
             if(Object.hasOwn(value,'permission_profile')&&!Object.hasOwn(value,'sandbox_policy'))delete cache.settings.sandbox;
@@ -150,17 +170,45 @@ function sandboxCandidate(profile:SessionProfile):any{
 
 async function persistedAfter(rpc:RpcClient,id:string,file:string,offset:number,settings:Record<string,unknown>):Promise<SessionProfile>{
   await rpc.request('thread/settings/update',{threadId:id,...settings},{mutation:true});
+  return readAppliedSessionSettings(file,id,offset);
+}
+
+export async function readAppliedSessionSettings(file:unknown,id:string,offset?:number):Promise<SessionProfile>{
   const deadline=Date.now()+5000;
-  do{const current=await readSessionProfile(file,id);if(current.verified&&current.complete&&(current.settingsOffset??0)>offset)return current;await delay(25);}while(Date.now()<deadline);
+  do{const current=await readSessionProfile(file,id);if(current.verified&&current.complete&&(offset===undefined||(current.settingsOffset??0)>offset))return current;
+    if(offset===undefined||typeof file!=='string')break;
+    await delay(25);
+  }while(Date.now()<deadline);
   throw new BridgeError('policy_verification_failed','宿主设置尚未完整落盘，已暂停投递；请稍后重试。');
+}
+
+export function persistedServiceTier(profile:SessionProfile):string|undefined{return observedServiceTier(knownTier(profile))??undefined;}
+
+                                              
+export async function readLiveServiceTier(rpc:RpcClient,id:string,loaded:any,current?:SessionProfile,guard?:()=>void|Promise<void>):Promise<{serviceTier:string|null|undefined;profile?:SessionProfile}>{
+  if(loaded.serviceTier!==null)return{serviceTier:observedServiceTier(loaded.serviceTier),profile:current};
+  if(loaded.approvalPolicy===undefined)throw new BridgeError('profile_unverified','原生未回报当前审批策略，无法在保持原设置的前提下核验服务档位。');
+  const file=current?.file??loaded.thread?.path;
+  if(typeof file!=='string'||!file)return{serviceTier:null,profile:current};
+  const previous=current??await readSessionProfile(file,id);
+  await guard?.();
+                                             
+  const profile=await persistedAfter(rpc,id,file,previous.offset,{approvalPolicy:loaded.approvalPolicy});
+  const tier=profile.appliedServiceTier;
+  if(!tier||tier.offset<=previous.offset)throw new BridgeError('profile_unverified','原生未提供新的服务档位生效记录，消息继续保留。');
+  return{serviceTier:tier.present?tier.value:null,profile};
 }
 
                                                             
 export async function snapshotLiveSession(rpc:RpcClient,id:string,file:string):Promise<SessionProfile>{
-  const live=await rpc.request('thread/resume',{threadId:id,excludeTurns:true});
-  if(live.thread?.id!==id)throw new BridgeError('session_changed','实时快照返回了其他线程。');
   const previous=await readSessionProfile(file,id);
+  const {args}=planCodexResume(id,previous,previous.settings.cwd??'',{exact:true});
+  const live=await rpc.request('thread/resume',args,{mutation:true});
+  if(live.thread?.id!==id)throw new BridgeError('session_changed','实时快照返回了其他线程。');
+  if(live.approvalPolicy===undefined)throw new BridgeError('profile_unavailable','原生未回报当前审批策略，无法安全保存重启快照；未停止原运行时。');
   const profile=await persistedAfter(rpc,id,file,previous.offset,{approvalPolicy:live.approvalPolicy});
+  if(live.serviceTier===null&&(!profile.appliedServiceTier||profile.appliedServiceTier.offset<=previous.offset))
+    throw new BridgeError('profile_unavailable','原生未提供新的服务档位生效记录，未停止原运行时。');
   profile.live=Object.fromEntries(['model','modelProvider','reasoningEffort','serviceTier','approvalPolicy','approvalsReviewer','cwd','runtimeWorkspaceRoots','activePermissionProfile','sandbox'].filter(key=>live[key]!==undefined).map(key=>[key,live[key]]));
   const active=profile.live.activePermissionProfile?.id;
   if(typeof active==='string'&&active.startsWith('nxbridge_')){
@@ -187,37 +235,40 @@ export async function verifyRestartProfileCurrent(profile:SessionProfile):Promis
   if(!current.verified||!current.complete||(current.settingsOffset??0)<(profile.settingsOffset??0)
     ||(current.settingsOffset??0)>(profile.settingsOffset??0)&&(
       !samePermission(current.settings.permissionProfile,profile.settings.permissionProfile)
-      ||knownTier(current)!==undefined&&knownTier(current)!==knownTier(profile)
+      ||knownTier(current)!==knownTier(profile)
       ||['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots'].some(key=>!isDeepStrictEqual(current.settings[key],profile.settings[key]))))
     throw new BridgeError('restart_profile_changed','原会话历史无法核验，或在自动重启快照后写入了不同的设置。已保留消息，等待确认原会话设置。');
 }
 
                                        
-export async function verifyResumedSession(rpc:RpcClient,id:string,original:SessionProfile):Promise<{resumed:any;policy:SessionPolicy;profile:SessionProfile}>{
-  const resumed=await rpc.request('thread/resume',{threadId:id,excludeTurns:true});
-  const current=await readSessionProfile(original.file??resumed.thread?.path,id),plan=permissionPlan(original);
+export async function verifyResumedSession(rpc:RpcClient,id:string,original:SessionProfile,guard?:()=>void,cwd=original.settings.cwd??original.meta.cwd??''):Promise<{resumed:any;policy:SessionPolicy;profile:SessionProfile}>{
+  const {args,plan}=planCodexResume(id,original,cwd,{exact:true});
+  const resumed=await rpc.request('thread/resume',args,{mutation:true,beforeSend:guard});
+  if(resumed.thread?.id!==id)throw new BridgeError('session_changed','恢复结果的线程 ID 与原会话不符，未投递。');
+  const file=original.file??resumed.thread?.path;
+  const current=await readSessionProfile(file,id);guard?.();
+  observedResumedTier(resumed,current,original);
   const exact=original.settings.permissionProfile&&samePermission(current.settings.permissionProfile,original.settings.permissionProfile);
-  if(resumed.thread?.id!==id||!current.verified||!current.complete||!exact&&!samePermission(current.settings.permissionProfile,plan.permission))throw new BridgeError('policy_verification_failed','上次权限核验被中断，当前权限与原始或严格恢复方案不符，消息继续保留。');
+  if(!current.verified||!current.complete||!exact&&!samePermission(current.settings.permissionProfile,plan.permission))throw new BridgeError('policy_verification_failed','上次权限核验被中断，当前权限与原始或严格恢复方案不符，消息继续保留。');
   if(original.live&&(!exact||resumed.activePermissionProfile?.id!==original.live.activePermissionProfile?.id))
     throw new BridgeError('policy_verification_failed','上次重启后的实时权限或原生命名 profile 已改变，消息继续保留。');
   if((current.settingsOffset??0)<=(original.settingsOffset??0))throw new BridgeError('policy_verification_incomplete','上次恢复尚无新的权限落盘证据，等待安全冷恢复；消息继续保留。');
   for(const key of ['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots'])if(original.settings[key]!==undefined&&!isDeepStrictEqual(resumed[key],original.settings[key]))throw new BridgeError('policy_verification_failed','中断后的运行设置与原会话不符：'+key+'。');
-  verifyResumedTier(original,resumed.serviceTier);
   return{resumed,profile:current,policy:exact?{...plan.policy,source:'persisted',sandbox:current.settings.permissionProfile,unknown:[],narrowed:[],reason:undefined}:plan.policy};
 }
 
-                                                
-export async function resumeSession(rpc:RpcClient,id:string,options:{file?:string;home?:string;cwd:string;profile?:SessionProfile;verify?:boolean}):Promise<{resumed:any;policy:SessionPolicy;profile:SessionProfile}>{
-  const original=options.profile??await readSessionProfile(options.file??(options.home?sessionFile(options.home,id):undefined),id);
+                                    
+export function planCodexResume(id:string,original:SessionProfile,cwd:string,options:{exact?:boolean}={}){
   if(original.verified&&!original.complete)throw new BridgeError('policy_verification_failed','原会话权限记录尚未写完，未恢复或投递。');
   const plan=permissionPlan(original),saved=original.settings,config={...('config' in plan.options?plan.options.config:{}),...(saved.reasoningEffort!==undefined&&saved.reasoningEffort!==null?{model_reasoning_effort:saved.reasoningEffort}:{})};
-  const args:Record<string,unknown>={threadId:id,excludeTurns:true,...plan.options,config,cwd:saved.cwd??options.cwd,approvalPolicy:plan.policy.approval,approvalsReviewer:plan.policy.reviewer};
-  if(original.live){
-    const active=original.live.activePermissionProfile;
+  const args:Record<string,unknown>={threadId:id,excludeTurns:true,...plan.options,config,cwd:saved.cwd??cwd,approvalPolicy:plan.policy.approval,approvalsReviewer:plan.policy.reviewer};
+  const candidate=sandboxCandidate(original);
+  if(original.live||options.exact&&candidate){
+    const active=original.live?.activePermissionProfile;
     delete args.sandbox;delete args.permissions;args.config={...original.livePermissionConfig,...(saved.reasoningEffort!==undefined?{model_reasoning_effort:saved.reasoningEffort}:{})};
     if(active?.id)args.permissions=active.id;
     else{
-      const legacy=sandboxCandidate(original),mode=legacy&&({readOnly:'read-only',workspaceWrite:'workspace-write',dangerFullAccess:'danger-full-access'} as Record<string,string>)[legacy.type];
+      const legacy=candidate,mode=legacy&&({readOnly:'read-only',workspaceWrite:'workspace-write',dangerFullAccess:'danger-full-access'} as Record<string,string>)[legacy.type];
       if(!mode)throw new BridgeError('profile_unavailable','实时权限缺少可精确保留的原生表示。');
       args.sandbox=mode;
       if(legacy.type==='workspaceWrite')Object.assign(args.config!,{sandbox_workspace_write:{writable_roots:legacy.writableRoots??[],network_access:legacy.networkAccess??false,exclude_tmpdir_env_var:legacy.excludeTmpdirEnvVar??false,exclude_slash_tmp:legacy.excludeSlashTmp??false}});
@@ -226,20 +277,42 @@ export async function resumeSession(rpc:RpcClient,id:string,options:{file?:strin
   }
   for(const key of ['model','modelProvider','runtimeWorkspaceRoots'])if(saved[key]!==undefined)args[key]=saved[key];
   const tier=knownTier(original);if(tier!==undefined)args.serviceTier=tier;
+  if(options.exact&&(!original.verified||!original.complete||original.sessionId!==id||!args.cwd||typeof saved.model!=='string'||!saved.model||typeof saved.reasoningEffort!=='string'||!saved.reasoningEffort
+    ||tier===undefined||saved.approvalPolicy===undefined||saved.approvalsReviewer===undefined
+    ||!original.live&&!candidate&&(!saved.permissionProfile||!samePermission(saved.permissionProfile,plan.permission))))
+    throw new RuntimeRecoveryHold('owned_profile_unverified','还没能确认后台 Codex 原来的模型、推理强度、服务档位和安全设置，为免换成别的设置，暂不恢复；消息已保留。');
+  return{args,plan};
+}
+
+                                        
+export function observedResumedTier(resumed:any,current:SessionProfile,original:SessionProfile):string|null|undefined{
+  const expected=observedServiceTier(knownTier(original)),wire=observedServiceTier(resumed.serviceTier);
+  const actual=wire===null&&current.verified&&current.complete?observedServiceTier(knownTier(current)):wire;
+  if(expected!==undefined&&actual!==expected)throw new CodexServiceTierError({code:actual===undefined||actual===null?'service_tier_unverified':'service_tier_mismatch',saved:expected??undefined,...(typeof actual==='string'?{live:actual}:{})});
+  if(wire===null&&typeof actual==='string')resumed.serviceTier=nativeServiceTier(actual);
+  return actual;
+}
+
+                              
+export async function resumeSession(rpc:RpcClient,id:string,options:{file?:string;home?:string;cwd:string;profile?:SessionProfile;verify?:boolean;beforeResume?:()=>void;onResumed?:(thread:any)=>void;guard?:()=>void}):Promise<{resumed:any;policy:SessionPolicy;profile:SessionProfile}>{
+  const original=options.profile??await readSessionProfile(options.file??(options.home?sessionFile(options.home,id):undefined),id),saved=original.settings;
+  const {args,plan}=planCodexResume(id,original,options.cwd,{exact:!!options.beforeResume});
   let resumed:any;
-  try{resumed=await rpc.request('thread/resume',args,{timeout:30000});}
+  try{resumed=await rpc.request('thread/resume',args,{timeout:30000,mutation:!!options.beforeResume,beforeSend:options.beforeResume});}
   catch(error){if(plan.policy.unknown.includes('filesystem')&&/sandbox helper|codex-linux-sandbox|failed to load AGENTS/i.test(String((error as Error).message)))throw new BridgeError('policy_unknown_unstartable','原会话权限未知，原生宿主无法在禁止读取的策略下初始化。消息继续保留；请在正常窗口明确设置权限并完成一次交互后重试。');throw error;}
   if(resumed.thread?.id!==id)throw new BridgeError('session_changed','恢复结果的线程 ID 与原会话不符，未投递。');
+  options.onResumed?.(resumed.thread);
   for(const key of ['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots'])if(saved[key]!==undefined&&!isDeepStrictEqual(resumed[key],saved[key]))throw new BridgeError('policy_verification_failed','宿主未保留原会话的 '+key+'，已暂停投递。');
-  verifyResumedTier(original,resumed.serviceTier);
   const file=options.file??resumed.thread.path??original.file;
+  let current=await readSessionProfile(file,id);current=await verifyResumedTier(rpc,id,original,resumed,current,file,options.guard);
   if(options.verify===false)return{resumed,policy:plan.policy,profile:original};
   if(typeof file!=='string'||!file)throw new BridgeError('policy_verification_failed','无法读取原生权限生效证据，已暂停投递。');
-  let current=await readSessionProfile(file,id),candidate=original.live?.activePermissionProfile?.id?undefined:sandboxCandidate(original);
+  const candidate=original.live?.activePermissionProfile?.id?undefined:sandboxCandidate(original);
   const settings:Record<string,unknown>={approvalPolicy:plan.policy.approval};
   for(const key of ['collaborationMode','disabledPluginIds'])if(saved[key]!==undefined)settings[key]=saved[key];
-  if(tier!==undefined)settings.serviceTier=tier;
+                                         
   if(candidate)settings.sandboxPolicy=candidate;
+  options.guard?.();
   current=await persistedAfter(rpc,id,file,current.offset,settings);
   if(original.live){
     if(!samePermission(current.settings.permissionProfile,original.settings.permissionProfile)||resumed.activePermissionProfile?.id!==original.live.activePermissionProfile?.id)throw new BridgeError('policy_verification_failed','重启后的实时权限或原生命名 profile 已改变，已暂停投递。');
@@ -249,9 +322,12 @@ export async function resumeSession(rpc:RpcClient,id:string,options:{file?:strin
     const policy={...plan.policy,source:'persisted' as const,sandbox:current.settings.permissionProfile,narrowed:[],...(plan.policy.unknown.length?{reason:'policy_partial' as const}:{reason:undefined})};return{resumed,policy,profile:current};
   }
   if(candidate&&!samePermission(current.settings.permissionProfile,plan.permission)){
+    if(options.beforeResume)throw new BridgeError('policy_verification_failed','恢复后 Codex 报告的权限设置和原来的不一致，为安全起见暂停投递；消息已保留（运行 nxbridge status 查看）。');
                                              
-    const repaired=await rpc.request('thread/resume',args,{timeout:30000});if(repaired.thread?.id!==id)throw new BridgeError('session_changed','重新核验时原会话已经变化。');
-    current=await readSessionProfile(file,id);current=await persistedAfter(rpc,id,file,current.offset,{approvalPolicy:plan.policy.approval});
+    options.guard?.();
+    const repaired=await rpc.request('thread/resume',args,{timeout:30000,mutation:!!options.beforeResume});if(repaired.thread?.id!==id)throw new BridgeError('session_changed','重新核对时 Codex 会话已经变了，消息没有送出。');
+    current=await readSessionProfile(file,id);options.guard?.();current=await persistedAfter(rpc,id,file,current.offset,{approvalPolicy:plan.policy.approval});
+    current=await verifyResumedTier(rpc,id,original,repaired,current,file,options.guard);
   }
   if(!samePermission(current.settings.permissionProfile,plan.permission)||current.settings.approvalPolicy!==undefined&&!isDeepStrictEqual(current.settings.approvalPolicy,plan.policy.approval)||current.settings.approvalsReviewer!==undefined&&!isDeepStrictEqual(current.settings.approvalsReviewer,plan.policy.reviewer))throw new BridgeError('policy_verification_failed','无法核验不放宽权限的恢复结果，已暂停投递。');
   return{resumed,policy:plan.policy,profile:current};

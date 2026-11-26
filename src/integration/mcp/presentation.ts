@@ -48,6 +48,15 @@ function completionGuardNotices(members:any[]):string[]{
   }
   return lines;
 }
+                                                                             
+export function restartPauseText(detail:any):string{
+  if(detail?.code==='service_tier_mismatch')return'后台 Codex 重启后服务档位和原来对不上'+(detail.saved!==undefined||detail.live!==undefined?`（原来 ${detail.saved??'未指定'}，现在 ${detail.live??'未指定'}）`:'')+'，为免改用别的档位已暂停投递，消息已保留';
+  if(detail?.code==='service_tier_unverified')return'后台 Codex 重启后没能确认服务档位和原来一致，为免改用别的档位已暂停投递，消息已保留';
+  return'后台 Codex 的重启没有完整完成，已暂停投递，消息已保留';
+}
+function restartPauseNotice(member:any):string[]{
+  return member?.state==='paused'&&(member.pause_reason??member.pauseReason)==='restart_incomplete'?[restartPauseText(member.pause_detail)]:[];
+}
                                
 function profileNotice(member:any):string[]{
   const view=member?.partner_profile,wanted=profileText(view?.requested),who='后台 '+(member?.host==='codex'?'Codex':'Claude');
@@ -69,6 +78,7 @@ export function formatStatus(status:any):string{
     ...(status.partner.enabled===false?['搭档的 nxbridge 已关闭；发信已停用，不会自动启动替代窗口。']:[]),
     ...(status.partner.retryBudget?.warning?[status.partner.retryBudget.warning]:[]),
     ...[status.self,status.partner].flatMap(profileNotice),
+    ...[status.self,status.partner].flatMap(restartPauseNotice),
                                       
     ...[status.self,status.partner].flatMap(p=>p?.childCompletions?.hold?.reason?[`Codex 的子代理已做完，尚未确认主线程接着处理：${p.childCompletions.hold.reason}。没动的话到原 Codex 窗口说一句继续，不用重跑子代理`]:[]),
                                                

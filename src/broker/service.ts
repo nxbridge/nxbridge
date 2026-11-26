@@ -62,7 +62,7 @@ export async function runService(home=bridgeHome()):Promise<void>{
     ownership=await registerCurrentProcess(home,'broker');
     const windowsIndependent=process.platform!=='win32'||ownedProcesses(home).records.some(value=>value.role==='broker'&&value.windowsIndependent&&value.identity.pid===process.pid&&value.identity.startedAt===ownership!.identity.startedAt);
     const resources=new ResourceHealth(resourceSampler(home));
-    broker=new Broker(store,config,{codex:new CodexAdapter(config,home),claude:new ClaudeAdapter(config,home)},home,origin,{entry:runtime.record.entry,generation:runtime.record.generation,buildId:runtime.record.buildId,windowsIndependent},resources);
+    broker=new Broker(store,config,{codex:new CodexAdapter(config,home,{pid:ownership.identity.pid,startedAt:ownership.identity.startedAt}),claude:new ClaudeAdapter(config,home)},home,origin,{entry:runtime.record.entry,generation:runtime.record.generation,buildId:runtime.record.buildId,windowsIndependent},resources);
     started=broker.start();await started;
     const terminate=()=>{void close().catch(error=>{process.stderr.write('协调器关闭未完成：'+describeError(error)+'\n');process.exitCode=1;});};
     process.once('SIGINT',terminate);process.once('SIGTERM',terminate);

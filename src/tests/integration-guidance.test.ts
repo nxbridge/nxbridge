@@ -47,5 +47,13 @@ test('暂停原因只取已记录证据，离开暂停或切换会话后清除',
   await f.broker.dispatch('hook',{session_id:'x',hook_event_name:'Interrupt'});assert.equal(partner().pause_reason,'interrupted');
   f.store.updatePeer(f.x.id,{state:'ready'});assert.equal(partner().pause_reason,undefined);assert.equal(f.store.peer(f.x.id).pauseReason,undefined);
   f.store.updatePeer(f.x.id,{state:'paused',pauseReason:'restart_incomplete'});assert.equal(partner().pause_reason,'restart_incomplete');
+  const event={memberId:f.x.id,sessionId:f.x.sessionId,runtimeId:'restarted-runtime'};
+  const detail={code:'service_tier_mismatch',saved:'opaque-tier-a',live:'flex'};
+  f.codex.emit('sessionVerifying',event);f.codex.emit('sessionVerificationFailed',{...event,error:{code:'restart_incomplete',message:'原生档位已改变，消息保留',pauseDetail:detail}});
+  assert.deepEqual(partner().pause_detail,detail);
+  assert.equal(partner().hosting.user_step,'原生档位已改变，消息保留');
+  f.store.updatePeer(f.x.id,{state:'ready'});assert.equal(partner().pause_detail,undefined);
+  f.store.updatePeer(f.x.id,{state:'paused',pauseReason:'restart_incomplete'});
   f.store.updatePeer(f.x.id,{sessionId:'different-session'});assert.equal(f.store.peer(f.x.id).pauseReason,undefined);
+  assert.equal(partner().pause_detail,undefined);
 });

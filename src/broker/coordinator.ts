@@ -19,7 +19,7 @@ import { readCodexHistory, type HistoryCheckpoint } from '../hosts/codex/codex-h
 import {ClaudeAdapter} from '../hosts/claude/adapter.js';
 import {liveProcess} from '../process/process.js';
 import {peerAddress} from '../hosts/claude/claude-inbox.js';
-import {BridgeError,DeliveryError,describeError} from '../shared/errors.js';
+import {BridgeError,DeliveryError,RuntimeRecoveryHold,describeError} from '../shared/errors.js';
 import {DEFAULT_RETENTION} from '../config/defaults.js';
 import {WAKE_NOTICE,HEALTH_WAKE_NOTICE,completionWakeId,isEmbeddedWake,otherHost,type Actor,type BridgeConfig,type Endpoint,type Message,type Peer,type Pair,type PeerState,type RegisterInput,type Host} from '../types.js';
 import {delay} from '../shared/time.js';
@@ -286,11 +286,15 @@ export class Broker {
     store.onCooperationChange=ids=>{for(const id of ids)store.faults.sync('cooperation_clock:'+id,()=>this.communicationTips.cooperation.changed(store.peer(id)));};
     this.configurationReload=new ConfigurationReload(home);this.configuration=new InHostConfiguration(home,Date.now,()=>this.applyConfiguration(),(name,data)=>this.store.event(name,data));
     this.runtimeHealth=new BrokerHealthCoordinator({store,config,adapters,home,resources},{incidents:this.incidents,deliveryHealth:this.deliveryHealth,communicationTips:this.communicationTips,pairAnomalies:this.pairAnomalies,idleNotices:this.idleNotices,profiles:this.profiles,foregroundHealth:this.foregroundHealth,managedRecovery:this.managedRecovery,health:this.health,codexDirect:this.codexDirect,daemons:this.daemons,questions:this.questions,turnEnds:this.turnEnds},{stopped:()=>this.stopped,actor:(...args)=>this.actor(...args),enabled:(...args)=>this.enabled(...args),requireEnabled:(...args)=>this.requireEnabled(...args),ownedClaudeLaunchReady:(...args)=>this.memberLifecycle.ownedClaudeLaunchReady(...args),ownedClaudeLaunchFailure:(...args)=>this.memberLifecycle.ownedClaudeLaunchFailure(...args),signalCodexWake:(...args)=>this.signalCodexWake(...args),signalEmbeddedWake:(...args)=>this.signalEmbeddedWake(...args),refreshHookTrust:(...args)=>this.refreshHookTrust(...args),pumpStage:(...args)=>this.pumpStage(...args)});
-    this.memberLifecycle=new BrokerLifecycleCoordinator({store,config,adapters,home},{profileCoordination:this.profileCoordination,deletedSessions:this.deletedSessions,takeovers:this.takeovers,managedRecovery:this.managedRecovery,transfers:this.transfers,runtimeHealth:this.runtimeHealth,deliveryHealth:this.deliveryHealth,daemons:this.daemons,codexDirect:this.codexDirect},{
+    this.memberLifecycle=new BrokerLifecycleCoordinator({store,config,adapters,home},{profileCoordination:this.profileCoordination,deletedSessions:this.deletedSessions,takeovers:this.takeovers,managedRecovery:this.managedRecovery,transfers:this.transfers,runtimeHealth:this.runtimeHealth,deliveryHealth:this.deliveryHealth,daemons:this.daemons,codexDirect:this.codexDirect,subagentCompletions:this.subagentCompletions},{
       stopped:()=>this.stopped,
       migrateCodexIdentity:(...args)=>this.migrateCodexIdentity(...args),
       restartCodexTransport:(peer,endpoint,options)=>this.restartCodex({peer_id:peer.id},{endpoint,options}),
       pumpAfterCurrent:()=>{const pumping=this.pumping;return pumping?pumping.then(()=>this.pump()):this.pump();},
+    });
+    adapters.codex.bindOwnedRoutes?.(id=>this.memberLifecycle.ownedCodexRoute(id),id=>{
+      const peer=this.stopped?undefined:this.store.getPeer(id);
+      return peer?.host==='codex'&&peer.owner==='nxbridge'?peer.sessionId??undefined:undefined;
     });
     this.modReads=new ModReadServer(home,(actor,operation,receipt,endpointEpoch,health)=>this.modRead(actor,operation,receipt,endpointEpoch,health),(input,actor,receipt,endpointEpoch,admit)=>this.modWrite(input,actor,receipt,endpointEpoch,admit));
     const on=(adapter:{on:(event:string,listener:(...args:any[])=>void)=>unknown},event:string,listener:(...args:any[])=>unknown)=>adapter.on(event,(...args:any[])=>{
@@ -530,7 +534,7 @@ export class Broker {
     await this.pumpStage('startup_legacy',()=>{captureLegacyTakeovers(this.store,this.home);});
     await this.pumpStage('startup_controls',()=>{writeMemberControls(this.home,this.store);});
     for(const peer of this.store.peers())await this.pumpStage('startup_member:'+peer.id,()=>{if(!this.enabled(peer.id))this.adapters[peer.host].setEnabled?.(peer,this.runtimeEndpoint(peer.id),false);});
-    await this.pumpStage('startup_routes',()=>this.restoreOwnedCodexRoutes());
+    this.background('startup_routes',()=>this.restoreOwnedCodexRoutes());
     await this.pumpStage('startup_receipts',()=>this.store.recoverEmbeddedReceipts());
     await this.pumpStage('startup_questions',()=>this.questions.sweep());
     for(const pair of this.store.pairs())for(const id of [pair.claude,pair.codex])await this.pumpStage('startup_integration:'+id,()=>{if(this.enabled(id))this.pairAnomalies.integration(this.store.peer(id),{});});
@@ -547,12 +551,13 @@ export class Broker {
     this.questions.recover();
     for(const pair of pairs)for(const id of [pair.codex,pair.claude])await this.pumpStage('startup_delivery:'+id,()=>this.deliveryHealth.restarted(pair,this.store.peer(id),this.store.deliveryCounts(pair.id,id),this.store.unsettledDeliveryFacts(pair.id,id),interrupted.get(id)??0));
     this.maintain();
-    const endpoints=[...new Set(this.store.endpoints().filter(e=>e.mode==='app-server'&&this.enabled(e.peerId)).map(e=>e.address))];
+                                            
+    const endpoints=[...new Set(this.store.endpoints().filter(e=>e.mode==='app-server'&&this.enabled(e.peerId)&&!this.memberLifecycle.ownedCodexRoute(e.peerId)).map(e=>e.address))];
     await Promise.allSettled(endpoints.map(e=>this.adapters.codex.connect(e).catch(error=>{
       if(isCodexIdentityError(error)){for(const endpoint of this.store.endpoints().filter(value=>value.address===e))this.store.setSetting('codexIdentity:'+endpoint.peerId,{code:error.code,message:'投递已暂停：'+error.message,endpoint:e});}
       else this.disconnected(e);throw error;
     })));
-    await this.refreshCodexSubagents();
+    this.background('startup_children',()=>this.refreshCodexSubagents());
     const tick=()=>{
       if(this.stopped)return;
       this.background('member_recovery_tick',()=>Promise.all(this.schedulePairedRecoveries().values()));
@@ -834,6 +839,7 @@ export class Broker {
       if(home)this.store.setSetting('managedLaunchProof:'+id,{...(saved?.sessionId===peer.sessionId?saved:{}),sessionId:peer.sessionId!,configHome:home,...(saved?.nativeLaunchId&&saved.sessionId===peer.sessionId?{restorePairId:pair.id}:{})});
       try{await this.memberLifecycle.prepare(peer);}
       catch(error){
+        if(error instanceof RuntimeRecoveryHold)continue;
                                                   
         if(!this.store.peer(id).launchFailure)this.store.updatePeer(id,{launchFailure:{at:Date.now(),...(error instanceof BridgeError?{code:error.code}:{}),message:describeError(error).slice(0,1200)}});
         this.store.event('pair.partner.start.failed',{peerId:id,error:describeError(error)});
@@ -1200,7 +1206,7 @@ export class Broker {
     const capability={identityIssues:this.store.faults.map('status_identity',ids,id=>id,peerId=>{const issue=this.store.setting('codexIdentity:'+peerId);return issue?[{peerId,...issue as object}]:[];}).flat(),...(background?{claudeBackground:background}:{}),pluginCaches:installedCacheStatus(this.home),processProbes:processProbeStatus(),processAncestry:processAncestryStatus(),...(this.resources?{resources:this.resources.snapshot()}:{}),integrationIssues:this.store.faults.map('status_integration',ids,id=>id,peerId=>this.runtimeHealth.integrationIssues(peerId,true)).flat()};
     Object.assign(capability,{retirements:actor?retirements.filter(value=>ids.includes(value.peerId)):retirements,incidents:this.runtimeHealth.incidentViews(ids),notes:this.runtimeHealth.incidentNotes(ids,observer?.id),rpc:this.adapters.codex.rpcMetrics?.(),degraded:this.store.faults.status().filter(value=>value.degraded).map(value=>actor?{stage:value.stage.split(':')[0],count:value.count,retryAt:value.retryAt}:value),outageLedger:brokerOutageDiagnostic(this.home)});
     Object.assign(capability,{hookTimings:ids.flatMap(id=>{const timing=this.pairAnomalies.hookTimings(this.store.peer(id));return timing?[timing]:[];})});
-    const frozen=frozenProfileStatus(this.home,this.config);Object.assign(capability,{configurationReload:this.configurationReload.status,frozen_profiles:frozen.profiles,...(frozen.warnings.length?{profile_warnings:frozen.warnings}:{})});
+    const frozen=frozenProfileStatus(this.home,this.config),profileWarnings=[...this.config.profileWarnings??[],...frozen.warnings,...this.profiles.warnings()];Object.assign(capability,{configurationReload:this.configurationReload.status,frozen_profiles:frozen.profiles,...(profileWarnings.length?{profile_warnings:profileWarnings}:{})});
     const describePeer=(p:Peer)=>{
       const binding=this.store.bindings.current(p.id),endpoint=this.store.endpoint(p.id),child=p.host==='claude'?claudeChild(this.home,p.id):undefined,health=this.runtimeHealth.peerHealth(p),budget=endpoint?this.providerRetries.get(endpoint.address):undefined;
       return{...p,permission_facts:permissionFacts(p,endpoint),...this.runtimeHealth.deliveryGuidance(p),...(this.memberLifecycle.recoveryStatus(p)?{recovery:this.memberLifecycle.recoveryStatus(p)}:{}),...(health?.nativeIssue?{native_issue:health.nativeIssue}:{}),...(p.host==='codex'?{nativeHistory:this.store.setting('codexHistoryCompatibility:'+p.id),directDelivery:this.codexDirect.status(p.id)}:{}),...(binding?{context:{sessionId:binding.sessionId,epoch:binding.epoch,transitioning:binding.transitioning,lineage:this.store.bindings.lineage(p.id)}}:{}),...(health?{health}:{}),...(budget?{retryBudget:budget}:{}),...(child?{backgroundMode:'child',worker:{phase:child.phase,pid:child.worker?.pid,nativePid:child.native?.pid,configHome:child.configHome,...(child.human?{human:child.human}:{}),...(child.error?{error:child.error}:{})},takeoverCommand:`nxbridge open claude --member ${p.id}`+(p.state==='busy'?' --interrupt':'')}:{})};
@@ -1579,6 +1585,7 @@ export class Broker {
       else if(this.store.setting('managedSessionConflict:'+peer.id))reason='原生会话身份冲突，投递暂缓';
       else if(peer.state==='busy')reason=undefined;
       else if(!endpoint||['offline','unknown','starting'].includes(peer.state))reason='当前原生会话不可达或尚未核验';
+      else if(this.waitingOwnedCodexSubscription(peer,endpoint))reason='后台 Codex 还没重新接上，Codex 子任务的完成提醒先保留，接上后自动送达';
       else if(endpoint.daemon&&(!daemonWakeAuthorized(this.store,pair)||daemonContextChanged(this.store,peer,endpoint)))reason='用户窗口没有当前上下文的主动唤醒授权';
       else if(endpoint.mode==='embedded'&&!endpoint.daemon&&this.config.compatibilityWake!=='notify')reason='此用户窗口未启用兼容唤醒';
       else if(view.wake?.state==='unknown')reason='上次唤醒结果不明，未重复提交';
@@ -1589,6 +1596,10 @@ export class Broker {
     if(JSON.stringify(previous??null)===JSON.stringify(hold))return;
     this.pairAnomalies.integration(peer,{subagentHold:hold});
     if(pair)this.runtimeHealth.refreshNoticeConditions(pair,'subagent_completion_hold');
+  }
+  private waitingOwnedCodexSubscription(peer:Peer,endpoint:Endpoint):boolean{
+    return peer.host==='codex'&&peer.owner==='nxbridge'&&endpoint.mode==='app-server'&&!endpoint.daemon
+      &&!this.adapters.codex.hasSubscription(peer,endpoint);
   }
   private async submitCodexSignal(peer:Peer,channel:string,guard:()=>boolean,submit:(authorize:()=>Promise<boolean>)=>Promise<void|string|undefined>,queued=false):Promise<boolean>{
     let id:string|undefined;
@@ -1613,7 +1624,7 @@ export class Broker {
       }catch(error){
                                                       
         const safe=error instanceof DeliveryError&&!error.uncertain&&['attach_failed','disconnected','timeout','daemon_identity_changed','-32601','method_not_found','unsupported'].includes(error.code);
-        if(!safe||!guard())throw error;
+        if(!safe||!guard()||peer.owner==='nxbridge'&&!endpoint.daemon&&!this.adapters.codex.hasSubscription(peer,endpoint))throw error;
         this.store.event('subagent.wake.fallback',{peerId:peer.id,batchId:batch,reason:error.code});
         return await this.submitCodexSignal(peer,'queue',guard,authorize=>this.adapters.codex.queueWake(peer,endpoint,async()=>{
           if(!await(endpoint.daemon?this.daemons:this.adapters.codex).queueWakeReady(peer,endpoint)||!await authorize())throw new DeliveryError('wake_unavailable','父会话已不再满足唤醒条件。');
@@ -1656,6 +1667,7 @@ export class Broker {
     if(hostingGate(this.store,peer))return SKIPPED;
     const pair=this.store.pairFor(peer.id),current=this.store.peer(peer.id);
     if(!pair||!peer.sessionId||!this.codexWakeAllowed(peer,endpoint,pair.id)||this.subagentCompletions.blocked(peer))return SKIPPED;
+    if(this.waitingOwnedCodexSubscription(current,endpoint))return SKIPPED;
     if(endpoint.daemon&&!await this.daemons.wakeReady(peer,endpoint))return SKIPPED;
     if(this.subagentCompletions.pending(peer)&&!this.codexDirect.status(peer.id)?.continuation?.uncertain)return this.signalSubagentWake(peer,endpoint,pair);
     if(localCodexEndpoint(this.home,endpoint.address)){
@@ -1800,17 +1812,22 @@ export class Broker {
   }
   private async refreshCodexSubagents(root?:Peer,runtime?:Endpoint):Promise<void>{
     const peers=this.store.peers(),endpoints=this.store.endpoints();
+    const observations:Promise<unknown>[]=[];
     for(const peer of peers)if(peer.host==='codex'&&peer.kind==='subagent'&&this.enabled(peer.id))
       for(const endpoint of endpoints.filter(ep=>ep.peerId===peer.id&&ep.active&&ep.mode==='app-server'&&(!runtime||ep.address===runtime.address))){
+        const current=()=>!this.stopped&&this.enabled(peer.id)&&this.store.getPeer(peer.id)?.sessionId===peer.sessionId
+          &&this.store.endpoints(peer.id).some(ep=>ep.epoch===endpoint.epoch&&ep.active&&ep.address===endpoint.address&&ep.pid===endpoint.pid&&ep.procStart===endpoint.procStart&&ep.runtimeId===endpoint.runtimeId);
+        observations.push(this.pumpStage('subagent_observe:'+peer.id,async()=>{
                                            
         if((!runtime||!codexRuntimeEndpoint(endpoint,runtime))&&endpoint.pid&&endpoint.procStart&&await ownedProcessState({pid:endpoint.pid,startedAt:endpoint.procStart})==='dead'){
-          const current=this.store.endpoints(peer.id).find(ep=>ep.epoch===endpoint.epoch&&ep.active&&ep.address===endpoint.address&&ep.pid===endpoint.pid&&ep.procStart===endpoint.procStart&&ep.runtimeId===endpoint.runtimeId);
-          if(current){this.store.deactivate(peer.id,current.epoch);if(!this.store.endpoint(peer.id))this.store.updatePeer(peer.id,{state:'offline'});}
-          continue;
+          if(current()){this.store.deactivate(peer.id,endpoint.epoch);if(!this.store.endpoint(peer.id))this.store.updatePeer(peer.id,{state:'offline'});}
+          return;
         }
-        if(root&&(!runtime||!codexRuntimeEndpoint(endpoint,runtime)||!codexRuntimeChild(root,peer,runtime,peers,endpoints)))continue;
-        await this.pumpStage('subagent_observe:'+peer.id,()=>this.adapters.codex.observe(peer,endpoint));
+        if(root&&(!runtime||!codexRuntimeEndpoint(endpoint,runtime)||!codexRuntimeChild(root,peer,runtime,peers,endpoints)))return;
+        if(current())await this.adapters.codex.observe(peer,endpoint);
+        }));
       }
+    await Promise.all(observations);
   }
   private codexRestartChildren(peer:Peer,runtime:Endpoint):Peer[]{
     const peers=this.store.peers(),endpoints=this.store.endpoints(),children=peers.filter(child=>child.id!==peer.id&&codexRuntimeChild(peer,child,runtime,peers,endpoints)),ids=new Set(children.map(child=>child.id));

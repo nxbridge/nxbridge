@@ -6,6 +6,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { resolveCli } from '../process/host-command.js';
+import { ClaudeStreamHealth } from '../hosts/claude/claude-stream.js';
 import { temporaryDirectory } from '../tests/support/temporary.js';
 
 test('实际 Claude：Stop 继续片段遭遇不可重试 400 时仍报告根轮次终态',{timeout:35000},async t=>{
@@ -68,6 +69,11 @@ export function register(on){
   t.diagnostic(JSON.stringify({modelRequests,events,terminal:terminal.map(row=>[row.terminal_reason,row.api_error_status,row.is_error]),stderr}));
   assert.equal(modelRequests[0],'initial');assert.ok(modelRequests.length>=2);assert.ok(modelRequests.slice(1).every(value=>value==='continued'));
   assert.deepEqual(terminal.map(row=>[row.terminal_reason,row.api_error_status,row.is_error]),[['api_error',400,true]]);
+  const health=new ClaudeStreamHealth();
+  for(const line of stdout.trim().split('\n'))health.observe(JSON.parse(line));
+  assert.equal(health.get()?.state,'failed');
+  assert.equal(health.get()?.completion,'failed');
+  assert.equal(health.get()?.error,'Claude API 请求失败（HTTP 400）');
   const root=events.filter(row=>['start','stop','failure','complete'].includes(row.what));
   assert.deepEqual(root.map(row=>row.what),['start','stop','failure','complete']);
   const [began,stop,failure,complete]=root;

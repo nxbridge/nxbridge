@@ -38,10 +38,12 @@ export function readConfiguration(home:string):ConfigurationDocument{
   }else if(source==='toml'&&existsSync(legacy))warnings.push(`${legacy} 仅作为旧配置备份保留；已有 TOML 配置，不合并旧 JSON。`);
   const userDocument=user===undefined?{}:parseConfiguration(user,userFile);
   const active=source==='legacy-json'?legacy:filename;
-  const normalized=normalizeConfiguration(document,key=>configLocation(managed??'',key,active));
-  const userNormalized=normalizeConfiguration(userDocument,key=>configLocation(user??'',key,userFile));
+  const normalized=normalizeConfiguration(document,key=>configLocation(managed??'',key,active),{readLegacyProfiles:'managed'});
+  const userNormalized=normalizeConfiguration(userDocument,key=>configLocation(user??'',key,userFile),{readLegacyProfiles:'user'});
   let config=normalized.config as unknown as Record<string,unknown>;
   for(const field of CONFIG_FIELDS)if(configValue(userDocument,field.key)!==undefined)config=withConfigValue(config,field.internal,configValue(userNormalized.config,field.internal));
+  const profileWarnings=[...normalized.config.profileWarnings??[],...userNormalized.config.profileWarnings??[]];
+  if(profileWarnings.length){config={...config,profileWarnings};warnings.push(...profileWarnings);}
   for(const [items,text,file]of [[normalized.unknown,managed??'',active],[userNormalized.unknown,user??'',userFile]] as const)
     for(const key of items)warnings.push(`${configLocation(text,key,file)}：未知配置项 ${key.map(part=>/^[\w-]+$/.test(part)?part:JSON.stringify(part)).join('.')}，已保留但未使用。`);
   return{filename,userFile,source,text:managed??'',userText:user??'',managedExists:managed!==undefined,userExists:user!==undefined,legacyText,document,userDocument,config:config as unknown as BridgeConfig,warnings};
@@ -58,7 +60,7 @@ function unchanged(current:ConfigurationDocument):void{
 function persist(current:ConfigurationDocument,document:Record<string,unknown>,keys:string[],origin:ConfigurationOrigin){
   const migrated=current.source==='legacy-json';
   unchanged(current);
-  atomicText(current.filename,MANAGED_HEADER+stringify(withConfigValue(document,'schema_version',1))+'\n');
+  atomicText(current.filename,MANAGED_HEADER+stringify(withConfigValue(compatibleManagedDocument(document),'schema_version',1))+'\n');
   const home=path.dirname(current.filename);syncFrozenProfiles(home,readConfiguration(home).config);
   atomicText(path.join(path.dirname(current.filename),'config-last-change.json'),JSON.stringify({at:Date.now(),origin,keys,migrated},null,2)+'\n');
   return{changed:true,filename:current.filename,keys,migrated};
@@ -70,7 +72,7 @@ export function writeConfiguration(home:string,edits:ConfigurationEdit[],origin:
   return commitConfiguration(prepareConfiguration(home,edits),origin);
 }
 export function prepareConfiguration(home:string,edits:ConfigurationEdit[]):PreparedConfiguration{
-  const current=readConfiguration(home);let document=current.document;
+  const current=readConfiguration(home);let document=compatibleManagedDocument(current.document);
   for(const edit of edits){
     const field=configurationField(edit.key);
     if(field.immutable)throw new BridgeError('config_key_immutable',`${edit.key} 由配置版本管理，不能用 set/unset 修改。`);
@@ -79,6 +81,10 @@ export function prepareConfiguration(home:string,edits:ConfigurationEdit[]):Prep
   }
   normalizeConfiguration(document,key=>configLocation(current.text,key,current.filename));
   return{current,document,keys:[...new Set(edits.map(edit=>edit.key))],changed:!current.managedExists||!isDeepStrictEqual(current.document,document)};
+}
+                                        
+function compatibleManagedDocument(document:Record<string,unknown>):Record<string,unknown>{
+  return configValue(document,'partners.codex.service_tier')==='flex'?withConfigValue(document,'partners.codex.service_tier',undefined):document;
 }
 export function commitConfiguration(prepared:PreparedConfiguration,origin:ConfigurationOrigin):{changed:boolean;filename:string;keys:string[];migrated:boolean}{
   const {current,document,keys,changed}=prepared;

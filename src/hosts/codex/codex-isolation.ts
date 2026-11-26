@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { HostLaunch } from '../host-launch.js';
 import {runCli} from '../../process/host-command.js';
-import { codexArguments, codexDedicatedEndpointArguments, type ProcessIdentity } from '../../process/process.js';
+import { codexArguments, codexDedicatedEndpointArguments, processIdentity, type ProcessIdentity } from '../../process/process.js';
 import {BridgeError,describeError} from '../../shared/errors.js';
 import { proveUnixCodexSocket } from '../../ipc/unix-socket.js';
 
@@ -41,6 +41,13 @@ export async function requireDedicatedCodex(launch:HostLaunch,home?:string):Prom
 export async function verifyDedicatedCodexArguments(endpoint:string,native:ProcessIdentity):Promise<void>{
   const args=await codexArguments(native),subcommand=args.indexOf('app-server');
   if(subcommand<0||!args.slice(0,subcommand).includes('--no-daemon')||!codexDedicatedEndpointArguments(args,endpoint))throw new BridgeError('shared_backend','原生 App Server 没有可核验的专用模式，未授权停止共享后台。');
+}
+                                   
+export async function verifyCodexNativeGeneration({pid,procStart}:{pid?:number;procStart?:string}):Promise<ProcessIdentity>{
+  if(!pid||!procStart)throw new BridgeError('unowned_runtime','没法确认后台 Codex 是不是原来那个进程。');
+  const native=await processIdentity(pid);
+  if(native.startedAt!==procStart||!/^codex(?:\.exe)?$/i.test(native.name))throw new BridgeError('unowned_runtime','没法确认后台 Codex 服务是不是原来那个进程。');
+  return native;
 }
 export async function verifyDedicatedCodex(endpoint:string,native:ProcessIdentity):Promise<void>{
   await verifyDedicatedCodexArguments(endpoint,native);

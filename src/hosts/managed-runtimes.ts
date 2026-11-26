@@ -7,7 +7,7 @@ import {BridgeError} from '../shared/errors.js';
 import {atomicWriteText} from '../storage/atomic-file.js';
 import {stateDirectory} from '../storage/state-directory.js';
 import { ownedProcesses, ownedRecordState, ownedRecordPredatesBoot, currentLinuxBootId, type OwnedProcessRecord } from '../process/owned-processes.js';
-import { ownedProcessState, type ProcessState } from '../process/process-stop.js';
+import { ownedProcessState, type OwnedIdentity, type ProcessState } from '../process/process-stop.js';
 import type { SessionProfile } from './codex/codex-session-profile.js';
 
 export interface ManagedRuntime {
@@ -16,9 +16,17 @@ export interface ManagedRuntime {
   configHome?:string;launchMethod?:string;createdAt:number;error?:string;failureCode?:string;launchSettled?:boolean;bootstrapRevision?:string;
   dedicated?:boolean;executable?:string;version?:string;sessionId?:string;profileId?:string;authenticatedLoopback?:boolean;
   sessionVerification?:{sessionId:string;profile:SessionProfile;restartSourceId?:string};
+  coldResumeUnconfirmed?:{sessionId:string;pid:number;procStart:string;attempts?:1|2;transportClosed?:boolean;broker?:OwnedIdentity;connectionId?:string};
+  childControlChecks?:{pid:number;procStart:string;pending:Record<string,string>};
   threadUnloadDelaySecs?:number;bootId?:string;
 }
 export interface RuntimeRecord {file:string;value:ManagedRuntime}
+                            
+export function writeExistingRuntime({file,value}:RuntimeRecord):void{
+  if(value.kind==='owned'){atomicJson(file,value);return;}
+  const {id,owner,kind,state,...legacy}=value;
+  atomicJson(file,legacy);
+}
 export const runtimeDirectory=(home:string)=>path.join(home,'run','runtimes');
 const tokenFile=(home:string,id:string)=>runtimeFile(home,id).replace(/\.json$/,'.token');
 export function createRuntimeToken(home:string,value:ManagedRuntime):string{

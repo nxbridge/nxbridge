@@ -7,18 +7,133 @@ import { temporary } from './support/temporary.js';
 import { FakeAdapter } from './support/fake-adapter.js';
 import {BridgeError} from '../shared/errors.js';
 import {type Endpoint,type Peer} from '../types.js';
-import { saveManagedRuntime } from '../hosts/managed-runtimes.js';
+import { runtimeFor, saveManagedRuntime } from '../hosts/managed-runtimes.js';
+import { RpcClient } from '../ipc/rpc.js';
 import { managedMarker } from '../install/installation.js';
 import { processIdentity } from '../process/process.js';
 import { once } from 'node:events';
 import { WebSocketServer } from 'ws';
-import { CodexAdapter } from '../hosts/codex/adapter.js';
+import { CodexAdapter, connectAppServer } from '../hosts/codex/adapter.js';
 import { Broker, type Adapters } from '../broker/coordinator.js';
 import { Store } from '../storage/store.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
 import { formatGlobalStatus, formatStatus } from '../integration/mcp/presentation.js';
 import path from 'node:path';
-import { writeFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
+
+test('冷恢复的关闭证据来自实际 WebSocket 结束事件',async t=>{
+  const home=temporary(t),adapter=new CodexAdapter(DEFAULT_CONFIG,home),server=new WebSocketServer({host:'127.0.0.1',port:0});
+  t.after(async()=>{adapter.close();for(const socket of server.clients)socket.terminate();await new Promise<void>(resolve=>server.close(()=>resolve()));});
+  await once(server,'listening');
+  server.on('connection',socket=>socket.on('message',payload=>{
+    const request=JSON.parse(payload.toString());
+    if(request.method==='initialize')socket.send(JSON.stringify({id:request.id,result:{userAgent:'codex-tui/0.166.0 (fixture)'}}));
+  }));
+  const endpoint='ws://127.0.0.1:'+(server.address() as {port:number}).port;
+  const rpc=await connectAppServer(endpoint,DEFAULT_CONFIG,undefined,home,{readOnly:true});
+  const websocket=[...server.clients][0]!,remoteClosed=once(websocket,'close');
+                           
+  rpc.disconnected();assert.equal(rpc.closed,true);assert.equal(websocket.readyState,websocket.OPEN);
+  assert.equal(await (adapter as any).closeColdResumeTransport(rpc),true);
+  await remoteClosed;
+});
+
+for(const seal of [false,true])test('原生连接迟关闭时'+(seal?'停止协调器后不写证据':'仍记录实际关闭证据'),async t=>{
+  const home=temporary(t),adapter=new CodexAdapter(DEFAULT_CONFIG,home),server=new WebSocketServer({host:'127.0.0.1',port:0});
+  t.after(async()=>{adapter.close();for(const socket of server.clients)socket.terminate();await new Promise<void>(resolve=>server.close(()=>resolve()));});
+  await once(server,'listening');
+  server.on('connection',socket=>socket.on('message',payload=>{
+    const request=JSON.parse(payload.toString());
+    if(request.method==='initialize')socket.send(JSON.stringify({id:request.id,result:{userAgent:'codex-tui/0.166.0 (fixture)'}}));
+  }));
+  const endpoint='ws://127.0.0.1:'+(server.address() as {port:number}).port;
+  const rpc=await connectAppServer(endpoint,DEFAULT_CONFIG,undefined,home,{readOnly:true}),websocket=[...server.clients][0]!;
+  websocket.pause();const remoteClosed=once(websocket,'close');
+  const setTimer=setTimeout,wait=t.mock.method(globalThis,'setTimeout',(callback:()=>void,ms?:number)=>setTimer(callback,ms===1500?0:ms));
+  let evidence=false;let observed!:()=>void;const observation=new Promise<void>(resolve=>observed=resolve);
+  try{assert.equal(await (adapter as any).closeColdResumeTransport(rpc,()=>{evidence=true;observed();}),false);}
+  finally{wait.mock.restore();}
+  assert.equal(evidence,false);if(seal)adapter.close();
+  websocket.resume();await remoteClosed;
+  if(seal)assert.equal(await (adapter as any).closeColdResumeTransport(rpc),true);else await observation;
+  assert.equal(evidence,!seal);
+});
+
+test('冷恢复只从已退出的协调器代次或正常启动兼容的旧记录取得重试许可',async t=>{
+  const home=temporary(t),owner=await processIdentity(process.pid),id='original',runtime={id:randomUUID(),peerId:'member',sessionId:id,owner:managedMarker(home),kind:'owned' as const,state:'ready' as const,endpoint:'unix://original',pid:1,procStart:'native-1',createdAt:1};
+  const marker={sessionId:id,pid:runtime.pid,procStart:runtime.procStart};
+  const ordinary=new CodexAdapter(DEFAULT_CONFIG,home),sameProcess=new CodexAdapter(DEFAULT_CONFIG,home),started=new CodexAdapter(DEFAULT_CONFIG,home,owner);
+  t.after(()=>{ordinary.close();sameProcess.close();started.close();});
+  const read=()=>runtimeFor(home,{id:runtime.id})!;
+  const plan=(adapter:CodexAdapter)=>(adapter as any).prepareColdResume(read(),id);
+  saveManagedRuntime(home,{...runtime,coldResumeUnconfirmed:{...marker,attempts:1,broker:{pid:owner.pid,startedAt:owner.startedAt},connectionId:'unchanged-owner'}});
+  await assert.rejects(plan(ordinary),{code:'owned_subscription_waiting'});
+  await assert.rejects(plan(sameProcess),{code:'owned_subscription_waiting'});
+  await assert.rejects(plan(started),{code:'owned_subscription_waiting'});
+  saveManagedRuntime(home,{...runtime,coldResumeUnconfirmed:{...marker,attempts:1,broker:{pid:owner.pid,startedAt:'prior-generation'},connectionId:'exited-owner'}});
+  assert.equal((await plan(started)).attempt,2);assert.equal(read().value.coldResumeUnconfirmed?.transportClosed,true);
+  saveManagedRuntime(home,{...runtime,coldResumeUnconfirmed:marker});
+  await assert.rejects(plan(ordinary),{code:'owned_subscription_waiting'});
+  assert.equal((await plan(started)).attempt,2);assert.equal(read().value.coldResumeUnconfirmed?.transportClosed,true);
+  saveManagedRuntime(home,{...runtime,coldResumeUnconfirmed:{...marker,attempts:2,transportClosed:true}});
+  await assert.rejects(plan(started),{code:'owned_subscription_waiting'});
+});
+
+for(const outcome of ['无关闭证据','重试成功','两次失败'] as const)test('托管迁移冷恢复按代次保留关闭证据与尝试次数：'+outcome,async t=>{
+  const home=temporary(t),store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home);
+  t.after(()=>{adapter.close();store.close();});
+  const original=store.register(registration('codex','migration-root'));store.updatePeer(original.id,{owner:'nxbridge'});
+  const peer=store.peer(original.id),endpoint=store.endpoint(peer.id)!,id=peer.sessionId!,file=path.join(home,'migration.jsonl');
+  endpoint.nativeSession={transcriptPath:file};
+  const settings={model:'fixture',reasoning_effort:'high',service_tier:'default',approval_policy:'never',approvals_reviewer:'user',permission_profile:{type:'disabled'}};
+  writeFileSync(file,[{type:'session_meta',payload:{id}},{type:'turn_context',payload:settings}].map(row=>JSON.stringify(row)+'\n').join(''),'utf8');
+  const runtime={id:randomUUID(),peerId:peer.id,sessionId:id,owner:managedMarker(home),kind:'owned' as const,state:'ready' as const,endpoint:endpoint.address,pid:1,procStart:'native-1',createdAt:1};
+  saveManagedRuntime(home,runtime);
+  const client=(state:'timeout'|'loaded'|'success')=>{
+    const sent:string[]=[];let wireOpen=true,lateReply!:()=>boolean;
+    const rpc=new RpcClient(message=>{sent.push(message.method!);queueMicrotask(()=>{
+      if(message.method==='thread/loaded/list')rpc.receive({id:message.id,result:{data:state==='loaded'?[id]:[]}});
+      else if(message.method==='thread/resume'){
+        assert.equal(message.params.threadId,id);assert.equal(message.params.model,settings.model);assert.equal(message.params.serviceTier,'default');
+        const reply=()=>{const subscribed=wireOpen;rpc.receive({id:message.id,result:{thread:{id,path:file,status:{type:'idle'}},model:settings.model,reasoningEffort:'high',serviceTier:'default',approvalPolicy:'never',approvalsReviewer:'user'}});return subscribed;};
+        if(state==='success')reply();else lateReply=reply;
+      }else if(message.method==='thread/settings/update'){
+        appendFileSync(file,JSON.stringify({type:'event_msg',payload:{type:'thread_settings_applied',thread_id:id,thread_settings:settings}})+'\n','utf8');
+        rpc.receive({id:message.id,result:{}});
+      }else assert.fail('恢复核验不应发送输入：'+message.method);
+    });},()=>{wireOpen=false;});
+    t.after(()=>rpc.close());
+    const request=rpc.request.bind(rpc);
+    t.mock.method(rpc,'request',(method:string,params?:unknown,options?:Parameters<typeof rpc.request>[2])=>request(method,params,method==='thread/resume'?{...options,timeout:20}:options));
+    return{rpc,sent,late:()=>lateReply()};
+  };
+  const acquire=(host:CodexAdapter,rpc:RpcClient)=>(host as any).acquireMigrationRoot(rpc,runtime,peer,endpoint,()=>{});
+  const proof=(host:CodexAdapter)=>t.mock.method(host as any,'closeColdResumeTransport',async(rpc:RpcClient,onClosed:()=>void)=>{rpc.close();onClosed();return true;});
+  if(outcome!=='无关闭证据')proof(adapter);
+  const first=client('timeout');
+  await assert.rejects(acquire(adapter,first.rpc),{code:'timeout'});
+  assert.equal(first.rpc.closed,true);assert.equal(first.late(),false);
+  assert.deepEqual(first.sent,['thread/loaded/list','thread/resume']);
+  const pending=()=>runtimeFor(home,{id:runtime.id})!.value.coldResumeUnconfirmed;
+  assert.equal(pending()?.attempts,1);assert.equal(pending()?.transportClosed,outcome==='无关闭证据'?undefined:true);
+  assert.equal(pending()?.broker?.pid,process.pid);assert.ok(pending()?.broker?.startedAt);assert.ok(pending()?.connectionId);
+  const restarted=new CodexAdapter(DEFAULT_CONFIG,home);t.after(()=>restarted.close());
+  if(outcome==='无关闭证据'){
+    const fresh=client('timeout');await assert.rejects(acquire(restarted,fresh.rpc),{code:'owned_subscription_waiting'});assert.deepEqual(fresh.sent,[]);return;
+  }
+  proof(restarted);
+  const loaded=client('loaded');await assert.rejects(acquire(restarted,loaded.rpc),{code:'owned_subscription_waiting'});
+  assert.deepEqual(loaded.sent,['thread/loaded/list']);assert.equal(pending()?.attempts,1);
+  const second=client(outcome==='重试成功'?'success':'timeout');
+  if(outcome==='重试成功'){
+    await acquire(restarted,second.rpc);
+    assert.deepEqual(second.sent,['thread/loaded/list','thread/resume','thread/settings/update']);assert.equal(pending(),undefined);
+  }else{
+    await assert.rejects(acquire(restarted,second.rpc),{code:'owned_subscription_waiting'});
+    assert.deepEqual(second.sent,['thread/loaded/list','thread/resume']);assert.equal(pending()?.attempts,2);assert.equal(second.late(),false);
+    const fresh=client('timeout');await assert.rejects(acquire(adapter,fresh.rpc),{code:'owned_subscription_waiting'});assert.deepEqual(fresh.sent,[]);
+  }
+});
 
 for(const state of ['runtimeQueued','unknown','sending','held','partial'] as const)test('身份迁移只凭完整原生缺席证据保留未知，不重投旧消息：'+state,async t=>{
   const f=fixture(t),home=f.broker.home,pair=f.store.pair(f.c.id,f.x.id),endpoint=f.store.endpoint(f.x.id)!,history=path.join(home,'history.jsonl');

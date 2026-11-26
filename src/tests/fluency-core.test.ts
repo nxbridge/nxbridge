@@ -70,6 +70,14 @@ test('托管恢复开始时撤销尚未准入的旧投递提醒',t=>{
   f.store.setSetting('managedRecovery:'+f.x.id,{pairId:pair.id,state:'recovering'});observe();assert.deepEqual(health.peek(pair.id,f.c.id),[]);assert.equal(health.active(pair.id,f.c.id),false);
 });
 
+test('Codex 会话故障保留具体原因，卡住与等待接回分配不同处理方',()=>{
+  for(const [code,message] of [['native_thread_wedged','会话请求已卡住'],['native_thread_unconfirmed','请求还没得到确认'],['owned_subscription_waiting','后台还没重新接上']]){
+    const cause=faultCause(new DeliveryError(code!,message!));
+    assert.equal(cause.layer,'native');assert.equal(cause.userText,message);
+    assert.equal(cause.action.owner,code==='native_thread_wedged'?'user':'runtime');
+  }
+});
+
 test('仅显式回复约定进入依赖账本，FYI 不遮蔽待办，排队期间的发信不能结清未读约定',t=>{
   t.mock.timers.enable({apis:['Date'],now:1000000});const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id);
   const task=f.store.accept(pair,f.c,'处理任务','task',undefined,undefined,'explicit',true);f.store.transition(task.id,'contextObserved');

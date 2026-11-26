@@ -5,7 +5,8 @@ import { nativeForm } from './native-form.js';
 import { hostingModel, hostingText, policyText } from './hosting.js';
 import { pairPermission } from './admission.js';
 
-const serviceTier={type:'string',enum:['standard','fast','flex']};
+                                       
+const serviceTier={type:'string',enum:['standard','fast']};
 const SPEC={name:'select_partner',isDeferred:false,description:"commit user's explicit partner choice only; never choose yourself. pass saved selection_id plus either key of the candidate the user picked (action=choose) or action: create = new bg partner, cancel; after partner window closed also adopt = continue original session in bg, wait = wait for user to reopen window, unpair. create may include model, effort and service_tier for the new Codex partner",inputSchema:{type:'object',properties:{selection_id:{type:'string'},key:{type:'string'},action:{type:'string',enum:['choose','create','cancel','adopt','wait','unpair']},model:{type:'string'},effort:{anyOf:[{type:'string'},{type:'number',minimum:0}]},service_tier:serviceTier},required:['selection_id'],additionalProperties:false}};
                                                              
 const PROFILE_SPEC={name:'partner_profile',isDeferred:true,description:'view/change model, effort and service_tier of your current Codex partner (nxbridge-owned bg only). set: any of these fields; omit fields you want to keep. busy -> pending, applied at idle. result includes effective (host-reported), requested, per-field sources, status and delivery_held. uncertain/mismatch -> delivery held until verified or reset. model switch resets partner prompt cache. reset: drop member choice, keep live profile. global defaults: config propose (user confirms)',inputSchema:{type:'object',properties:{action:{type:'string',enum:['get','set','reset']},model:{type:'string'},effort:{anyOf:[{type:'string'},{type:'number',minimum:0}]},service_tier:serviceTier},additionalProperties:false}};

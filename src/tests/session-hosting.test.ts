@@ -126,15 +126,17 @@ test('关闭托管表单只取消选择，下一次发送仍询问，消息不�
   assert.ok(store.messages().every(message=>message.state==='accepted'&&message.attempts===0));
 });
 
-for(const owner of ['user','nxbridge'] as const)test(owner+' 的已加载会话在首次连接和升级复核时只订阅，不改实时设置',async t=>{
+for(const owner of ['user','nxbridge'] as const)test(owner+' 的首次连接不通过恢复请求改变加载中的会话设置',async t=>{
   const home=temporary(t),store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home),calls:any[]=[];
   t.after(()=>{adapter.close();store.close();});
   const peer=store.register(registration('codex','loaded'));store.updatePeer(peer.id,{owner});const endpoint=store.endpoint(peer.id)!;
-  if(owner==='nxbridge')saveManagedRuntime(home,{id:randomUUID(),peerId:peer.id,sessionId:'loaded',owner:managedMarker(home),kind:'owned',state:'ready',dedicated:true,endpoint:endpoint.address,createdAt:Date.now()});
-  const rpc=new RpcClient(message=>{calls.push(message);queueMicrotask(()=>rpc.receive({id:message.id,result:{thread:{id:'loaded',cwd:peer.cwd,status:{type:'idle'}}}}));},()=>{});
+  if(owner==='nxbridge')saveManagedRuntime(home,{id:randomUUID(),peerId:peer.id,sessionId:'loaded',owner:managedMarker(home),kind:'owned',state:'ready',dedicated:true,pid:endpoint.pid!,procStart:endpoint.procStart!,endpoint:endpoint.address,createdAt:Date.now()});
+  const rpc=new RpcClient(message=>{calls.push(message);queueMicrotask(()=>rpc.receive({id:message.id,result:message.method==='thread/loaded/list'?{data:['loaded']}:{thread:{id:'loaded',cwd:peer.cwd,status:{type:'idle'}}}}));},()=>{});
   adapter.connect=async()=>rpc;t.after(()=>rpc.close());
-  await adapter.attach(store.peer(peer.id),endpoint,{verify:true});
-  assert.deepEqual(calls.filter(call=>call.method==='thread/resume').map(call=>call.params),[{threadId:'loaded',excludeTurns:true}]);
+  (adapter as any).clients.set(endpoint.address,rpc);
+  if(owner==='nxbridge')await assert.rejects(adapter.attach(store.peer(peer.id),endpoint,{verify:true}),{code:'owned_subscription_waiting'});
+  else await adapter.attach(store.peer(peer.id),endpoint,{verify:true});
+  assert.deepEqual(calls.filter(call=>call.method==='thread/resume').map(call=>call.params),owner==='user'?[{threadId:'loaded',excludeTurns:true}]:[]);
   assert.equal(calls.some(call=>call.method==='thread/settings/update'),false);
 });
 
@@ -187,16 +189,129 @@ test('托管子代理不阻塞根成员，错误根线程卸载后解除冲突',
   f.codex.emit('state','wrong-root','offline',endpoint.address);assert.equal(hostingGate(f.store,f.store.peer(f.x.id)),false);
 });
 
-for(const valid of [true,false])test('核验途中重启仅比较持久证据：'+(valid?'完成核验':'不匹配继续暂存'),async t=>{
+for(const valid of [true,false])test('当前连接已有订阅时可继续比较中断核验的持久证据：'+(valid?'完成核验':'不匹配继续暂存'),async t=>{
   const home=temporary(t),file=path.join(home,'history.jsonl'),store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home);t.after(()=>{adapter.close();store.close();});
-  writeFileSync(file,row('session_meta',{id:'interrupted'})+row('turn_context',{permission_profile:profile,approval_policy:'on-request',approvals_reviewer:'user'}),'utf8');
+  writeFileSync(file,row('session_meta',{id:'interrupted'})+row('turn_context',{permission_profile:profile,approval_policy:'on-request',approvals_reviewer:'user',model:'fixture-model',reasoning_effort:'high',service_tier:'priority'}),'utf8');
   const original=await readSessionProfile(file,'interrupted');
   appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:'interrupted',thread_settings:{permission_profile:valid?profile:{type:'disabled'}}}),'utf8');
   const peer=store.register(registration('codex','interrupted'));store.updatePeer(peer.id,{owner:'nxbridge'});const endpoint=store.endpoint(peer.id)!;
-  saveManagedRuntime(home,{id:randomUUID(),peerId:peer.id,owner:managedMarker(home),kind:'owned',state:'ready',dedicated:true,endpoint:endpoint.address,createdAt:Date.now(),sessionVerification:{sessionId:'interrupted',profile:original}});
-  const calls:string[]=[],rpc=new RpcClient(message=>{calls.push(message.method!);queueMicrotask(()=>rpc.receive({id:message.id,result:{thread:{id:'interrupted',path:file,status:{type:'idle'}},approvalPolicy:'on-request',approvalsReviewer:'user'}}));},()=>{});adapter.connect=async()=>rpc;t.after(()=>rpc.close());
-  if(valid)await adapter.attach(store.peer(peer.id),endpoint);else await assert.rejects(adapter.attach(store.peer(peer.id),endpoint),{code:'policy_verification_failed'});
+  Object.assign(endpoint,{runtimeId:randomUUID(),pid:process.pid,procStart:'fixture-native'});
+  saveManagedRuntime(home,{id:endpoint.runtimeId!,peerId:peer.id,owner:managedMarker(home),kind:'owned',state:'ready',dedicated:true,pid:endpoint.pid!,procStart:endpoint.procStart!,endpoint:endpoint.address,createdAt:Date.now(),sessionVerification:{sessionId:'interrupted',profile:original}});
+  const calls:string[]=[],rpc=new RpcClient(message=>{calls.push(message.method!);queueMicrotask(()=>rpc.receive({id:message.id,result:{thread:{id:'interrupted',path:file,status:{type:'idle'}},model:'fixture-model',reasoningEffort:'high',serviceTier:'priority',approvalPolicy:'on-request',approvalsReviewer:'user'}}));},()=>{});adapter.connect=async()=>rpc;t.after(()=>rpc.close());
+  (adapter as any).clients.set(endpoint.address,rpc);
+  (adapter as any).ownedRoutes.subscribed({peer:store.peer(peer.id),endpoint},rpc);
+  if(valid)await adapter.attach(store.peer(peer.id),endpoint,{verify:true});else await assert.rejects(adapter.attach(store.peer(peer.id),endpoint,{verify:true}),{code:'policy_verification_failed'});
   assert.equal(!!runtimeFor(home,{peerId:peer.id})?.value.sessionVerification,!valid);assert.equal(calls.includes('thread/settings/update'),false);
+});
+
+for(const loaded of [false,true])test('托管故障恢复和协调器中断后重连均独立核验 null 档位投影：'+(loaded?'已加载':'冷恢复'),async t=>{
+  const home=temporary(t),sessionId='opaque-recovery',file=path.join(home,'history.jsonl'),store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home);t.after(()=>{adapter.close();store.close();});
+  const settings={permission_profile:profile,approval_policy:'on-request',approvals_reviewer:'user',model:'fixture-model',reasoning_effort:'high',service_tier:'opaque-tier-a'};
+  const applied=()=>row('event_msg',{type:'thread_settings_applied',thread_id:sessionId,thread_settings:settings});
+  writeFileSync(file,row('session_meta',{id:sessionId})+applied(),'utf8');
+  const original=await readSessionProfile(file,sessionId),peer=store.register(registration('codex',sessionId));store.updatePeer(peer.id,{owner:'nxbridge'});
+  const endpoint=store.endpoint(peer.id)!,runtimeId=randomUUID();
+  Object.assign(endpoint,{runtimeId,pid:process.pid,procStart:'fixture-native',nativeSession:{transcriptPath:file}});
+  saveManagedRuntime(home,{id:runtimeId,peerId:peer.id,owner:managedMarker(home),kind:'owned',state:'ready',pid:endpoint.pid!,procStart:endpoint.procStart!,endpoint:endpoint.address,createdAt:Date.now(),...(loaded?{sessionVerification:{sessionId,profile:original}}:{})});
+  const calls:{method:string;params:any}[]=[];
+  const rpc=new RpcClient(message=>{
+    calls.push({method:message.method!,params:message.params});
+    if(message.method==='thread/settings/update'){
+      assert.equal(Object.hasOwn(message.params,'serviceTier'),false);
+      appendFileSync(file,applied(),'utf8');
+    }
+    queueMicrotask(()=>rpc.receive({id:message.id,result:message.method==='thread/loaded/list'?{data:loaded?[sessionId]:[]}:{thread:{id:sessionId,path:file,status:{type:'idle'}},model:'fixture-model',reasoningEffort:'high',serviceTier:null,approvalPolicy:'on-request',approvalsReviewer:'user'}}));
+  },()=>{});adapter.connect=async()=>rpc;t.after(()=>rpc.close());
+  (adapter as any).clients.set(endpoint.address,rpc);
+  t.mock.method(adapter as any,'verifyColdResumeRuntime',async()=>{});
+  if(loaded){
+    await assert.rejects(adapter.attach(store.peer(peer.id),endpoint),{code:'owned_subscription_waiting',phase:'prepare'});
+    assert.deepEqual(calls.map(call=>call.method),['thread/loaded/list']);
+    assert.ok(runtimeFor(home,{id:runtimeId})!.value.sessionVerification);
+    return;
+  }
+  await adapter.attach(store.peer(peer.id),endpoint);
+  assert.equal(runtimeFor(home,{id:runtimeId})!.value.sessionVerification,undefined);
+  assert.equal(calls.some(call=>call.method==='turn/start'),false);
+  assert.ok(calls.some(call=>call.method==='thread/settings/update'));
+  if(!loaded)assert.equal(calls.find(call=>call.method==='thread/resume')!.params.serviceTier,'opaque-tier-a');
+});
+
+for(const state of ['初查仍加载','复查重新加载','原生通知重新加载','仅已完成子代理保持加载'] as const)test('普通来信只恢复已确认卸载的原线程：'+state,async t=>{
+  const home=temporary(t),sessionId='ordinary-owned-cold',file=path.join(home,'history.jsonl'),store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home);t.after(()=>{adapter.close();store.close();});
+  const settings={permission_profile:{type:'disabled'},approval_policy:'never',approvals_reviewer:'user',model:'gpt-6.1-sol',reasoning_effort:'max',service_tier:'priority'};
+  const applied=()=>row('event_msg',{type:'thread_settings_applied',thread_id:sessionId,thread_settings:settings});
+  writeFileSync(file,row('session_meta',{id:sessionId})+applied(),'utf8');
+  const peer=store.register(registration('codex',sessionId));store.updatePeer(peer.id,{owner:'nxbridge',model:'gpt-6.1-sol',effort:'max'});const endpoint=store.endpoint(peer.id)!;
+  const runtimeId=randomUUID();Object.assign(endpoint,{runtimeId,pid:process.pid,procStart:'fixture-native',nativeSession:{transcriptPath:file}});
+  saveManagedRuntime(home,{id:runtimeId,peerId:peer.id,sessionId,owner:managedMarker(home),kind:'owned',state:'ready',pid:endpoint.pid!,procStart:endpoint.procStart!,endpoint:endpoint.address,createdAt:Date.now()});
+  const calls:{method:string;params:any}[]=[],child='completed-but-open';let lists=0;
+  const rpc=new RpcClient(message=>{
+    calls.push({method:message.method!,params:message.params});
+    const method=message.method;
+    assert.ok(['thread/loaded/list','thread/resume','thread/settings/update','turn/start'].includes(method!));
+    if(method==='thread/loaded/list')lists++;
+    else assert.equal(message.params?.threadId,sessionId);
+    if(message.method==='thread/settings/update')appendFileSync(file,applied(),'utf8');
+    if(message.method==='turn/start')assert.equal(runtimeFor(home,{id:runtimeId})!.value.sessionVerification,undefined,'首条输入前必须结清恢复核验');
+    const loaded=state==='初查仍加载'?[sessionId]:state==='复查重新加载'&&lists===2?[sessionId,child]:[child];
+    const result=method==='thread/loaded/list'?{data:loaded}:method==='thread/resume'?{thread:{id:sessionId,path:file,status:{type:'idle'}},model:message.params.model??'gpt-6.2-astra',reasoningEffort:message.params.config?.model_reasoning_effort??'low',serviceTier:message.params.serviceTier??'opaque-tier-a',approvalPolicy:'never',approvalsReviewer:'user',sandbox:{type:'dangerFullAccess'}}:method==='turn/start'?{turn:{id:'ordinary-input'}}:{};
+    queueMicrotask(()=>{
+      if(state==='原生通知重新加载'&&method==='thread/loaded/list'&&lists===2)
+        (adapter as any).notify(endpoint.address,{method:'thread/status/changed',params:{threadId:sessionId,status:{type:'idle'}}});
+      rpc.receive({id:message.id,result});
+    });
+  },()=>{});adapter.connect=async()=>rpc;t.after(()=>rpc.close());
+  (adapter as any).clients.set(endpoint.address,rpc);
+  const checks={pid:process.pid,procStart:'fixture-native',pending:{[child]:'unconfirmed-child-probe'}};
+  t.mock.method(adapter as any,'verifyColdResumeRuntime',async()=>{
+    const {value}=runtimeFor(home,{id:runtimeId})!;saveManagedRuntime(home,{...value,childControlChecks:checks});
+  });
+  if(state==='初查仍加载'){
+    await assert.rejects(adapter.wake(store.peer(peer.id),endpoint),{code:'owned_subscription_waiting'});
+    assert.deepEqual(calls.map(call=>call.method),['thread/loaded/list']);
+    await adapter.discoverLoaded(endpoint.address,rpc);
+    (adapter as any).notify(endpoint.address,{method:'turn/started',params:{threadId:sessionId}});
+    assert.deepEqual(calls.map(call=>call.method),['thread/loaded/list','thread/loaded/list']);
+    return;
+  }
+  if(state!=='仅已完成子代理保持加载'){
+    await assert.rejects(adapter.wake(store.peer(peer.id),endpoint),{code:'owned_cold_resume_waiting'});
+    assert.deepEqual(calls.map(call=>call.method),['thread/loaded/list','thread/loaded/list']);
+    assert.equal(runtimeFor(home,{id:runtimeId})!.value.sessionVerification,undefined);
+    return;
+  }
+  await adapter.wake(store.peer(peer.id),endpoint);
+  assert.deepEqual(calls.slice(0,3).map(call=>call.method),['thread/loaded/list','thread/loaded/list','thread/resume']);
+  assert.deepEqual(runtimeFor(home,{id:runtimeId})!.value.childControlChecks,checks);
+  const resumed=calls.find(call=>call.method==='thread/resume')!;
+  assert.equal(resumed.params.threadId,sessionId);assert.equal(resumed.params.model,'gpt-6.1-sol');assert.equal(resumed.params.config.model_reasoning_effort,'max');assert.equal(resumed.params.serviceTier,'priority');
+  assert.ok(calls.findIndex(call=>call.method==='turn/start')>calls.findIndex(call=>call.method==='thread/settings/update'));
+});
+
+for(const proof of ['缺失','其他成员','缺少进程代次'] as const)test('托管根线程缺少完整运行时归属时保持等待：'+proof,async t=>{
+  const home=temporary(t),store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home);t.after(()=>{adapter.close();store.close();});
+  const peer=store.register(registration('codex','owned-no-proof'));store.updatePeer(peer.id,{owner:'nxbridge'});const endpoint=store.endpoint(peer.id)!;
+  if(proof!=='缺失')saveManagedRuntime(home,{id:randomUUID(),peerId:proof==='其他成员'?randomUUID():peer.id,owner:managedMarker(home),kind:'owned',state:'ready',endpoint:endpoint.address,createdAt:Date.now()});
+  const rpc=new RpcClient(()=>assert.fail('归属无法核实时不能请求原生线程'),()=>{});
+  adapter.connect=async()=>rpc;(adapter as any).clients.set(endpoint.address,rpc);
+  await assert.rejects(adapter.attach(store.peer(peer.id),endpoint),{code:'owned_route_unverified',phase:'prepare'});
+});
+
+test('一个托管线程的对账未返回时，协调器和另一托管线程仍能启动',async t=>{
+  const {store,broker,c,x,codex}=fixture(t);
+  const peer=store.register(registration('codex','另一托管线程',{state:'ready'})),partner=store.register(registration('claude','另一搭档'));
+  store.pair(c.id,x.id);store.pair(partner.id,peer.id);
+  for(const member of [x,peer])store.updatePeer(member.id,{owner:'nxbridge',state:'ready'});
+  let release!:()=>void,healthyReady!:()=>void,slowStarted!:()=>void;
+  const pending=new Promise<void>(resolve=>release=resolve),healthy=new Promise<void>(resolve=>healthyReady=resolve),slow=new Promise<void>(resolve=>slowStarted=resolve);
+  (codex as any).reconcileOwnedRoute=({peer:member}:{peer:typeof x})=>{
+    if(member.id===x.id){slowStarted();return pending;}
+    healthyReady();return Promise.resolve();
+  };
+  const starting=broker.start();
+  try{await Promise.all([starting,slow,healthy]);}
+  finally{release();}
 });
 
 test('原配置目录不符或门禁写入失败时保留精确核验证据，修复后继续原会话',async t=>{
@@ -206,24 +321,27 @@ test('原配置目录不符或门禁写入失败时保留精确核验证据，�
   const peer=store.register(registration('codex',sessionId));store.updatePeer(peer.id,{owner:'nxbridge'});
   const partner=store.register(registration('claude','fixture-partner'));store.pair(partner.id,peer.id);
   const endpoint=store.endpoint(peer.id)!;
-  writeFileSync(file,row('session_meta',{id:sessionId})+row('turn_context',{permission_profile:profile,model:'fixture-model',reasoning_effort:'high',service_tier:'priority'}),'utf8');
-  const settings=await readSessionProfile(file,sessionId),live={model:'fixture-model',reasoningEffort:'high',serviceTier:'priority',activePermissionProfile:{id:'fixture-permissions'}};
+  writeFileSync(file,row('session_meta',{id:sessionId})+row('turn_context',{permission_profile:profile,model:'fixture-model',reasoning_effort:'high',service_tier:'priority',approval_policy:'on-request',approvals_reviewer:'user'}),'utf8');
+  const settings=await readSessionProfile(file,sessionId),live={model:'fixture-model',reasoningEffort:'high',serviceTier:'priority',approvalPolicy:'on-request',approvalsReviewer:'user',activePermissionProfile:{id:'fixture-permissions'}};
   appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:sessionId,thread_settings:{permission_profile:profile}}),'utf8');
   const runtimeId=randomUUID(),verification={sessionId,profile:{...settings,live},restartSourceId:randomUUID()};
-  saveManagedRuntime(home,{id:runtimeId,peerId:peer.id,sessionId,configHome:home,owner:managedMarker(home),kind:'owned',state:'ready',endpoint:endpoint.address,createdAt:Date.now(),sessionVerification:verification});
+  Object.assign(endpoint,{runtimeId,pid:process.pid,procStart:'fixture-native'});store.saveEndpoint(endpoint);
+  saveManagedRuntime(home,{id:runtimeId,peerId:peer.id,sessionId,configHome:home,owner:managedMarker(home),kind:'owned',state:'ready',pid:endpoint.pid!,procStart:endpoint.procStart!,endpoint:endpoint.address,createdAt:Date.now(),sessionVerification:verification});
   const resumeCalls:string[]=[];
   const rpc=new RpcClient(message=>{if(message.method==='thread/resume')resumeCalls.push(message.method);queueMicrotask(()=>rpc.receive({id:message.id,result:{thread:{id:sessionId,path:file,status:{type:'idle'}},...live}}));},()=>{});
   let detectedHome=temporary(t);
   adapter.connect=async()=>{(adapter as any).configHomes.set(endpoint.address,detectedHome);return rpc;};t.after(()=>rpc.close());
-  await assert.rejects(adapter.attach(store.peer(peer.id),endpoint),{code:'original_home_changed'});
+  (adapter as any).clients.set(endpoint.address,rpc);
+  (adapter as any).ownedRoutes.subscribed({peer:store.peer(peer.id),endpoint},rpc);
+  await assert.rejects(adapter.attach(store.peer(peer.id),endpoint,{verify:true}),{code:'original_home_changed'});
   assert.equal(resumeCalls.length,0);assert.equal(hostingGate(store,store.peer(peer.id)),true);
   detectedHome=home;
   const setSetting=store.setSetting.bind(store);let failCommit=true;
   store.setSetting=(key,value)=>{if(key===hostingKey(peer.id)&&(value as {verified?:boolean}).verified){assert.ok(runtimeFor(home,{id:runtimeId})?.value.sessionVerification);if(failCommit)throw new BridgeError('fixture_write_failed','模拟核验门禁写入失败');}setSetting(key,value);};
-  await assert.rejects(adapter.attach(store.peer(peer.id),endpoint),{code:'fixture_write_failed'});
+  await assert.rejects(adapter.attach(store.peer(peer.id),endpoint,{verify:true}),{code:'fixture_write_failed'});
   assert.equal(hostingGate(store,store.peer(peer.id)),true);assert.ok(runtimeFor(home,{id:runtimeId})?.value.sessionVerification);
   failCommit=false;
-  await adapter.attach(store.peer(peer.id),endpoint);
+  await adapter.attach(store.peer(peer.id),endpoint,{verify:true});
   assert.equal(hostingGate(store,store.peer(peer.id)),false);assert.equal(runtimeFor(home,{id:runtimeId})?.value.sessionVerification,undefined);
   assert.equal(resumeCalls.length,2);
 });
@@ -247,30 +365,33 @@ test('失败核验显示阻塞，用户重新打开或释放后不继承后台�
   writeHosting(f.store,f.store.peer(f.x.id),{released:true});assert.equal(hostingRecord(f.store,f.store.peer(f.x.id))?.verifying,false);assert.equal(hostingRecord(f.store,f.store.peer(f.x.id))?.verificationRuntimeId,undefined);
 });
 
-test('已登记为托管的非独占旧运行时冷恢复核验原线程，不影响其他会话',async t=>{
+test('已登记为托管的非独占旧运行时缺少空闲证明时保留原消息',async t=>{
   const home=temporary(t),file=path.join(home,'legacy.jsonl'),store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home),broker=new Broker(store,DEFAULT_CONFIG,{codex:adapter,claude:new FakeAdapter()} as unknown as Adapters,home);t.after(async()=>{await broker.stop();store.close();});
   writeFileSync(file,row('session_meta',{id:'legacy'})+row('turn_context',{permission_profile:profile,approval_policy:'on-request',approvals_reviewer:'user'}),'utf8');
   const initial=registration('codex','legacy');initial.endpoint.epoch=initial.endpoint.address;
   const peer=store.register(initial);store.updatePeer(peer.id,{owner:'nxbridge'});const endpoint=store.endpoint(peer.id)!;
   const partner=store.register(registration('claude','legacy-partner')),pair=store.pair(partner.id,peer.id);
-  saveManagedRuntime(home,{id:randomUUID(),peerId:peer.id,sessionId:'legacy',owner:managedMarker(home),kind:'owned',state:'ready',dedicated:false,endpoint:endpoint.address,createdAt:Date.now()});
+  endpoint.runtimeId=randomUUID();store.saveEndpoint(endpoint);
+  saveManagedRuntime(home,{id:endpoint.runtimeId,peerId:peer.id,sessionId:'legacy',owner:managedMarker(home),kind:'owned',state:'ready',dedicated:false,pid:endpoint.pid!,procStart:endpoint.procStart!,endpoint:endpoint.address,createdAt:Date.now()});
   let loaded=false;const calls:string[]=[],rpc=new RpcClient(message=>{
     calls.push(message.method!);if(message.method==='thread/resume')loaded=true;
     if(message.method==='thread/settings/update')appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:'legacy',thread_settings:{permission_profile:profile,approval_policy:'on-request',approvals_reviewer:'user'}}),'utf8');
-    queueMicrotask(()=>rpc.receive({id:message.id,result:{thread:{id:'legacy',cwd:peer.cwd,path:file,status:{type:loaded?'idle':'notLoaded'}},cwd:peer.cwd,approvalPolicy:'on-request',approvalsReviewer:'user'}}));
+    queueMicrotask(()=>rpc.receive({id:message.id,result:message.method==='thread/loaded/list'?{data:[]}:{thread:{id:'legacy',cwd:peer.cwd,path:file,status:{type:loaded?'idle':'notLoaded'}},cwd:peer.cwd,approvalPolicy:'on-request',approvalsReviewer:'user'}}));
   },()=>{});adapter.connect=async()=>rpc;t.after(()=>rpc.close());
-  let verified=false;adapter.on('sessionPolicy',()=>verified=true);await adapter.attach(store.peer(peer.id),endpoint);
-  assert.equal(verified,true);assert.equal(runtimeFor(home,{peerId:peer.id})?.value.sessionVerification,undefined);assert.ok(calls.includes('thread/settings/update'));assert.equal(calls.includes('thread/start'),false);
-  const message=store.accept(pair,partner,'核验完成后继续原消息','legacy-message'),receipt=broker.receive({host:'codex',memberId:peer.id,sessionId:'legacy',callId:'receive-legacy'}) as any;
-  assert.equal(hostingGate(store,store.peer(peer.id)),false);assert.ok(receipt.messages.some((value:any)=>value.message_id===message.id));
+  (adapter as any).clients.set(endpoint.address,rpc);
+  const message=store.accept(pair,partner,'核验完成后继续原消息','legacy-message');
+  await assert.rejects(adapter.attach(store.peer(peer.id),endpoint),{code:'owned_cold_resume_waiting',phase:'prepare'});
+  assert.deepEqual(calls,['thread/loaded/list']);assert.equal(runtimeFor(home,{peerId:peer.id})?.value.sessionVerification,undefined);
+  assert.equal(store.message(message.id).state,'accepted');
 });
 
 test('临时命名权限的实时快照带完整定义，重启继续使用同名原策略',async t=>{
   const home=temporary(t),file=path.join(home,'temporary-profile.jsonl'),id='temporary-profile';
-  writeFileSync(file,row('session_meta',{id})+row('turn_context',{permission_profile:profile,approval_policy:'on-request',approvals_reviewer:'user'}),'utf8');
+  const settings={permission_profile:profile,approval_policy:'on-request',approvals_reviewer:'user',model:'fixture-model',reasoning_effort:'high',service_tier:'default',cwd:home};
+  writeFileSync(file,row('session_meta',{id})+row('turn_context',settings),'utf8');
   const calls:any[]=[],rpc=new RpcClient(message=>{calls.push(message);
-    if(message.method==='thread/settings/update')appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:id,thread_settings:{permission_profile:profile,approval_policy:'on-request',approvals_reviewer:'user'}}),'utf8');
-    queueMicrotask(()=>rpc.receive({id:message.id,result:{thread:{id,path:file,status:{type:'idle'}},approvalPolicy:'on-request',approvalsReviewer:'user',activePermissionProfile:{id:'nxbridge_transfer'}}}));
+    if(message.method==='thread/settings/update')appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:id,thread_settings:settings}),'utf8');
+    queueMicrotask(()=>rpc.receive({id:message.id,result:{thread:{id,path:file,status:{type:'idle'}},model:settings.model,reasoningEffort:settings.reasoning_effort,cwd:home,serviceTier:'default',approvalPolicy:'on-request',approvalsReviewer:'user',activePermissionProfile:{id:'nxbridge_transfer'}}}));
   },()=>{});t.after(()=>rpc.close());
   const snapshot=await snapshotLiveSession(rpc,id,file);calls.length=0;await resumeSession(rpc,id,{profile:snapshot,cwd:home});
   assert.equal(calls[0].params.permissions,'nxbridge_transfer');assert.deepEqual(calls[0].params.config['permissions.nxbridge_transfer'],{filesystem:{':root':'none'},network:{enabled:false}});

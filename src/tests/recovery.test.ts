@@ -1,13 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { WebSocketServer } from 'ws';
 import { CodexAdapter } from '../hosts/codex/adapter.js';
+import { exitedOwnedCodexRoute } from '../hosts/codex/codex-owned-routes.js';
 import { Broker, type Adapters } from '../broker/coordinator.js';
 import { Store } from '../storage/store.js';
-import {BridgeError} from '../shared/errors.js';
+import {BridgeError,RuntimeRecoveryHold} from '../shared/errors.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
 import { FakeAdapter } from './support/fake-adapter.js';
 import {fixture, lifecycle} from './support/broker-fixture.js';
@@ -15,6 +17,10 @@ import { registration } from './support/registration.js';
 import { temporary } from './support/temporary.js';
 import {atomicJson} from '../shared/files.js';
 import { claudeChildFile } from '../hosts/claude/claude-child.js';
+import { managedMarker } from '../install/installation.js';
+import { runtimeFor, saveManagedRuntime } from '../hosts/managed-runtimes.js';
+import { processIdentity } from '../process/process.js';
+import { HEALTH_WAKE_NOTICE } from '../types.js';
 
 async function completePump(work:Promise<unknown>):Promise<void>{
   let timer:NodeJS.Timeout|undefined;try{await Promise.race([work,new Promise<never>((_resolve,reject)=>{timer=setTimeout(()=>reject(Error('慢恢复阻塞了独立消息泵')),5000);})]);}finally{clearTimeout(timer);}
@@ -51,6 +57,50 @@ test('独立恢复预算仍阻止尚未到期的后台启动',async t=>{
   const peer=f.store.updatePeer(f.c.id,{owner:'nxbridge',state:'offline'});f.store.deactivate(f.c.id);
   const incident=f.broker.managedRecovery.observe(peer,pair);f.broker.managedRecovery.settled(incident,new Error('上次恢复暂时失败'));
   t.mock.method(lifecycle(f.broker),'prepare',async()=>{assert.fail('恢复预算尚未到期');});await f.broker.pump();assert.equal(f.store.peer(f.c.id).state,'offline');
+});
+
+for(const stage of ['failed','removed','before-register','unproven','alive'] as const)test('同会话恢复只跳过已确认退出的历史运行时：'+stage,async t=>{
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),peer=f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'offline'});
+  t.mock.method(f.codex,'routeExited',(...[target,address,launch]:Parameters<FakeAdapter['routeExited']>)=>exitedOwnedCodexRoute(f.broker.home,{peer:target,endpoint:address},launch));
+  const identity=await processIdentity(process.pid),runtimeId=randomUUID(),native={pid:identity.pid,procStart:stage==='alive'?identity.startedAt:identity.startedAt+'-retired'};
+  const old={...f.store.endpoint(peer.id)!,...native,runtimeId,configHome:f.broker.home};
+  f.store.saveEndpoint(old);
+  const runtime={id:runtimeId,peerId:peer.id,sessionId:peer.sessionId!,owner:managedMarker(f.broker.home),kind:'owned' as const,state:'failed' as const,endpoint:old.address,configHome:old.configHome,...native,createdAt:1};
+  const proof={sessionId:peer.sessionId,runtimeId,endpoint:old.address,configHome:old.configHome,...native};
+  const key='managedLaunchProof:'+peer.id;
+  if(stage==='failed'||stage==='alive')saveManagedRuntime(f.broker.home,runtime);
+  if(stage!=='unproven')f.store.setSetting(key,proof);
+  const replacement={...runtime,id:randomUUID(),endpoint:'unix://replacement',state:'starting' as const,createdAt:2};
+  if(stage==='before-register')saveManagedRuntime(f.broker.home,replacement);
+  const queued=f.store.accept(pair,f.c,'等待恢复后的原投递','unused'),oldUnknown=f.store.accept(pair,f.c,'提交状态不明','uncertain');f.store.claim(oldUnknown.id);f.store.transition(oldUnknown.id,'unknown');
+  let interrupted=stage==='before-register';
+  const normal=f.codex.attach.bind(f.codex);
+  const attach=t.mock.method(f.codex,'attach',async(target:Parameters<FakeAdapter['attach']>[0],endpoint:Parameters<FakeAdapter['attach']>[1])=>{
+    if(endpoint.address===old.address)throw new RuntimeRecoveryHold('owned_route_unverified','历史端点不再拥有原生订阅');
+    if(interrupted){interrupted=false;throw new RuntimeRecoveryHold('owned_subscription_waiting','替代后台已启动，登记尚未完成');}
+    assert.equal(target.sessionId,peer.sessionId);return normal(target,{...endpoint,runtimeId:replacement.id});
+  });
+  const ensure=t.mock.method(f.codex,'ensureEndpoint',async(...[_cwd,id,_requester,sessionId,home,beforeLaunch]:Parameters<FakeAdapter['ensureEndpoint']>)=>{
+    assert.equal(id,peer.id);assert.equal(sessionId,peer.sessionId);assert.equal(home,old.configHome);
+    if(stage==='before-register')assert.equal(runtimeFor(home!,{peerId:id})?.value.id,replacement.id);
+    else await beforeLaunch?.();
+    return replacement.endpoint;
+  });
+  const manager=lifecycle(f.broker);
+  if(stage==='unproven'||stage==='alive'){
+    await assert.rejects(manager.prepare(peer),{code:'owned_route_unverified'});
+    assert.equal(ensure.mock.callCount(),0);assert.equal(attach.mock.callCount(),1);assert.equal(f.store.endpoint(peer.id)?.runtimeId,runtimeId);
+  }else{
+    if(stage==='before-register'){
+      await assert.rejects(manager.prepare(peer),{code:'owned_subscription_waiting'});
+      assert.deepEqual(f.store.setting(key),proof);
+    }
+    await manager.prepare(peer);
+    assert.equal(f.store.endpoint(peer.id)?.address,replacement.endpoint);assert.equal(f.store.peer(peer.id).sessionId,peer.sessionId);
+    assert.equal(ensure.mock.callCount(),stage==='before-register'?2:1);
+    assert.ok(attach.mock.calls.every(call=>call.arguments[1].address===replacement.endpoint));
+  }
+  assert.equal(f.store.message(queued.id).attempts,0);assert.equal(f.store.message(oldUnknown.id).state,'unknown');assert.equal(f.codex.woken.length,0);
 });
 
 test('投递仍被阻塞时健康后台照常完成一分钟稳定恢复观察',async t=>{
@@ -153,33 +203,93 @@ for(const replaced of [false,true])test('用户观察通道异步重连'+(replac
 });
 
 test('notLoaded 清除订阅缓存，恢复合并并发，断线重连沿用原线程且不重发 unknown',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:Date.now()});
   const server=new WebSocketServer({host:'127.0.0.1',port:0});await once(server,'listening');
   const address=`ws://127.0.0.1:${(server.address() as {port:number}).port}`,methods:{method:string;params:any}[]=[];
+  const home=temporary(t),sessionId='same-thread',file=path.join(home,'history.jsonl'),runtimeId=randomUUID(),native=await processIdentity(process.pid);
+  const row=(type:string,payload:unknown)=>JSON.stringify({type,payload})+'\n';
+  const settings={permission_profile:{type:'disabled'},approval_policy:'never',approvals_reviewer:'user',model:'gpt-6.1-sol',reasoning_effort:'max',service_tier:'priority'};
+  writeFileSync(file,row('session_meta',{id:sessionId})+row('turn_context',settings),'utf8');
+  let status='notLoaded';
   server.on('connection',socket=>socket.on('message',raw=>{
     const request=JSON.parse(raw.toString());methods.push(request);
     if(request.id===undefined)return;
-    const result=request.method==='initialize'?{userAgent:'codex-tui/0.166.0 (test; test) test (codex-tui; 0.166.0)'}:request.method==='thread/loaded/list'?{data:[]}:request.method==='thread/resume'?{thread:{id:'same-thread',cwd:process.cwd(),status:{type:'idle'}}}:request.method==='thread/read'?{thread:{id:'same-thread',cwd:process.cwd(),status:{type:'active'}}}:{};
+    if(request.method==='thread/resume')status='idle';
+    if(request.method==='thread/settings/update')appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:sessionId,thread_settings:settings}),'utf8');
+    const thread={id:sessionId,path:file,cwd:process.cwd(),status:{type:status}};
+    const result=request.method==='initialize'?{userAgent:'codex-tui/0.166.0 (test; test) test (codex-tui; 0.166.0)'}:request.method==='thread/loaded/list'?{data:status==='notLoaded'?[]:[sessionId]}:request.method==='thread/resume'?{thread,model:settings.model,reasoningEffort:settings.reasoning_effort,serviceTier:settings.service_tier,approvalPolicy:'never',approvalsReviewer:'user'}:request.method==='thread/read'?{thread}:request.method==='turn/start'?{turn:{id:'completion-wake'}}:{};
     socket.send(JSON.stringify({jsonrpc:'2.0',id:request.id,result}));
   }));
-  const home=temporary(t),config={...DEFAULT_CONFIG,implicit:'never' as const},store=new Store(':memory:'),codex=new CodexAdapter(config,home),claude=new FakeAdapter();
-  const broker=new Broker(store,config,{codex,claude} as unknown as Adapters,home);
+  const config={...DEFAULT_CONFIG,implicit:'never' as const},store=new Store(':memory:'),claude=new FakeAdapter();
+  let codex=new CodexAdapter(config,home),broker=new Broker(store,config,{codex,claude} as unknown as Adapters,home);
   t.after(async()=>{await broker.stop();store.close();for(const socket of server.clients)socket.terminate();await new Promise<void>(r=>server.close(()=>r()));});
-  const c=store.register(registration('claude','c')),x=store.register(registration('codex','same-thread',{cwd:process.cwd(),endpoint:{address,epoch:address,mode:'app-server',pid:null,procStart:null}}));
+  const c=store.register(registration('claude','c')),x=store.register(registration('codex',sessionId,{cwd:process.cwd(),endpoint:{address,epoch:address,mode:'app-server',pid:native.pid,procStart:native.startedAt,runtimeId,nativeSession:{transcriptPath:file}}}));
   store.updatePeer(x.id,{owner:'nxbridge'});const pair=store.pair(c.id,x.id),endpoint=store.endpoint(x.id)!;
+  saveManagedRuntime(home,{id:runtimeId,peerId:x.id,sessionId,owner:managedMarker(home),kind:'owned',state:'ready',pid:native.pid,procStart:native.startedAt,endpoint:address,createdAt:Date.now()});
+  t.mock.method(codex as any,'verifyColdResumeRuntime',async()=>{});
+  status='active';
+  const unleased=await codex.connect(address);
+  for(const method of ['thread/read','thread/resume','thread/queue/add','thread/settings/update','thread/unsubscribe','thread/delete','turn/start']){
+    await assert.rejects(unleased.request(method,{threadId:sessionId},{mutation:method!=='thread/read'}),{code:'owned_subscription_waiting',phase:'prepare',uncertain:false});
+    assert.equal(methods.some(value=>value.method===method),false);
+  }
+  await assert.rejects(codex.release(store.peer(x.id),endpoint),{code:'owned_subscription_waiting'});
+  status='notLoaded';
                                       
   const restoreMember=async()=>{const pumping=broker.pump(),recovering=lifecycle(broker).recoveryWork(x.id);await Promise.all([pumping,recovering]);};
-  await Promise.all([codex.attach(x,endpoint),codex.attach(x,endpoint)]);
+  await Promise.all([codex.attach(store.peer(x.id),endpoint),codex.attach(store.peer(x.id),endpoint)]);
   assert.equal(methods.filter(m=>m.method==='thread/resume').length,1);
-  store.updatePeer(x.id,{state:'offline'});await restoreMember();
+  status='active';store.updatePeer(x.id,{state:'offline'});await restoreMember();
   assert.equal(store.peer(x.id).state,'busy');assert.equal(methods.filter(m=>m.method==='thread/resume').length,1);
   assert.equal(methods.some(m=>m.method==='thread/read'),true);
-  const unloaded=once(codex,'state');for(const socket of server.clients)socket.send(JSON.stringify({method:'thread/status/changed',params:{threadId:x.sessionId,status:{type:'notLoaded'}}}));await unloaded;
+  status='notLoaded';const unloaded=once(codex,'state');for(const socket of server.clients)socket.send(JSON.stringify({method:'thread/status/changed',params:{threadId:x.sessionId,status:{type:'notLoaded'}}}));await unloaded;
   assert.equal(store.peer(x.id).state,'offline');
   await restoreMember();assert.equal(store.peer(x.id).state,'ready');assert.equal(methods.filter(m=>m.method==='thread/resume').length,2);
   const message=store.accept(pair,c,'结果不明，不可自动重发','uncertain');store.claim(message.id);store.transition(message.id,'unknown');
-  const disconnected=once(codex,'disconnected');for(const socket of server.clients)socket.terminate();await disconnected;
+  status='notLoaded';const disconnected=once(codex,'disconnected');for(const socket of server.clients)socket.terminate();await disconnected;
   assert.equal(store.endpoint(x.id),undefined);await restoreMember();
   assert.equal(store.peer(x.id).sessionId,'same-thread');assert.equal(store.peer(x.id).state,'ready');assert.equal(store.message(message.id).state,'unknown');
   assert.equal(methods.some(m=>m.method==='thread/start'||m.method==='turn/start'),false);
   assert.ok(methods.filter(m=>m.method==='thread/resume').every(m=>m.params.threadId==='same-thread'));
+
+                                             
+  const ordinary=store.accept(pair,c,'等待原线程重新订阅','ordinary-after-restart');
+  broker.subagentCompletions.record(store.peer(x.id),'child','child-turn',undefined,undefined);
+  await broker.stop();
+  codex=new CodexAdapter(config,home);broker=new Broker(store,config,{codex,claude} as unknown as Adapters,home);
+  t.mock.method(codex as any,'verifyColdResumeRuntime',async()=>{});
+  t.mock.method(codex as any,'completionNative',async()=>{});
+  const before=methods.length;
+  assert.equal(store.peer(x.id).state,'ready');
+  assert.equal(store.endpoint(x.id)?.active,true);
+  await restoreMember();
+  const held=(await broker.dispatch('status',{}) as any).peers.find((p:any)=>p.id===x.id);
+  assert.match(held.childCompletions.hold.reason,/后台 Codex 还没重新接上.*完成提醒先保留/);
+  assert.equal(held.childCompletions.wake,undefined);
+  assert.equal(store.setting('codexWake:'+x.id),undefined);
+  assert.equal(store.message(ordinary.id).attempts,0);
+  assert.equal(broker.managedRecovery.get(x.id)?.attempts.length,0);
+  assert.ok(methods.slice(before).some(m=>m.method==='thread/loaded/list'));
+  assert.ok(methods.slice(before).every(m=>m.params?.threadId!==sessionId),'持有端点但无订阅时，不能进入线程串行队列');
+
+  status='notLoaded';t.mock.timers.tick(31000);
+  await restoreMember();
+  await completePump(broker.pump());
+  const requests=methods.slice(before),resumed=requests.filter(m=>m.method==='thread/resume');
+  assert.equal(resumed.length,1);
+  assert.deepEqual([resumed[0]!.params.threadId,resumed[0]!.params.model,resumed[0]!.params.config.model_reasoning_effort,resumed[0]!.params.serviceTier],
+    [sessionId,'gpt-6.1-sol','max','priority']);
+  assert.equal(requests.filter(m=>m.method==='turn/start').length,1);
+  assert.equal(requests.some(m=>m.method==='thread/start'||m.method==='thread/queue/add'),false);
+  assert.equal(store.message(ordinary.id).attempts,0);
+  const actor={host:'codex',sessionId,memberId:x.id,callId:'consume-after-restart'};
+  const prompt=await broker.dispatch('hook',{actor,session_id:sessionId,hook_event_name:'UserPromptSubmit',prompt:HEALTH_WAKE_NOTICE,turn_id:'completion-wake'}) as any;
+  assert.match(prompt.hookSpecificOutput.additionalContext,/child-turn/);
+  const receipt=await broker.dispatch('receive',actor) as any;
+  assert.deepEqual(receipt.messages.map((m:any)=>m.message_id),[ordinary.id]);
+  assert.deepEqual((await broker.dispatch('receive',{...actor,callId:'repeat-consume'}) as any).messages,[]);
+  await completePump(broker.pump());
+  assert.equal(methods.slice(before).filter(m=>m.method==='turn/start').length,1);
+  assert.equal(store.message(ordinary.id).attempts,1);
+  assert.equal(broker.managedRecovery.get(x.id)?.attempts.length,0);
 });

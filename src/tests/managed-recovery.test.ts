@@ -1,10 +1,30 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ManagedRecovery, managedRecoveryKey, recoveryUserStep, type ManagedIncident } from '../broker/recovery/managed-recovery.js';
-import {BridgeError} from '../shared/errors.js';
+import {BridgeError,RuntimeRecoveryHold} from '../shared/errors.js';
 import {fixture, lifecycle} from './support/broker-fixture.js';
 import { Takeovers, recordManagedAdoption, foregroundMatchesTakeover } from '../broker/recovery/takeover.js';
 import {deliveryHealthKey,type RuntimeNotice} from '../broker/health/contracts.js';
+
+test('订阅等待在原生卸载后自动复核并投递原消息，不需要人工解锁或切换模型',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),endpoint=f.store.endpoint(f.x.id)!;
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'offline',model:'gpt-6.1-sol',effort:'max'});
+  f.codex.attachFailure=new RuntimeRecoveryHold('owned_subscription_waiting','等待原线程按原设置接回');
+  const pending=f.store.accept(pair,f.c,'保持原会话和模型处理这条消息','held-through-unload');
+  await f.broker.pump();await f.broker.pump();
+  assert.equal(f.store.message(pending.id).state,'accepted');assert.equal(f.codex.delivered.length,0);
+  assert.equal(f.broker.managedRecovery.get(f.x.id)?.preconditionCode,'owned_subscription_waiting');
+  f.codex.attachFailure=undefined;
+  f.codex.emit('state',f.x.sessionId,'offline',endpoint.address);
+  now+=31000;
+  await f.broker.pump();await f.broker.pump();
+  assert.equal(f.store.message(pending.id).state,'contextObserved');
+  assert.equal(f.codex.delivered.filter(message=>message.id===pending.id).length,1);
+  assert.equal(f.store.peer(f.x.id).sessionId,f.x.sessionId);assert.equal(f.store.peer(f.x.id).model,'gpt-6.1-sol');assert.equal(f.store.peer(f.x.id).effort,'max');
+  assert.equal(f.codex.created.length,0);assert.equal(f.codex.ensured,0);
+  assert.equal(f.broker.managedRecovery.get(f.x.id)?.attempts.length,0,'重连原线程不消耗新进程启动额度');
+});
 
 test('恢复步骤直接对用户说当前这一步，只写用到的目录、入口和会话',t=>{
   const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),recovery=new ManagedRecovery(f.store);
@@ -21,6 +41,7 @@ test('恢复步骤直接对用户说当前这一步，只写用到的目录、�
     [['original_home_changed','cwd_mismatch'],/改回原来的.*有意迁移.*重新打开会话/],
     [['session_not_found','session_ambiguous','session_invalid','resume_not_found','rollout_not_found'],/找回会话.*历史记录.*另选搭档/],
     [['invalid_config'],/修复.*配置文件/],
+    [['owned_profile_unverified','restart_profile_unverified'],/告诉 Claude.*查原来的设置并决定怎么处理/],
     [['foreground_active','claude_foreground_active'],/回到正在接手这个会话的窗口/],
     [['claude_background_unavailable','claude_bypass_consent_required','claude_bypass_disabled','claude_inbound_restricted','claude_policy_unverified'],/确认后台运行、审批和收信设置/],
     [['session_changed','future_precondition'],/^运行 nxbridge status 查看原因$/]

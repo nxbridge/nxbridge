@@ -7,6 +7,7 @@ import {sameDirectory} from '../../shared/files.js';
 import { prepareOwnedLaunch } from '../../hosts/host-launch.js';
 import { selectSessionLaunch } from '../../hosts/session-launch.js';
 export { profileVersionSupported } from '../../hosts/host-version.js';
+import type { CodexServiceTierPauseDetail } from '../../hosts/codex/codex-service-tier.js';
 import { managedRuntimes, runtimeFor, managedRuntimeState, managedRuntimeNativeState, removeManagedRuntime, saveManagedRuntime, type ManagedRuntime, type RuntimeRecord } from '../../hosts/managed-runtimes.js';
 import { codexSubagent, codexUserWindow } from '../../hosts/codex/codex-lineage.js';
 import { nativeConfigHome, processIdentity, codexArguments, codexAppServerArguments, probeProcesses } from '../../process/process.js';
@@ -18,7 +19,7 @@ export interface HostingRecord {
   pairId:string;memberId:string;sessionId:string;configHome:string;cwd:string;origin:'user'|'managed';
   background:boolean;released?:boolean;phase?:'adopting'|'releasing'|'awaiting_window';
   verified?:boolean;verifying?:boolean;reason?:string;userStep?:string;policy?:SessionPolicy;at:number;
-  verificationRuntimeId?:string;verificationEndpoint?:string;verificationError?:{code:string;message:string};
+  verificationRuntimeId?:string;verificationEndpoint?:string;verificationError?:{code:string;message:string;pauseDetail?:CodexServiceTierPauseDetail};
   attempts?:number;nextAt?:number;bootstrapProbeKey?:string;launchPark?:LaunchPark;
 }
 export const hostingKey=(id:string)=>'hosting:'+id;

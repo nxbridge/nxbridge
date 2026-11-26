@@ -30,6 +30,7 @@ const scope=(peer:Peer,endpoint?:Endpoint)=>JSON.stringify([peer.sessionId,endpo
 
 export function faultCause(error:unknown):{code:string;layer:IncidentLayer;causeClass:CauseClass;userText:string;action:IncidentAction}{
   const code=String((error as {code?:unknown})?.code??'unknown'),message=describeError(error);
+  if(['native_thread_wedged','native_thread_unconfirmed','owned_subscription_waiting'].includes(code))return{code,layer:'native',causeClass:'unknown',userText:message,action:{owner:code==='native_thread_wedged'?'user':'runtime',text:message}};
   if(code==='reply_socket_conflict')return{code,layer:'transport',causeClass:'configuration',userText:'nxbridge 接收回执的连接文件位置被别的文件占用了，消息暂时发不出去',action:{owner:'user',text:'运行 nxbridge status 查看占用的路径；不要重发任务'}};
   if(code==='payload_too_large')return{code,layer:'protocol',causeClass:'unknown',userText:'原生消息超过大小保护，连接已关闭，正在降频核验。',action:{owner:'runtime',text:'使用有界请求重新核验连接，不重复拉取全量历史。'}};
   if(/payload|response_too_large|WS_ERR_UNSUPPORTED_MESSAGE_LENGTH|1009/.test(code)||/max(?:imum)?.*(?:payload|message).*size|unsupported.*message.*length/i.test(message))return{code,layer:'protocol',causeClass:'payload',userText:'原生响应超过大小保护，已停止重复读取。',action:{owner:'model',text:'Report the protocol size fault once; continue independent work.'}};

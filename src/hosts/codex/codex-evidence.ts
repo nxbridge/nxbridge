@@ -6,11 +6,41 @@ import { codexThreadUnmaterialized } from './codex-thread-state.js';
 const capabilities=new WeakMap<RpcClient,Set<string>>();
 const threadCapabilities=new WeakMap<RpcClient,Set<string>>();
 const pending=new WeakMap<RpcClient,Map<string,Promise<CodexThread>>>();
+const observedThreads=new WeakMap<RpcClient,Map<string,CodexThread>>();
 const unsupported=(error:unknown)=>/method not found|unknown (?:method|variant)|not supported|unsupported|unrecognized.*method/i.test(String((error as Error)?.message??error))||String((error as {code?:unknown})?.code)==='-32601';
 const unavailable=(rpc:RpcClient,method:string,threadId:string)=>capabilities.get(rpc)?.has(method)||threadCapabilities.get(rpc)?.has(method+'|'+threadId);
 function rememberUnsupported(rpc:RpcClient,method:string,threadId:string,error:unknown):void{
   const global=String((error as {code?:unknown}).code)==='-32601'||/method not found|unknown method/i.test(String((error as Error).message)),map=global?capabilities:threadCapabilities;
   let values=map.get(rpc);if(!values){values=new Set();map.set(rpc,values);}values.add(global?method:method+'|'+threadId);
+}
+
+                                     
+export async function catalogCodexThreads(rpc:RpcClient,ids:ReadonlySet<string>):Promise<Map<string,CodexThread>>{
+  const threads=new Map<string,CodexThread>(),deadline=performance.now()+5000;
+  if(!ids.size)return threads;
+  let cursor:string|undefined;
+  const cursors=new Set<string>();
+  for(let pageIndex=0;pageIndex<10;pageIndex++){
+    const timeout=Math.ceil(deadline-performance.now());if(timeout<=0)break;
+    const page=await rpc.request('thread/list',{limit:100,modelProviders:[],sourceKinds:['cli','vscode','exec','appServer','subAgent','subAgentReview','subAgentCompact','subAgentThreadSpawn','subAgentOther','unknown'],...(cursor?{cursor}:{})},{timeout});
+    if(!Array.isArray(page.data))break;
+    for(const thread of page.data)if(typeof thread?.id==='string'&&ids.has(thread.id)&&typeof thread.cwd==='string')threads.set(thread.id,thread);
+    if(threads.size===ids.size||page.nextCursor==null)break;
+    if(typeof page.nextCursor!=='string'||!page.nextCursor||cursors.has(page.nextCursor))break;
+    cursor=page.nextCursor;cursors.add(cursor!);
+  }
+                                                        
+  for(const id of ids)if(!threads.has(id)){
+    const observed=observedThreads.get(rpc)?.get(id);
+    if(observed)threads.set(id,{...observed,status:undefined});
+  }
+  return threads;
+}
+
+export function observeCodexThreadIdentity(rpc:RpcClient,thread:CodexThread):void{
+  let observed=observedThreads.get(rpc);if(!observed){observed=new Map();observedThreads.set(rpc,observed);}
+  observed.set(thread.id,thread);
+  if(observed.size>256)observed.delete(observed.keys().next().value!);
 }
 
                                              

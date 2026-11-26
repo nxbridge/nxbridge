@@ -5,11 +5,11 @@ import {type BridgeConfig,type ModelProfile,type Peer} from '../../types.js';
 import { captureFrozenProfile, freezesProfile, profileFields, resolveProfileDefaults, type ProfileField, type ProfileSources } from './frozen-profile.js';
 
 export const modelProfileSchema=z.object({model:z.string().trim().min(1).optional(),effort:z.union([z.string().trim().min(1),z.number().finite().nonnegative()]).optional()});
-export const codexProfileSchema=modelProfileSchema.extend({serviceTier:z.enum(['standard','fast','flex']).optional()});
+export const codexProfileSchema=modelProfileSchema.extend({serviceTier:z.enum(['standard','fast']).optional()});
 export const PARTNER_PROFILE_TOOL={name:'partner_profile',description:'view/change model + effort of your current partner (nxbridge-owned bg only; user windows refused). set: model and/or effort, any value host accepts (no list; strengths/cost: partner skill). never interrupts: busy -> pending, applied at idle. result = effective (host-reported) + requested + status + delivery_held. host rejects -> partner keeps current profile; uncertain/mismatch -> delivery held till reconciled or reset. model switch resets partner prompt cache -> switch only for real reason. claude native bg: live change unsupported -> create new partner w/ profile. reset: drop member choice, live profile kept. global defaults: config propose (user confirms)',inputSchema:{type:'object' as const,properties:{action:{type:'string',enum:['get','set','reset']},model:{type:'string'},effort:{anyOf:[{type:'string'},{type:'number',minimum:0}]}},additionalProperties:false},annotations:{readOnlyHint:false,destructiveHint:false,openWorldHint:false}};
 export interface PartnerProfileIntent {
   requested:ModelProfile;source:'defaults'|'explicit';status:'pending'|'applied'|'failed';
-  at:number;sessionId?:string;capture?:boolean;captureEffort?:false;explicitFields?:ProfileField[];sources?:ProfileSources;context?:string;failedAt?:number;blocked?:boolean;resolved?:ModelProfile;error?:{code:string;message:string};
+  at:number;sessionId?:string;capture?:boolean;captureEffort?:false;explicitFields?:ProfileField[];sources?:ProfileSources;context?:string;failedAt?:number;blocked?:boolean;resolved?:ModelProfile;error?:{code:string;message:string};warnings?:string[];
 }
 export type EffectiveModelProfile=Omit<ModelProfile,'serviceTier'>&{requestedModel?:string;serviceTier?:string|null};
 const key=(peer:Peer)=>'partnerProfile:'+peer.id;
@@ -28,7 +28,24 @@ export function profileChangeFailure(error:unknown,submitted:boolean,accepted=fa
                                      
 export class PartnerProfiles {
   constructor(private store:Store,private home:string,private config:BridgeConfig){}
-  intent(peer:Peer):PartnerProfileIntent|undefined{return this.store.setting<PartnerProfileIntent>(key(peer))??undefined;}
+  intent(peer:Peer):PartnerProfileIntent|undefined{
+    const intent=this.store.setting<PartnerProfileIntent>(key(peer))??undefined;
+    if(!intent||peer.host!=='codex'||!([intent.requested,intent.resolved].some(profile=>(profile?.serviceTier as string|undefined)==='flex')))return intent;
+                                           
+    if((intent.requested.serviceTier as string|undefined)==='flex'){
+      delete intent.requested.serviceTier;
+      if(intent.sources)delete intent.sources.serviceTier;
+      if(intent.explicitFields)intent.explicitFields=intent.explicitFields.filter(field=>field!=='serviceTier');
+    }
+    if((intent.resolved?.serviceTier as string|undefined)==='flex'){
+      delete intent.resolved!.serviceTier;
+      if(intent.requested.serviceTier!==undefined)intent.resolved!.serviceTier=intent.requested.serviceTier;
+    }
+    if(!hasProfile(intent.requested)){intent.status='applied';intent.blocked=false;delete intent.error;}
+    intent.warnings=[...intent.warnings??[],'之前单独给后台 Codex 指定的服务档位 flex 已不再提供，这项指定已撤销；会话现在实际用的档位没有改动。'];
+    this.store.setSetting(key(peer),intent);return intent;
+  }
+  warnings():string[]{return this.store.peers().flatMap(peer=>(this.intent(peer)?.warnings??[]).map(warning=>`${peer.id}：${warning}`));}
   requested(peer:Peer):ModelProfile{return this.intent(peer)?.requested??{};}
   launchError(peer:Peer,error:unknown):unknown{
     const intent=this.intent(peer),model=intent?.requested.model;
@@ -90,6 +107,6 @@ export class PartnerProfiles {
   view(peer:Peer){
     const intent=this.intent(peer),fields=profileFields.filter(field=>peer[field]!==undefined);
     const sources=Object.fromEntries(fields.filter(field=>intent?.requested[field]===undefined).map(field=>[field,'host']));
-    return{effective:Object.fromEntries(fields.map(field=>[field,peer[field]])),sources:{...sources,...intent?.sources},delivery_held:this.blocks(peer),...(intent?{requested:intent.requested,status:intent.status,source:intent.source,at:intent.at,...(intent.error?{error:intent.error}:{})}:{status:'host' as const})};
+    return{effective:Object.fromEntries(fields.map(field=>[field,peer[field]])),sources:{...sources,...intent?.sources},delivery_held:this.blocks(peer),...(intent?{requested:intent.requested,status:intent.status,source:intent.source,at:intent.at,...(intent.error?{error:intent.error}:{}),...(intent.warnings?.length?{warnings:intent.warnings}:{})}:{status:'host' as const})};
   }
 }

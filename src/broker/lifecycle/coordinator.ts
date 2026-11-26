@@ -26,13 +26,14 @@ import {launchInputFingerprint,parkLaunchFailure} from '../../hosts/launch-park.
 import {restoreBootstrapKey} from '../../hosts/codex/codex-isolation.js';
 import {nativeProfileEffort} from '../../integration/mod/mod-protocol.js';
 import {memberEnabled,requireMemberEnabled} from '../member-control.js';
-import {BridgeError,describeError} from '../../shared/errors.js';
+import {BridgeError,RuntimeRecoveryHold,describeError} from '../../shared/errors.js';
 import {sameDirectory} from '../../shared/files.js';
 import {delay} from '../../shared/time.js';
 import {randomUUID} from 'node:crypto';
 import {SKIPPED} from '../fault-boundary.js';
 import {TransportMigrations,ownedTransportPaths,type TransportMigration} from '../recovery/transport-migration.js';
 import type {CodexRestartOptions} from '../../hosts/codex/adapter.js';
+import type {OwnedCodexRoute} from '../../hosts/codex/codex-owned-routes.js';
 import {codexSocketAlias} from '../../ipc/unix-socket.js';
 
 interface LifecycleEnvironment {readonly store:Store;readonly config:BridgeConfig;readonly adapters:Adapters;readonly home:string;}
@@ -46,6 +47,7 @@ interface LifecycleServices {
   readonly deliveryHealth:DeliveryHealth;
   readonly daemons:CodexDaemons;
   readonly codexDirect:CodexDirectDelivery;
+  readonly subagentCompletions:Pick<import('../subagent-completions.js').SubagentCompletions,'pending'>;
 }
 interface LifecycleHooks {
   stopped():boolean;
@@ -97,6 +99,19 @@ export class BrokerLifecycleCoordinator {
   clearBackoff(id:string):void{this.clearRetryDelay(id);this.recoveryFailures.delete(id);}
   launchInputsChanged(id?:string):void{if(id===undefined)this.parkChecks.clear();else this.parkChecks.delete(id);}
 
+  ownedCodexRoute(id:string):OwnedCodexRoute|undefined{
+    if(this.hooks.stopped())return;
+    const {store}=this.environment,peer=store.getPeer(id);
+    if(!peer?.sessionId||peer.host!=='codex'||peer.owner!=='nxbridge')return;
+    const pair=store.pairFor(id);
+    if(!pair||pair.paused||!this.enabled(id)
+      ||this.retiring.has(id)||this.services.takeovers.get(id)||store.setting('managedSessionConflict:'+id)
+      ||hostingRecord(store,peer)?.released||store.bindings.current(id)?.transitioning)return;
+    const endpoint=store.endpoint(id);
+    if(endpoint?.mode!=='app-server'||endpoint.daemon||endpoint.pendingContext)return;
+    return {peer,endpoint};
+  }
+
   async prepare(peer:Peer,extraReason?:string,provisional?:{peerId:string;sessionId:string;authorize?:()=>void;beforeCreate?:()=>void},claimedAttempt?:string,migration?:TransportMigration):Promise<void>{
     const {store,adapters}=this.environment;
     this.requireEnabled(peer);
@@ -107,8 +122,8 @@ export class BrokerLifecycleCoordinator {
     if(this.hooks.stopped()||this.retiring.has(peer.id)||!store.pairFor(peer.id)&&!provisional)throw new BridgeError('peer_releasing','搭档已离开当前配对，未启动后台进程。');
     const pending=this.preparing.get(peer.id);if(pending)return pending;
     if(this.services.deletedSessions.pendingCreation(peer.id))throw new BridgeError('session_unverified','新会话创建结果尚未核实，未重复创建；请等待原生身份登记。');
-    const runtime=peer.host==='codex'?runtimeFor(this.environment.home,{peerId:peer.id})?.value:undefined;
-    if(runtime)store.setSetting('managedLaunchProof:'+peer.id,{sessionId:peer.sessionId,runtimeId:runtime.id,configHome:runtime.configHome,executable:runtime.executable,profileId:runtime.profileId,version:runtime.version});
+    const launch=store.setting<StoredLaunchProof>('managedLaunchProof:'+peer.id);
+    if(peer.host==='codex'&&(!launch?.runtimeId||launch.sessionId!==peer.sessionId))this.rememberManagedLaunch(peer.id);
     const pairId=store.pairFor(peer.id)?.id,sessionId=peer.sessionId;
     const guard=()=>{
       const current=store.peer(peer.id),pair=store.pairFor(peer.id),sourcePair=provisional?store.pairFor(provisional.peerId):undefined;
@@ -154,18 +169,25 @@ export class BrokerLifecycleCoordinator {
         }
       }else if(peer.host==='codex'){
         const attach=async(endpoint:Endpoint)=>{
-          try{if(codexUserWindow(peer))await adapters.codex.observe(peer,endpoint);else await adapters.codex.attach(peer,endpoint,{verify:hostingRecord(store,peer)?.phase==='adopting'});}
+          try{if(codexUserWindow(peer))await adapters.codex.observe(peer,endpoint);else await adapters.codex.attach(peer,endpoint,{verify:hostingRecord(store,peer)?.phase==='adopting',prepare:guard});}
           catch(error){
             const runtime=runtimeFor(this.environment.home,{endpoint:endpoint.address})?.value;
-            if(!(error instanceof BridgeError)||error.code!=='policy_verification_incomplete'||peer.owner!=='nxbridge'||!runtime?.dedicated||runtime.peerId!==peer.id||runtime.sessionVerification?.sessionId!==peer.sessionId)throw error;
+            if(error instanceof RuntimeRecoveryHold||!(error instanceof BridgeError)||error.code!=='policy_verification_incomplete'||peer.owner!=='nxbridge'||!runtime?.dedicated||runtime.peerId!==peer.id||runtime.sessionVerification?.sessionId!==peer.sessionId)throw error;
             guard();const pair=store.pairFor(peer.id)!,counts=store.deliveryCounts(pair.id,pair[otherHost(peer.host)]);
             if(counts.unknown+counts.sending+counts.runtimeQueued)throw new BridgeError('delivery_unsettled','权限核验被中断且仍有未结算投递，保留原运行时及消息。');
             const result=await adapters.codex.restart(peer,endpoint,guard,{verificationRecovery:true,requesterSession:codexRequester(store,peer)});guard();
             store.deactivate(peer.id,endpoint.epoch);store.event('codex.verification.restarted',{peerId:peer.id,sessionId:peer.sessionId,oldPid:result.oldPid,pid:result.pid});
           }
         };
-        const previous=store.endpoints(peer.id).filter(e=>e.mode==='app-server'&&(hostingRecord(store,peer)?.phase!=='adopting'||runtimeFor(this.environment.home,{endpoint:e.address})?.value.peerId===peer.id)).sort((a,b)=>a.seenAt-b.seenAt).at(-1);
-        if(previous){try{await attach(previous);return;}catch(error){if(isCodexIdentityError(error)){await this.hooks.migrateCodexIdentity(peer,previous,error);return;}if(peer.owner!=='nxbridge')throw error;}}
+        const previous=this.ownedCodexRoute(peer.id)?.endpoint??store.endpoints(peer.id).filter(e=>e.mode==='app-server'&&(hostingRecord(store,peer)?.phase!=='adopting'||runtimeFor(this.environment.home,{endpoint:e.address})?.value.peerId===peer.id)).sort((a,b)=>a.seenAt-b.seenAt).at(-1);
+        if(previous){
+          if(await adapters.codex.routeExited(peer,previous,launch)){
+            guard();const active=store.endpoint(peer.id),native=active?.native??active,prior=previous.native??previous;
+            if(active&&(active.epoch!==previous.epoch||active.address!==previous.address||active.bindingEpoch!==previous.bindingEpoch||active.runtimeId!==previous.runtimeId||native?.pid!==prior.pid||native?.procStart!==prior.procStart))
+              throw new RuntimeRecoveryHold('owned_subscription_waiting','核验退出期间原托管端点已改变，等待重新核验。');
+            store.deactivate(peer.id,previous.epoch);
+          }else try{await attach(previous);return;}catch(error){if(isCodexIdentityError(error)){await this.hooks.migrateCodexIdentity(peer,previous,error);return;}if(error instanceof RuntimeRecoveryHold||peer.owner!=='nxbridge')throw error;}
+        }
         if(peer.owner==='nxbridge'){
           const original=previous??store.endpoints(peer.id).sort((a,b)=>b.seenAt-a.seenAt)[0];
           guard();
@@ -192,7 +214,15 @@ export class BrokerLifecycleCoordinator {
       if(saved?.nativeLaunchId&&saved.sessionId===peer.sessionId&&saved.restorePairId===store.pairFor(peer.id)?.id)store.setSetting('managedLaunchProof:'+peer.id,null);
       if(store.peer(peer.id).launchFailure)store.updatePeer(peer.id,{launchFailure:undefined});
     }
-    catch(failure){const error=this.services.profileCoordination.profiles.launchError(store.getPeer(peer.id)??peer,failure);if(peer.owner==='nxbridge'&&this.enabled(peer.id)&&!isCodexIdentityError(error)){store.updatePeer(peer.id,{state:'offline',launchFailure:{at:Date.now(),...(error instanceof BridgeError?{code:error.code}:{}),message:describeError(error).slice(0,1200)}});if(error instanceof BridgeError&&error.code==='bootstrap_policy_unsupported'&&store.pairFor(peer.id)){const key=(error as BridgeError&{bootstrapProbeKey?:string}).bootstrapProbeKey;writeHosting(store,peer,{verifying:false,reason:error.code,userStep:error.message,bootstrapProbeKey:key,nextAt:key?Number.MAX_SAFE_INTEGER:Date.now()+30000});}}throw error;}
+    catch(failure){
+      if(failure instanceof RuntimeRecoveryHold&&store.pairFor(peer.id)){
+        const incident=this.recoveryIncident(peer);
+        this.services.managedRecovery.blocked(incident,failure);
+        this.publishRecovery(incident,peer,describeError(failure));
+        throw failure;
+      }
+      const error=this.services.profileCoordination.profiles.launchError(store.getPeer(peer.id)??peer,failure);if(peer.owner==='nxbridge'&&this.enabled(peer.id)&&!isCodexIdentityError(error)){store.updatePeer(peer.id,{state:'offline',launchFailure:{at:Date.now(),...(error instanceof BridgeError?{code:error.code}:{}),message:describeError(error).slice(0,1200)}});if(error instanceof BridgeError&&error.code==='bootstrap_policy_unsupported'&&store.pairFor(peer.id)){const key=(error as BridgeError&{bootstrapProbeKey?:string}).bootstrapProbeKey;writeHosting(store,peer,{verifying:false,reason:error.code,userStep:error.message,bootstrapProbeKey:key,nextAt:key?Number.MAX_SAFE_INTEGER:Date.now()+30000});}}throw error;
+    }
     finally{this.preparing.delete(peer.id);}
   }
   ownedClaudeLaunchReady(peer:Peer):boolean{
@@ -283,7 +313,7 @@ export class BrokerLifecycleCoordinator {
       }
       incident??=this.services.managedRecovery.get(peer.id);this.recoveryAt.delete(peer.id);this.recoveryFailures.delete(peer.id);if(incident&&incident.state!=='closed'){this.services.managedRecovery.settled(incident);this.publishRecovery(incident,peer,'restored same session; no task replayed');}return true;
     }catch(error){
-      if(isCodexIdentityError(error))return false;
+      if(error instanceof RuntimeRecoveryHold||isCodexIdentityError(error))return false;
       if(peer.owner==='nxbridge'&&peer.sessionId)incident=this.recoveryIncident(peer);
       if(incident){
         if(recoveryPrecondition(error))this.services.managedRecovery.blocked(incident,error,parkLaunchFailure(error,this.environment.home,this.environment.config,peer,incident.configHome,incident.proof));
@@ -534,6 +564,13 @@ export class BrokerLifecycleCoordinator {
           return;
         }
       }
+      const ownedRoute=this.ownedCodexRoute(id);
+      const reconciliation=ownedRoute&&this.environment.adapters.codex.reconcileOwnedRoute?.(ownedRoute,()=>this.recover(ownedRoute.peer));
+      if(reconciliation){
+        this.restoringMembers.add(id);
+        try{await reconciliation;}finally{this.restoringMembers.delete(id);}
+        return;
+      }
       this.services.managedRecovery.ready(id,!!endpoint&&peer.state!=='offline'&&(!availability||availability.state==='reachable'));
       if(!peer.sessionId){if(hasPending&&!peer.launchFailure)restore=()=>this.prepare(peer);}
       else if(!endpoint||peer.state==='offline')restore=()=>this.recover(peer);
@@ -672,8 +709,10 @@ export class BrokerLifecycleCoordinator {
       void recovery.then(ready=>{
         this.recoveryDeliveryWaits.delete(recovery);
         if(ready)this.background('recovery_delivery:'+id,()=>{
-          const peer=this.environment.store.getPeer(id);
-          if(peer&&['ready','busy'].includes(peer.state)&&this.environment.store.endpoint(id)&&(this.environment.store.pendingCount(id)||this.services.codexDirect.pending(id))){
+          const {store,adapters}=this.environment,peer=store.getPeer(id),endpoint=peer?store.endpoint(id):undefined;
+          const owned=this.ownedCodexRoute(id);
+          if(peer&&endpoint&&['ready','busy'].includes(peer.state)&&(!owned||adapters.codex.hasSubscription(peer,endpoint))
+            &&(store.pendingCount(id)||this.services.codexDirect.pending(id)||this.services.subagentCompletions.pending(peer))){
             return this.hooks.pumpAfterCurrent();
           }
           return SKIPPED;
@@ -695,7 +734,7 @@ export class BrokerLifecycleCoordinator {
     const peer=this.environment.store.peer(id);if(peer.owner!=='nxbridge'||!peer.sessionId)return;
     if(peer.host==='codex'){
       const runtime=runtimeFor(this.environment.home,{peerId:id})?.value;
-      if(runtime)this.environment.store.setSetting('managedLaunchProof:'+id,{sessionId:peer.sessionId,runtimeId:runtime.id,configHome:runtime.configHome,executable:runtime.executable,profileId:runtime.profileId,version:runtime.version});
+      if(runtime)this.environment.store.setSetting('managedLaunchProof:'+id,{sessionId:peer.sessionId,runtimeId:runtime.id,endpoint:runtime.endpoint,pid:runtime.pid,procStart:runtime.procStart,configHome:runtime.configHome,executable:runtime.executable,profileId:runtime.profileId,version:runtime.version});
       return;
     }
     const proof=nativeOwnership(this.environment.home,id);

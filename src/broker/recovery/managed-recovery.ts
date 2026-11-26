@@ -42,6 +42,8 @@ export function recoveryUserStep(peer:Pick<Peer,'host'|'cwd'>,incident:ManagedIn
                                    
   if(incident.state==='unknown')return `运行 nxbridge status 核对上次启动结果；确认之前不要再次启动或恢复会话 ${sid}`;
   switch(incident.preconditionCode){
+    case 'owned_profile_unverified':case 'restart_profile_unverified':
+      return '告诉 Claude，由它帮你查原来的设置并决定怎么处理';
                                                               
     case 'bootstrap_required':
       return(peer.host==='codex'?'Claude 会先试着运行一次；不行的话，':'')+'在 Claude/Codex 之外的普通 PowerShell 里运行 nxbridge bootstrap';

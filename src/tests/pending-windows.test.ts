@@ -8,7 +8,7 @@ import { registerPendingCodex } from '../broker/pending-windows.js';
 import { codexStartupArguments, processIdentity } from '../process/process.js';
 
 test('启动参数只接受明确 resume UUID，选项值、fork、last 和提示正文不能当作对话证明',()=>{
-  const id='00000002-0000-7000-8000-000000000002';
+  const id='00000000-0000-7000-8000-000000000002';
   assert.equal(codexStartupArguments(['codex','-c','x=1','resume',id]).resumeSessionId,id);
   for(const args of [['--profile','resume',id],['resume','--last'],['fork',id],['resume',id,'--fork'],['exec','resume',id],[id],['--','resume',id]])assert.equal(codexStartupArguments(['codex',...args]).resumeSessionId,undefined);
   assert.equal(codexStartupArguments(['codex','-m','model','app-server','--listen','stdio://']).appServer,true);

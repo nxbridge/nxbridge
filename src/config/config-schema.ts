@@ -26,7 +26,7 @@ export const CONFIG_FIELDS:ConfigField[]=[
     field(`partners.${host}.effort`,`partnerProfiles.${host}.effort`,z.union([profileName,z.number().finite()]),'非空的推理强度名称（如 high）或数值'),
     field(`partners.${host}.profile_source`,`partnerProfiles.${host}.source`,z.enum(['recommended','host','frozen']),'recommended、host 或 frozen'),
   ]),
-  field('partners.codex.service_tier','partnerProfiles.codex.serviceTier',z.enum(['standard','fast','flex']),'standard、fast 或 flex'),
+  field('partners.codex.service_tier','partnerProfiles.codex.serviceTier',z.enum(['standard','fast']),'standard 或 fast'),
   field('hosts.codex.endpoint','codexEndpoint',nonempty,'非空端点地址'),
   field('hosts.codex.auth_token_env','codexAuthTokenEnv',z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),'保存凭据的环境变量名'),
   ...Object.keys(DEFAULT_RETENTION).map(key=>field('retention.'+key.replace(/[A-Z]/g,value=>'_'+value.toLowerCase()),'retention.'+key,key==='logBackups'?positive.max(10):key==='maintenanceIntervalMs'?duration:positive,key==='logBackups'?'1～10 的整数':'正整数',true)),
@@ -50,16 +50,21 @@ export function legacyDocument(value:Record<string,unknown>):Record<string,unkno
   }
   let document:Record<string,unknown>={};for(const field of CONFIG_FIELDS){const item=configValue(value,field.internal);if(item!==undefined)document=withConfigValue(document,field.key,item);}return document;
 }
-export function normalizeConfiguration(document:Record<string,unknown>,where:(key:string)=>string):{config:BridgeConfig;unknown:string[][]}{
+export function normalizeConfiguration(document:Record<string,unknown>,where:(key:string)=>string,options:{readLegacyProfiles?:'managed'|'user'}={}):{config:BridgeConfig;unknown:string[][]}{
   let config:Record<string,unknown>={...DEFAULT_CONFIG,retention:{...DEFAULT_RETENTION}};
+  const profileWarnings:string[]=[];
   for(const field of CONFIG_FIELDS){
     for(const prefix of field.key.split('.').slice(0,-1).map((_,index)=>field.key.split('.').slice(0,index+1).join('.'))){const value=configValue(document,prefix);if(value!==undefined&&(!value||typeof value!=='object'||Array.isArray(value)||value instanceof Date))throw new BridgeError('invalid_config',`${where(prefix)}：${prefix} 必须是 TOML 表。`);}
     const value=configValue(document,field.key);if(value===undefined)continue;
+    if(options.readLegacyProfiles&&field.key==='partners.codex.service_tier'&&value==='flex'){
+      const suffix=options.readLegacyProfiles==='user'?'（在这个文件里删掉这一行）':'（运行 nxbridge config unset partners.codex.service_tier）';
+      profileWarnings.push(`${where(field.key)}：Codex 服务档位 flex 已不再提供，现在按未设置处理，模型和推理强度照旧；删掉这一项后提示消失${suffix}。`);continue;
+    }
     const checked=field.schema.safeParse(value);if(!checked.success)throw new BridgeError('invalid_config',`${where(field.key)}：${field.key} 应为${field.expected}。`);
     config=withConfigValue(config,field.internal,checked.data);
   }
   const unknown:string[][]=[];
   const matches=(field:ConfigField,parts:string[])=>parts.every((part,index)=>field.key.split('.')[index]===part);
   const walk=(value:Record<string,unknown>,prefix:string[]=[])=>{for(const [key,item]of Object.entries(value)){const parts=[...prefix,key];if(CONFIG_FIELDS.some(field=>matches(field,parts)&&field.key.split('.').length===parts.length))continue;if(CONFIG_FIELDS.some(field=>matches(field,parts))&&item&&typeof item==='object'&&!Array.isArray(item)&&!(item instanceof Date))walk(item as Record<string,unknown>,parts);else unknown.push(parts);}};walk(document);
-  return{config:config as unknown as BridgeConfig,unknown};
+  return{config:{...config,...(profileWarnings.length?{profileWarnings}:{})} as unknown as BridgeConfig,unknown};
 }

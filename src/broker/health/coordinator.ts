@@ -17,6 +17,7 @@ import {ForegroundHealth} from './foreground-health.js';
 import {CodexModelRequests,providerBlocked,withModelRequest} from '../../hosts/codex/codex-model-request.js';
 import type {DeliveryMessage} from '../delivery/file-references.js';
 import {claudeChild,type ClaudeChildRecord} from '../../hosts/claude/claude-child.js';
+import {normalizeClaudeTurnHealth} from '../../hosts/claude/claude-stream.js';
 import {probeProcesses} from '../../process/process.js';
 import {DeliveryHealth} from './delivery.js';
 import {noticeScope,unsettledCount,type RuntimeAvailability,type RuntimeNotice} from './contracts.js';
@@ -35,7 +36,7 @@ import {claudeAutoStatus} from '../../hosts/claude/claude-auto-mode.js';
 import {CodexDaemons,daemonPermission} from '../../hosts/codex/codex-daemon.js';
 import {CodexDirectDelivery} from '../../hosts/codex/codex-direct.js';
 import {ManagedRecovery} from '../recovery/managed-recovery.js';
-import {hostingGate,hostingStatus} from '../recovery/session-hosting.js';
+import {hostingGate,hostingStatus,hostingRecord} from '../recovery/session-hosting.js';
 import {readSessionProfile,sessionFile} from '../../hosts/codex/codex-session-profile.js';
 import type {Adapters} from '../coordinator.js';
 import type {TurnEndCoordinator} from '../turn-end.js';
@@ -87,10 +88,11 @@ export class BrokerHealthCoordinator {
       const endpoint=store.endpoint(peer.id),pair=store.pairFor(peer.id);
       const count=pending??(pair?.paused?store.deliveryCounts(pair.id,pair[otherHost(peer.host)]).accepted:store.pendingCount(peer.id));
       const hosting=hostingStatus(store,peer);
+      const pauseDetail=peer.state==='paused'&&peer.pauseReason==='restart_incomplete'&&hosting?.phase==='blocked'?hostingRecord(store,peer)?.verificationError?.pauseDetail:undefined;
       const auto=claudeAutoStatus(store,peer);
       const failure=this.hooks.ownedClaudeLaunchFailure(peer);
       const direct=peer.host==='codex'&&count>0?this.services.codexDirect.status(peer.id):undefined,wait=direct?.scope===JSON.stringify([pair?.id,JSON.stringify([peer.sessionId,endpoint?.epoch])])?direct.wait:undefined;
-      return{owner:peer.owner,...(peer.state==='paused'&&peer.pauseReason?{pause_reason:peer.pauseReason}:{}),...daemonDelivery(peer,endpoint,count,store.bindings.current(peer.id)?.transitioning,this.services.daemons.canWake(peer,endpoint),pair?.paused,daemonContextChanged(store,peer,endpoint)),...(wait?{delivery_wait:{state:'waiting_native_interaction' as const,reason:'native_thread_state' as const,host:'codex' as const,member_id:peer.id,session_id:peer.sessionId,name:peer.name,pending:count,...wait}}:{}),...nativeDeliveryWait(peer,endpoint,count,this.peerHealth(peer)),...(hosting?{hosting}:{}),...(auto?{claude_auto_mode:auto}:{}),...(failure?{launchFailure:failure,launch_precondition:failure}:{})};
+      return{owner:peer.owner,...(peer.state==='paused'&&peer.pauseReason?{pause_reason:peer.pauseReason}:{}),...(pauseDetail?{pause_detail:pauseDetail}:{}),...daemonDelivery(peer,endpoint,count,store.bindings.current(peer.id)?.transitioning,this.services.daemons.canWake(peer,endpoint),pair?.paused,daemonContextChanged(store,peer,endpoint)),...(wait?{delivery_wait:{state:'waiting_native_interaction' as const,reason:'native_thread_state' as const,host:'codex' as const,member_id:peer.id,session_id:peer.sessionId,name:peer.name,pending:count,...wait}}:{}),...nativeDeliveryWait(peer,endpoint,count,this.peerHealth(peer)),...(hosting?{hosting}:{}),...(auto?{claude_auto_mode:auto}:{}),...(failure?{launchFailure:failure,launch_precondition:failure}:{})};
     }
 
   probeRuntime(peer:Peer,fresh=false):Promise<RuntimeAvailability>{
@@ -284,7 +286,7 @@ export class BrokerHealthCoordinator {
       const start=this.environment.store.setting<number>('claudeTurnStart:'+peer.id),value=child.health;
       if(start&&peer.state==='busy'&&(!value||value.lastEventAt<start))return{turnId:peer.sessionId+':'+start,lastProgressAt:start,lastEventAt:start,state:Date.now()-start>=SILENCE_MS?'silent':'running',tools:[]};
       if(!value)return;
-      return{...value,state:peer.state==='needsHuman'?'needsHuman':['ready','failed','needsHuman'].includes(value.state)?value.state:value.retry?'networkRetrying':value.tools.length?'waitingTool':Date.now()-value.lastProgressAt>=SILENCE_MS?'silent':'running'};
+      return{...normalizeClaudeTurnHealth(value),state:peer.state==='needsHuman'?'needsHuman':['ready','failed','needsHuman'].includes(value.state)?value.state:value.retry?'networkRetrying':value.tools.length?'waitingTool':Date.now()-value.lastProgressAt>=SILENCE_MS?'silent':'running'};
     }
 
   deliverySucceeded(peer:Peer,endpoint=this.runtimeEndpoint(peer.id)):void{

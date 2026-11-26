@@ -12,7 +12,7 @@ function fixture(t:TestContext){
   const home=temporary(t),adapter=new CodexAdapter(DEFAULT_CONFIG,home),address='unix://'+path.join(home,'native.sock');
   t.after(()=>adapter.close());
   const peer:Peer={id:'peer',host:'codex',kind:'root',owner:'nxbridge',sessionId:'parent',cwd:home,name:'测试',parentId:null,permission:'prompting',state:'ready',updatedAt:0};
-  const endpoint:Endpoint={peerId:peer.id,address,epoch:'epoch',mode:'app-server',pid:process.pid,procStart:'测试原生代次',seenAt:0,active:true};
+  const endpoint:Endpoint={peerId:peer.id,address,epoch:'epoch',mode:'app-server',pid:process.pid,procStart:'测试原生代次',runtimeId:'native-generation',seenAt:0,active:true};
   const thread:CodexThread={id:peer.sessionId!,cwd:home,status:{type:'idle'}},calls:string[]=[];
   const rpc={closed:false,close(){this.closed=true;},request:async(method:string,params:unknown,options:unknown):Promise<unknown>=>{
     calls.push(method);
@@ -22,9 +22,13 @@ function fixture(t:TestContext){
     }
     assert.equal(method,'turn/start');
     assert.deepEqual(params,{threadId:peer.sessionId,input:[{type:'text',text:HEALTH_WAKE_NOTICE}]});
-    assert.deepEqual(options,{mutation:true});
+    assert.equal((options as {mutation?:boolean}).mutation,true);
+    (options as {beforeSend?:()=>void}).beforeSend?.();
     return{turn:{id:'实际接收唤醒的轮次'}};
   }};
+  (adapter as any).clients.set(address,rpc);
+  (adapter as any).attached.add(address+'|'+peer.sessionId);
+  (adapter as any).ownedRoutes.subscribed({peer,endpoint},rpc);
   t.mock.method(adapter,'connect',async()=>rpc as unknown as RpcClient);
   return{adapter,endpoint,peer,thread,calls,rpc,wake:(guard:()=>Promise<boolean>=async()=>true,signal?:AbortSignal)=>adapter.wakeSubagents(peer,endpoint,signal,guard)};
 }
@@ -33,7 +37,32 @@ test('仅已加载空闲父线程收到完成信号并返回原生轮次',async 
   const f=fixture(t);t.mock.method(f.adapter as any,'completionNative',async(endpoint:Endpoint)=>assert.equal(endpoint,f.endpoint));
   assert.equal(await f.wake(async()=>{assert.deepEqual(f.calls,['thread/read']);return true;}),'实际接收唤醒的轮次');
   assert.deepEqual(f.calls,['thread/read','turn/start']);
-  assert.equal(f.adapter.hasSubscription(f.peer,f.endpoint),false);
+  assert.equal(f.adapter.hasSubscription(f.peer,f.endpoint),true);
+});
+
+test('托管父线程缺少当前订阅时不读取或授权唤醒，旧路由没有 runtimeId 也不能例外',async t=>{
+  const f=fixture(t);delete f.endpoint.runtimeId;
+  t.mock.method(f.adapter as any,'completionNative',async()=>assert.fail('没有订阅时先保留唤醒，不进入原生准备'));
+  assert.equal(f.endpoint.runtimeId,undefined);
+  assert.equal(await f.wake(async()=>assert.fail('不能消耗唤醒授权')),undefined);
+  assert.deepEqual(f.calls,[]);
+});
+
+for(const change of ['取消订阅','更换连接'] as const)test('授权期间'+change+'会撤销完成唤醒许可',async t=>{
+  const f=fixture(t);t.mock.method(f.adapter as any,'completionNative',async()=>{});
+  assert.equal(await f.wake(async()=>{
+    if(change==='取消订阅')(f.adapter as any).ownedRoutes.revoke(f.endpoint.address,f.peer.sessionId);
+    else (f.adapter as any).clients.set(f.endpoint.address,{...f.rpc});
+    return true;
+  }),undefined);
+  assert.deepEqual(f.calls,['thread/read']);
+});
+
+test('用户窗口仍按原生加载状态核验，托管订阅门禁不改用户窗口行为',async t=>{
+  const f=fixture(t);f.peer.owner='user';(f.adapter as any).attached.clear();
+  t.mock.method(f.adapter as any,'completionNative',async()=>{});
+  assert.equal(await f.wake(),'实际接收唤醒的轮次');
+  assert.deepEqual(f.calls,['thread/read','turn/start']);
 });
 
 test('活跃、卸载、等待审批或输入的父线程不进入提交守卫',async t=>{
@@ -57,7 +86,7 @@ test('原生代次不匹配、授权拒绝和授权期间的新原生状态阻�
   }),undefined);
   const controller=new AbortController();
   assert.equal(await f.wake(async()=>{controller.abort();return true;},controller.signal),undefined);
-  assert.deepEqual(f.calls,['thread/read','thread/read','thread/read']);
+  assert.ok(f.calls.every(method=>method==='thread/read'),'状态事件可能补读元数据，但不能提交任何唤醒');
 });
 
 test('原生提交后撤销等待或缺少轮次回执保留结果不确定',async t=>{
@@ -75,6 +104,7 @@ test('原生提交后撤销等待或缺少轮次回执保留结果不确定',asy
 
 test('队列的最后空闲复核只用已有连接，断连、审批或新的原生进展都拒绝',async t=>{
   const f=fixture(t);
+  (f.adapter as any).clients.clear();
   assert.equal(await f.adapter.queueWakeReady(f.peer,f.endpoint),false);assert.deepEqual(f.calls,[]);
   (f.adapter as any).clients.set(f.endpoint.address,f.rpc);
   assert.equal(await f.adapter.queueWakeReady(f.peer,f.endpoint),true);

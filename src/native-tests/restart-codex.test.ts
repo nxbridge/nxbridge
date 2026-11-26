@@ -21,8 +21,9 @@ import { FakeAdapter } from '../tests/support/fake-adapter.js';
 import { registration } from '../tests/support/registration.js';
 import { temporaryDirectory } from '../tests/support/temporary.js';
 import { releaseNativeTestLaunches } from '../tests/support/native-launch.js';
-import {managedRuntimes} from '../hosts/managed-runtimes.js';
+import {managedRuntimes,runtimeFor} from '../hosts/managed-runtimes.js';
 import { readCodexHistory } from '../hosts/codex/codex-history.js';
+import {readSessionProfile} from '../hosts/codex/codex-session-profile.js';
 
 for(const named of [false,true])test('真实托管 Codex 安全重启原线程，保持历史/运行设置并加载新 MCP 和技能'+(named?'（命名权限）':'（旧式权限）'),{timeout:180000},async t=>{
   const temp=temporaryDirectory(),home=path.join(temp.directory,'bridge'),codexhome=path.join(temp.directory,'codex');
@@ -73,7 +74,7 @@ await server.connect(new StdioServerTransport());
   const skill=path.join(codexhome,'skills','restart-marker','SKILL.md');mkdirSync(path.dirname(skill),{recursive:true});
   const skillText=(version:string)=>`---\nname: restart-marker\ndescription: RESTART_SKILL_${version}\n---\n隔离的重启技能。\n`;
   writeFileSync(skill,skillText('V1'),'utf8');
-  const configText=(modelName:string,effort:string)=>`model_provider = "restart_test"\nmodel = ${JSON.stringify(modelName)}\nmodel_reasoning_effort = ${JSON.stringify(effort)}\nweb_search = "disabled"\nsandbox_mode = "read-only"\napproval_policy = "never"\n[model_providers.restart_test]\nname = "隔离重启检查"\nbase_url = ${JSON.stringify(base)}\nwire_api = "responses"\nrequires_openai_auth = false\n[features]\napps = false\nremote_plugin = false\n[features.code_mode]\nenabled = false\ndirect_only_tool_namespaces = ["restart_probe"]\n[features.non_prefixed_mcp_tool_names]\nenabled = true\nserver_names = ["restart_probe"]\n[analytics]\nenabled = false\n[mcp_servers.restart_probe]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ${JSON.stringify([fixture,marker])}\n`;
+  const configText=(modelName:string,effort:string,tier:string|undefined=named?'opaque-tier-a':undefined)=>`model_provider = "restart_test"\nmodel = ${JSON.stringify(modelName)}\nmodel_reasoning_effort = ${JSON.stringify(effort)}\n${tier===undefined?'':'service_tier = '+JSON.stringify(tier)+'\n'}web_search = "disabled"\nsandbox_mode = "read-only"\napproval_policy = "never"\n[model_providers.restart_test]\nname = "隔离重启检查"\nbase_url = ${JSON.stringify(base)}\nwire_api = "responses"\nrequires_openai_auth = false\n[features]\napps = false\nremote_plugin = false\n[features.code_mode]\nenabled = false\ndirect_only_tool_namespaces = ["restart_probe"]\n[features.non_prefixed_mcp_tool_names]\nenabled = true\nserver_names = ["restart_probe"]\n[analytics]\nenabled = false\n[mcp_servers.restart_probe]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ${JSON.stringify([fixture,marker])}\n`;
   const permissions=(text:string)=>{text=text.replace('requires_openai_auth = false','requires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0');return named?text.replace('sandbox_mode = "read-only"','default_permissions = "restart_profile"')+'\n[permissions.restart_profile.filesystem]\n":root" = "read"\n[permissions.restart_profile.network]\nenabled = false\n':text;};
   writeFileSync(path.join(codexhome,'config.toml'),permissions(configText('gpt-6.1-sol','xhigh')),'utf8');
   await ensureHome(home);
@@ -83,11 +84,12 @@ await server.connect(new StdioServerTransport());
   const runtimeRecord=managedRuntimes(home).find(record=>record.value.peerId===placeholder.id)!,child={pid:runtimeRecord.value.pid!};metadata=runtimeRecord.file;
   assert.equal(runtimeRecord.value.dedicated,true);pids.add(child.pid);
                                                 
-  const started=await (await codex.connect(initial)).request('thread/start',{cwd:temp.directory});
-  (codex as any).attached.add(initial+'|'+started.thread.id);
+  const initialRpc=await codex.connect(initial),started=await initialRpc.request('thread/start',{cwd:temp.directory,serviceTier:named?'opaque-tier-a':'default'});
   const input=threadRegistration(started.thread,initial,started)!;input.endpoint={...input.endpoint,configHome:codexhome,runtimeId:runtimeRecord.value.id,pid:child.pid,procStart:runtimeRecord.value.procStart??null};
   const peer=store.adopt(placeholder.id,input);
-  const partner=store.register(registration('claude','test-claude')),pair=store.pair(partner.id,peer.id),endpoint=store.endpoint(peer.id)!,rpc=await codex.attach(peer,endpoint);
+  const partner=store.register(registration('claude','test-claude')),pair=store.pair(partner.id,peer.id),endpoint=store.endpoint(peer.id)!;
+  (codex as any).ownedRoutes.subscribed({peer,endpoint},initialRpc);
+  const rpc=await codex.attach(peer,endpoint);
   await rpc.request('mcpServerStatus/list',{threadId:peer.sessionId,limit:100});
   const completed=new Set<string>();
   rpc.on('notification',message=>{if(message.method==='turn/completed')completed.add(message.params.turn.id);});
@@ -130,30 +132,68 @@ await server.connect(new StdioServerTransport());
     t.diagnostic('真实 429 后的用户恢复在原会话完成新轮次；恢复回执恰好一次，旧消息正文、路由和尝试次数保持原样。');
   }
   const before=await rpc.request('thread/resume',{threadId:peer.sessionId}),beforeRequests=requests.length;
-  const live=store.accept(pair,partner,'只返回重启后隔离检查答案','queued-before-restart');assert.equal(live.attempts,0);
   const deliveryGate=new Promise<void>(resolve=>releaseDelivery=resolve),originalInject=codex.inject.bind(codex);codex.inject=async(...args)=>{await deliveryGate;await originalInject(...args);};
   if(named)assert.equal(before.activePermissionProfile?.id,'restart_profile');
   const durablePath=before.thread.path;assert.ok(durablePath);await wait(()=>readFileSync(durablePath,'utf8').includes('重启前的持久答案'));
   const persistedReasoning=readFileSync(durablePath,'utf8').split('\n').filter(Boolean).map(line=>JSON.parse(line)).find(row=>row.type==='response_item'&&row.payload?.id===reasoning.id)?.payload;
   assert.deepEqual([persistedReasoning?.id,persistedReasoning?.summary,persistedReasoning?.encrypted_content],[reasoning.id,reasoning.summary,reasoning.encrypted_content],'原生落盘必须保留推理项的 ID、摘要和不透明密文');
   const extra=await rpc.request('thread/start',{cwd:temp.directory,ephemeral:true,config:{thread_unload_delay_secs:0}});
+  (codex as any).ownedRoutes.subscribed({peer:{...peer,sessionId:extra.thread.id},endpoint},rpc);
   await assert.rejects(broker.dispatch('codex.restart',{}),{code:'shared_runtime'});assert.equal(liveProcess(child.pid),true);
   assert.equal(store.message(missed.id).state,'contextObserved');assert.match(store.message(missed.id).evidence!,/thread\/read/);assert.equal(store.message(missed.id).attempts,1);
   await rpc.request('thread/unsubscribe',{threadId:extra.thread.id});await wait(async()=>!(await rpc.request('thread/loaded/list',{limit:100})).data.includes(extra.thread.id));
   const runtime=readJson<any>(metadata);atomicJson(metadata,{...runtime,procStart:'错误的进程代次'});
   await assert.rejects(broker.dispatch('codex.restart',{}),{code:'unowned_runtime'});assert.equal(liveProcess(child.pid),true);atomicJson(metadata,runtime);
+  if(named){
+    const profile=await readSessionProfile(durablePath,peer.sessionId!);
+    assert.equal(profile.verified,true);assert.equal(profile.complete,true);
+    delete profile.settings.serviceTier;delete profile.appliedServiceTier;
+    atomicJson(metadata,{...runtime,sessionVerification:{sessionId:peer.sessionId,profile}});
+    try{
+      await assert.rejects(codex.restart(peer,endpoint,()=>{},{verificationRecovery:true}),{code:'owned_profile_unverified'});
+      assert.equal(liveProcess(child.pid),true,'档位证据不完整时必须保留原进程');
+      assert.equal((await rpc.request('thread/read',{threadId:peer.sessionId,includeTurns:false})).thread.id,peer.sessionId);
+    }finally{atomicJson(metadata,runtime);}
+  }
   const uncertain=store.accept(pair,partner,'未确认消息保持原样','unknown');store.claim(uncertain.id);store.transition(uncertain.id,'unknown');
   const unknownBefore=store.message(uncertain.id);
   assert.equal(store.message(uncertain.id).attempts,1);
   writeFileSync(marker,'RESTART_MCP_V2','utf8');writeFileSync(skill,skillText('V2'),'utf8');
-  const changedConfig=permissions(configText('gpt-5.1-codex','low'));writeFileSync(path.join(codexhome,'config.toml'),changedConfig,'utf8');
+  const changedConfig=permissions(configText('gpt-5.1-codex','low','flex'));writeFileSync(path.join(codexhome,'config.toml'),changedConfig,'utf8');
+  if(!named){
+                                                 
+    await rpc.request('thread/settings/update',{threadId:peer.sessionId,serviceTier:'default'},{mutation:true});
+    await wait(async()=>(await readSessionProfile(durablePath,peer.sessionId!)).settings.serviceTier==='default');
+    await rpc.request('thread/unsubscribe',{threadId:peer.sessionId});
+    await wait(async()=>!(await rpc.request('thread/loaded/list',{limit:100})).data.includes(peer.sessionId));
+    assert.equal(codex.hasSubscription(store.peer(peer.id),endpoint),false);
+    let lastColdHold='';
+    try{await wait(async()=>{
+      try{await codex.attach(store.peer(peer.id),endpoint);return true;}
+      catch(error){if((error as {code?:string}).code!=='owned_cold_resume_waiting')throw error;lastColdHold=String(error);return false;}
+    });}catch(error){t.diagnostic(lastColdHold);throw error;}
+    assert.equal(codex.hasSubscription(store.peer(peer.id),store.endpoint(peer.id)!),true);
+    const cold=await rpc.request('thread/resume',{threadId:peer.sessionId,excludeTurns:true});
+    assert.deepEqual([cold.thread.id,cold.model,cold.reasoningEffort],[before.thread.id,before.model,before.reasoningEffort]);
+    assert.equal((await readSessionProfile(durablePath,peer.sessionId!)).settings.serviceTier,'default');
+    assert.equal(requests.length,beforeRequests,'仅恢复订阅不会启动轮次');
+    assert.equal(runtimeFor(home,{peerId:peer.id})!.value.pid,child.pid);
+  }
+  let live!:typeof missed;
+  const restart=codex.restart.bind(codex),duringRestart=t.mock.method(codex,'restart',(...args:Parameters<CodexAdapter['restart']>)=>{
+                                  
+    live=store.accept(pair,partner,'只返回重启后隔离检查答案','queued-before-restart');assert.equal(live.attempts,0);
+    return restart(...args);
+  });
   const result=await broker.dispatch('codex.restart',named?{partner:true,actor:{host:'claude',sessionId:partner.sessionId,callId:'native-partner-restart'}}:{}) as any;pids.add(result.pid);
+  duringRestart.mock.restore();
   assert.equal(result.restarted,true);assert.equal(result.session_id,peer.sessionId);assert.notEqual(result.pid,child.pid);assert.equal(liveProcess(child.pid),false);
   assert.deepEqual(store.message(uncertain.id),unknownBefore,'完整历史核验只解除重启阻塞，未知消息的正文、状态及投递次数保持原样');
   assert.equal(store.currentPair()?.id,pair.id);assert.equal(store.peer(peer.id).owner,'nxbridge');assert.equal(requests.length,beforeRequests,'冷恢复本身不调用模型');
   const restored=await codex.attach(store.peer(peer.id),store.endpoint(peer.id)!);
   const after=await restored.request('thread/resume',{threadId:peer.sessionId});
   assert.equal(after.thread.id,before.thread.id);assert.equal(after.model,before.model);assert.equal(after.reasoningEffort,before.reasoningEffort);
+  assert.equal((await readSessionProfile(after.thread.path,peer.sessionId!)).settings.serviceTier,named?'opaque-tier-a':'default','新配置的 flex 不能覆盖原生原有或不透明档位');
   assert.deepEqual(after.sandbox,before.sandbox);assert.deepEqual(after.approvalPolicy,before.approvalPolicy);assert.equal(after.cwd,before.cwd);assert.deepEqual(after.activePermissionProfile,before.activePermissionProfile);
   assert.match(JSON.stringify(after.thread.turns),/重启前的持久答案/);assert.equal(readFileSync(path.join(codexhome,'config.toml'),'utf8'),changedConfig);
   const refreshedMcp=await restored.request('mcpServerStatus/list',{threadId:peer.sessionId,limit:100});

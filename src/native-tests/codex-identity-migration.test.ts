@@ -4,7 +4,7 @@ import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { Duplex } from 'node:stream';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { readModelBody } from './model-http-fixture.js';
 import WebSocket from 'ws';
@@ -18,18 +18,20 @@ import {DEFAULT_CONFIG} from '../config/defaults.js';
 import {delay} from '../shared/time.js';
 import {ensureHome,socketDirectory} from '../ipc/home.js';
 import {spawnCli} from '../process/host-command.js';
-import { selectHostLaunch, spawnSelectedHost } from '../hosts/host-launch.js';
+import { selectHostLaunch } from '../hosts/host-launch.js';
 import { managedMarker } from '../install/installation.js';
 import { managedRuntimes, saveManagedRuntime, createRuntimeToken, runtimeDirectory } from '../hosts/managed-runtimes.js';
 import { requireDedicatedCodex } from '../hosts/codex/codex-isolation.js';
 import { liveProcess, nativeDescendant } from '../process/process.js';
-import { rememberOwnedHost } from '../process/owned-processes.js';
+import { declareOwnedNative, prepareProcessRegistry, rememberOwnedChild, rememberOwnedHost } from '../process/owned-processes.js';
+import { launchIndependentWindows } from '../process/windows/windows-background.js';
+import { spawnPosixSupervisor } from '../process/posix/posix-supervisor.js';
 import { FakeAdapter } from '../tests/support/fake-adapter.js';
 import { registration } from '../tests/support/registration.js';
 import { temporaryDirectory } from '../tests/support/temporary.js';
 import { releaseNativeTestLaunches } from '../tests/support/native-launch.js';
 
-test('旧 nxbridge 身份的真实后台：忙碌状态如实恢复、已结束线程卸载后安全迁移，原 ID 历史保留且无非官方 UA 请求',{timeout:150000},async t=>{
+test('旧 nxbridge 身份的真实后台：无订阅不触碰已加载线程，卸载后迁移同一 ID 并使用官方 UA',{timeout:150000},async t=>{
   const temp=temporaryDirectory(),root=temp.directory,home=path.join(root,'bridge'),codexHome=path.join(root,'codex'),launchId=randomUUID();
   mkdirSync(codexHome);await ensureHome(home);
   const config={...DEFAULT_CONFIG,codexHome,...(process.env.NXBRIDGE_TEST_CODEX_BINARY?{codexBinary:process.env.NXBRIDGE_TEST_CODEX_BINARY}:{})};
@@ -61,7 +63,16 @@ test('旧 nxbridge 身份的真实后台：忙碌状态如实恢复、已结束�
     const tokenFile=createRuntimeToken(home,{id:launchId,owner:managedMarker(home),kind:'owned',state:'starting',endpoint:address,authenticatedLoopback:true,createdAt:Date.now()});
     token=readFileSync(tokenFile,'utf8').trim();authentication=['--ws-auth','capability-token','--ws-token-file',tokenFile];
   }else address='unix://'+path.join(await socketDirectory(home),'old-identity.sock');
-  const child=spawnSelectedHost(launch,['--no-daemon','app-server','--listen',address,...authentication],{stdio:'ignore'});await rememberOwnedHost(home,child,'codex','codex-runtime',launchId,codexHome);
+  const args=[...launch.executable.prefix,'--no-daemon','app-server','--listen',address,...authentication],logfile=path.join(home,'run','old-identity.log');
+  await prepareProcessRegistry(home);
+  const wrapper=process.platform==='win32'?await launchIndependentWindows({home,executable:launch.executable.command,args,cwd:root,env:launch.env,logfile,role:'codex-runtime',launchId,configHome:codexHome}):await(async()=>{
+    const fd=openSync(logfile,'a',0o600);
+    try{
+      const child=spawnPosixSupervisor(launch.executable.command,args,{cwd:root,env:launch.env,stdio:['ignore',fd,fd],waitForNative:true,home});
+      return await rememberOwnedChild(home,child,'codex-runtime',{configHome:codexHome,posixGroup:true},launchId);
+    }finally{closeSync(fd);}
+  })();
+  assert.ok(wrapper);
   const wait=async(check:()=>boolean|Promise<boolean>)=>{const end=Date.now()+25000;while(!await check()){if(Date.now()>end)assert.fail('迁移验收超时：'+JSON.stringify({requests:requests.length,errors,status:broker.status(),runtimes:managedRuntimes(home)}));await delay(80);}};
   await wait(async()=>{try{const rpc=await connectAppServer(address,config,token,home,{readOnly:true});rpc.close();return true;}catch{return false;}});
                                          
@@ -80,9 +91,16 @@ test('旧 nxbridge 身份的真实后台：忙碌状态如实恢复、已结束�
   await new Promise<void>((resolve,reject)=>{ws.once('open',resolve);ws.once('error',reject);});
   old=new RpcClient(message=>ws.send(JSON.stringify(message)),()=>ws.close());ws.on('message',raw=>old!.receive(JSON.parse(raw.toString())));ws.on('close',()=>old!.disconnected());ws.on('error',()=>old!.disconnected());
   const initialized=await old.request('initialize',{clientInfo:{name:'nxbridge',version:'0.1.1'},capabilities:{experimentalApi:true}});old.notify('initialized');assert.match(initialized.userAgent,/^nxbridge\//);
-  const {thread}=await old.request('thread/start',{cwd:root,approvalPolicy:'never',sandbox:'danger-full-access',config:{thread_unload_delay_secs:0}});
+  const {thread}=await old.request('thread/start',{cwd:root,serviceTier:'default',approvalPolicy:'never',sandbox:'danger-full-access',config:{thread_unload_delay_secs:0}});
   await old.request('turn/start',{threadId:thread.id,input:[{type:'text',text:'升级前正在进行的隔离轮次'}]});await wait(()=>requests.length===1);
-  const cutoff=requests.length,placeholder=store.placeholder('codex',root),native=await nativeDescendant(child.pid!,'codex',0);
+  const cutoff=requests.length,placeholder=store.placeholder('codex',root);
+  let native:Awaited<ReturnType<typeof nativeDescendant>>|undefined;
+  await wait(async()=>{
+    try{native=await nativeDescendant(wrapper.identity.pid,'codex',0,address,wrapper);return true;}
+    catch(error){if(error instanceof BridgeError&&error.code==='process_identity_unknown')return false;throw error;}
+  });
+  assert.ok(native);
+  await declareOwnedNative(wrapper,native);
   saveManagedRuntime(home,{id:launchId,peerId:placeholder.id,owner:managedMarker(home),kind:'owned',state:'ready',createdAt:Date.now(),endpoint:address,pid:native.pid,procStart:native.startedAt,configHome:codexHome,executable:launch.executable.command,...(token?{authenticatedLoopback:true}:{})});
   const peer=store.adopt(placeholder.id,registration('codex',thread.id,{cwd:root,state:'busy',endpoint:{mode:'app-server',address,epoch:address,pid:native.pid,procStart:native.startedAt,configHome:codexHome}}));
   const partner=store.register(registration('claude','migration-source',{cwd:root})),pair=store.pair(partner.id,peer.id),message=store.accept(pair,partner,'迁移后只投递一次','upgrade');
@@ -92,11 +110,14 @@ test('旧 nxbridge 身份的真实后台：忙碌状态如实恢复、已结束�
   store.saveEndpoint({peerId:peer.id,mode:'embedded',address:'',epoch:'embedded:'+native.pid+':'+native.startedAt+':'+thread.id,pid:native.pid,procStart:native.startedAt,processKind:'app-server',configHome:codexHome,seenAt:Date.now(),active:true});
   await broker.start();
   assert.equal(store.endpoint(peer.id)?.mode,'app-server');assert.equal(store.bindings.current(peer.id),undefined);assert.equal(store.endpoints(peer.id).some(e=>e.active&&e.mode==='embedded'),false);
-  await broker.pump();assert.equal(liveProcess(native.pid),true);assert.equal(requests.length,cutoff);assert.equal(store.message(message.id).attempts,0);assert.match((broker.status() as any).capabilities.identityIssues[0].message,/仍在运行|空闲/);
-  assert.equal(store.peer(peer.id).state,'busy');
+  await broker.pump();assert.equal(liveProcess(native.pid),true);assert.equal(requests.length,cutoff);assert.equal(store.message(message.id).attempts,0);assert.match((broker.status() as any).capabilities.identityIssues[0].message,/卸载/);
+  assert.equal((await old.request('thread/read',{threadId:thread.id,includeTurns:false})).thread.status.type,'active');
   assert.equal(store.peer(peer.id).launchFailure,undefined);
   store.updatePeer(peer.id,{state:'paused'});
   release();await wait(async()=>{const live=(await old!.request('thread/read',{threadId:thread.id,includeTurns:true})).thread;return live.status.type==='idle'&&live.turns?.at(-1)?.status==='completed';});
+  await old.request('thread/settings/update',{threadId:thread.id,serviceTier:'default'});
+  await assert.rejects(codex.restart(store.peer(peer.id),store.endpoint(peer.id)!,()=>{},{identityMigration:true}),{code:'owned_subscription_waiting'});
+  assert.equal(requests.length,cutoff);assert.equal(liveProcess(native.pid),true);
   const before=await old.request('thread/resume',{threadId:thread.id,excludeTurns:true});
   await wait(()=>!!before.thread.path&&existsSync(before.thread.path)&&readFileSync(before.thread.path,'utf8').includes('MIGRATION_HISTORY_1'));
   const unsubscribed=await old.request('thread/unsubscribe',{threadId:thread.id});old.close();
@@ -121,11 +142,14 @@ test('旧 nxbridge 身份的真实后台：忙碌状态如实恢复、已结束�
   assert.equal(store.endpoint(peer.id)!.codexPermission!.sandbox,'danger-full-access');
   await broker.dispatch('hook',{session_id:thread.id,hook_event_name:'PreToolUse',permission_mode:'bypassPermissions'});
   assert.equal(codexPermission(after),'bypass');assert.equal(store.peer(peer.id).permission,'bypass');
-                                                         
+                                          
   const observer=new CodexAdapter(config,home);let bareObservation=false;
   observer.on('register',r=>{if(r.sessionId===thread.id&&!r.endpoint.codexPermission){bareObservation=true;codex.emit('register',r,peer.id);}});
   try{
-    await observer.connect(store.endpoint(peer.id)!.address);assert.equal(bareObservation,true);await broker.pump();
+    const address=store.endpoint(peer.id)!.address,observing=await observer.connect(address);
+    await observer.discoverLoaded(address,observing);assert.equal(bareObservation,false);
+    await assert.rejects(observing.request('thread/read',{threadId:thread.id,includeTurns:false}),{code:'owned_subscription_waiting'});
+    await broker.pump();
     await broker.dispatch('hook',{session_id:thread.id,hook_event_name:'PostToolUse',permission_mode:'bypassPermissions'});
     assert.equal(store.peer(peer.id).permission,'bypass');assert.equal(store.endpoint(peer.id)!.codexPermission!.sandbox,'danger-full-access');
   }finally{observer.close();}

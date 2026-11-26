@@ -16,6 +16,7 @@ import {saveManagedRuntime,runtimeFor,removeManagedRuntime,createRuntimeToken,ty
 import {managedMarker} from '../install/installation.js';
 import {processIdentity} from '../process/process.js';
 import {CodexAdapter,threadRegistration} from '../hosts/codex/adapter.js';
+import {CodexNativeRpc} from '../hosts/codex/codex-native-rpc.js';
 import {daemonRegistration} from '../hosts/codex/codex-daemon.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
 import {type RegisterInput} from '../types.js';
@@ -173,18 +174,20 @@ test('托管选择提交后接手已加载的 adopting 成员，只读复核即�
   assert.equal((await transfers.adopt(f.store.peer(f.x.id)) as any).status,'paired');assert.equal(hostingRecord(f.store,f.x)?.phase,undefined);assert.equal(f.store.pairFor(f.x.id)?.id,f.pair.id);assert.equal(f.store.peer(f.x.id).state,'busy');
 });
 
-test('原生子代理父链按运行时代次缓存，根线程状态每次只读获取',async t=>{
+test('无订阅时仅核查子代理父链，不向托管根线程发送串行读取',async t=>{
   const f=await setup(t);t.after(()=>f.store.close());const server=new WebSocketServer({host:'127.0.0.1',port:0}),adapter=new CodexAdapter(DEFAULT_CONFIG,f.home),calls:string[]=[];
+  adapter.bindOwnedRoutes(()=>undefined,id=>f.store.getPeer(id)?.sessionId??undefined);
   t.after(async()=>{adapter.close();for(const socket of server.clients)socket.terminate();await new Promise<void>(resolve=>server.close(()=>resolve()));});await once(server,'listening');
   const runtime={...f.runtime,endpoint:`ws://127.0.0.1:${(server.address() as {port:number}).port}`,authenticatedLoopback:true};saveManagedRuntime(f.home,runtime);createRuntimeToken(f.home,runtime);
   let rootState='active';server.on('connection',socket=>socket.on('message',raw=>{const request=JSON.parse(raw.toString());if(request.id===undefined)return;
-    assert.ok(['initialize','thread/read'].includes(request.method),'只能发起只读请求');calls.push(request.method+':'+(request.params?.threadId??''));const id=request.params?.threadId;
-    socket.send(JSON.stringify({id:request.id,result:request.method==='initialize'?codexInitializeResult:{thread:{id,cwd:f.home,status:{type:rootState},...(id==='child'?{source:{subAgent:{spawn:{parentThreadId:'root'}}}}:{source:'cli'})}}}));
+    assert.ok(['initialize','thread/list'].includes(request.method),'不能读取无订阅的线程控制队列');calls.push(request.method);
+    socket.send(JSON.stringify({id:request.id,result:request.method==='initialize'?codexInitializeResult:{data:[{id:'child',cwd:f.home,status:{type:rootState},source:{subAgent:{spawn:{parentThreadId:'root'}}}}]}}));
   }));
-  await adapter.inspectThread(runtime,'child');await adapter.inspectThread(runtime,'child');assert.equal(calls.filter(call=>call==='thread/read:child').length,1);
-  assert.equal((await adapter.inspectThread(runtime,'root'))?.status?.type,'active');rootState='idle';assert.equal((await adapter.inspectThread(runtime,'root'))?.status?.type,'idle');assert.equal(calls.filter(call=>call==='thread/read:root').length,2);
-  const changed={...runtime,configHome:path.join(f.home,'other')};saveManagedRuntime(f.home,changed);await adapter.inspectThread(changed,'child');assert.equal(calls.filter(call=>call==='thread/read:child').length,2);
-  const restarted={...changed,procStart:'new-generation'};saveManagedRuntime(f.home,restarted);await assert.rejects(adapter.inspectThread(restarted,'child'),{code:'runtime_endpoint_unverified'});assert.equal(calls.filter(call=>call==='thread/read:child').length,2);
+  await adapter.inspectThread(runtime,'child');await adapter.inspectThread(runtime,'child');assert.equal(calls.filter(call=>call==='thread/list').length,1);
+  assert.equal(await adapter.inspectThread(runtime,'root'),undefined);rootState='idle';
+  assert.equal(await adapter.inspectThread(runtime,'root'),undefined);assert.equal(calls.filter(call=>call==='thread/list').length,1);
+  const changed={...runtime,configHome:path.join(f.home,'other')};saveManagedRuntime(f.home,changed);await adapter.inspectThread(changed,'child');assert.equal(calls.filter(call=>call==='thread/list').length,2);
+  const restarted={...changed,procStart:'new-generation'};saveManagedRuntime(f.home,restarted);await assert.rejects(adapter.inspectThread(restarted,'child'),{code:'runtime_endpoint_unverified'});assert.equal(calls.filter(call=>call==='thread/list').length,2);
 });
 
 test('旧冲突卸载核验等待期间新增外来根线程，不会清除新冲突',async t=>{
@@ -211,9 +214,26 @@ test('旧运行时保留 peerId 的原生子代理沿同代次 Unix 端点只读
   t.after(async()=>{adapter.close();for(const client of server.clients)client.terminate();await new Promise<void>(resolve=>server.close(()=>http.close(()=>resolve())));});
   http.listen(process.platform==='win32'?{host:'127.0.0.1',port:0}:socket);await once(http,'listening');
   if(process.platform==='win32')writeFileSync(path.join(f.home,'proxy.mjs'),`import net from 'node:net';const socket=net.createConnection(${(http.address() as {port:number}).port},'127.0.0.1');process.stdin.pipe(socket);socket.pipe(process.stdout);socket.on('close',()=>process.exit());socket.on('error',()=>process.exit(1));`,'utf8');
-  server.on('connection',client=>client.on('message',raw=>{const request=JSON.parse(raw.toString());if(request.id===undefined)return;assert.ok(['initialize','thread/read'].includes(request.method));client.send(JSON.stringify({id:request.id,result:request.method==='initialize'?codexInitializeResult:{thread:{id:'child',cwd:f.home,source:{subAgent:{thread_spawn:{parent_thread_id:'root'}}}}}}));}));
-  removeManagedRuntime(runtimeFor(f.home,{id:f.runtime.id})!);writeFileSync(path.join(f.home,'run','codex-runtime.json'),JSON.stringify({...f.runtime,endpoint:'unix://'+socket}),'utf8');
+  const calls:string[]=[];
+  server.on('connection',client=>client.on('message',raw=>{const request=JSON.parse(raw.toString());if(request.id===undefined)return;calls.push(request.method);assert.ok(['initialize','thread/list'].includes(request.method));client.send(JSON.stringify({id:request.id,result:request.method==='initialize'?codexInitializeResult:{data:[{id:'child',cwd:f.home,source:{subAgent:{thread_spawn:{parent_thread_id:'root'}}}}]}}));}));
+  removeManagedRuntime(runtimeFor(f.home,{id:f.runtime.id})!);writeFileSync(path.join(f.home,'run','codex-runtime.json'),JSON.stringify({...f.runtime,sessionId:'root',endpoint:'unix://'+socket}),'utf8');
+  const legacy=runtimeFor(f.home,{id:'legacy'})!.value;
+  assert.equal(await adapter.inspectThread(legacy,'root'),undefined);assert.deepEqual(calls,[]);
   const child=await managedCodexRegistration(f.store,f.home,f.input('child'),(runtime,id)=>adapter.inspectThread(runtime,id));assert.equal(child?.kind,'subagent');assert.equal(child?.rootPeerId,f.x.id);assert.equal(hostingGate(f.store,f.x),false);
+  assert.deepEqual(calls,['initialize','thread/list']);
+});
+
+test('会话持有者探测只凭完整加载列表撤销当前连接上的目标状态',async t=>{
+  const adapter=new CodexAdapter(DEFAULT_CONFIG,temporary(t)),address='ws://localhost:1',target='root';
+  let data:unknown={data:['child'],nextCursor:'page'},second:unknown={data:null};
+  const rpc=new CodexNativeRpc(message=>queueMicrotask(()=>rpc.receive({id:message.id,result:message.params?.cursor?second:data})),()=>{},address);
+  t.after(()=>adapter.close());(adapter as any).clients.set(address,rpc);
+  const absent:string[]=[];rpc.on('threadAbsent',id=>absent.push(id));
+  assert.equal(await adapter.sessionState({sessionId:target},{address}),'unknown');assert.deepEqual(absent,[]);
+  second={data:[target]};
+  assert.equal(await adapter.sessionState({sessionId:target},{address}),'alive');assert.deepEqual(absent,[]);
+  data={data:['child']};
+  assert.equal(await adapter.sessionState({sessionId:target},{address}),'dead');assert.deepEqual(absent,[target]);
 });
 
 test('托管选择返回 held 后读取已存回执仍为 held',async t=>{

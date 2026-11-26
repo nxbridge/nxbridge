@@ -187,6 +187,7 @@ export interface BridgeConfig {
   codexEndpoint?: string;
   codexAuthTokenEnv?: string;
   partnerProfiles?: Partial<Record<Host, ModelProfile & {source?:PartnerProfileSource}>>;
+  profileWarnings?: string[];
   subagentSend: 'allow-verified' | 'deny';
   questionTimeoutMs?: number;
   syncTipMinutes: number;

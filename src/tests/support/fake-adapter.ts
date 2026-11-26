@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import type { DeliveryResult, Endpoint, Message, Peer, PermissionClass, RegisterInput } from '../../types.js';
 import type { CodexContextReceipt } from '../../hosts/codex/adapter.js';
+import type { OwnedCodexLaunchProof } from '../../hosts/codex/codex-owned-routes.js';
 import type {RuntimeAvailability} from '../../broker/health/contracts.js';
 import { registration } from './registration.js';
 
@@ -30,13 +31,15 @@ export class FakeAdapter extends EventEmitter{
   async continueInjected(peer:Peer,_endpoint:Endpoint){if(this.fail)throw this.fail;this.woken.push(peer);return'injection-turn-'+(++this.injectionTurn);}
   async probe(_peer:Peer):Promise<RuntimeAvailability>{return{state:'reachable',reasons:[],checked_at:Date.now()};}
   async connect(address:string){this.connected.push(address);return{request:async()=>({})};}
+  async routeExited(_peer:Peer,_endpoint:Endpoint,_launch?:OwnedCodexLaunchProof):Promise<boolean>{return false;}
   async attach(peer:Peer,endpoint:Endpoint){
     this.attached.push({peer,endpoint});if(this.attachFailure)throw this.attachFailure;
     this.emit('register',registration(peer.host,peer.sessionId!,{state:'ready',endpoint}),peer.id);return{request:async()=>({})};
   }
   async observe(peer:Peer,endpoint:Endpoint){await this.attach(peer,endpoint);}
   async observeActive(peer:Peer,endpoint:Endpoint){await this.attach(peer,endpoint);}
-  hasSubscription(_peer:Peer,_endpoint:Endpoint):boolean{return false;}
+                                     
+  hasSubscription(peer:Peer,endpoint:Endpoint):boolean{return peer.host==='codex'&&peer.owner==='nxbridge'&&!this.attachFailure&&!!peer.sessionId&&endpoint.active;}
   userSubscriptions():{peer:Peer;endpoint:Endpoint}[]{return[];}
   async releaseIdle(_peer:Peer,_endpoint:Endpoint,_guard:()=>boolean,_closing=false):Promise<'retained'|'released'|'unloaded'|'idle'>{return'retained';}
   async ensureEndpoint(_cwd?:string,_peerId?:string,_requesterSession?:string,_sessionId?:string,_configHome?:string,beforeLaunch?:()=>void|Promise<void>){await beforeLaunch?.();this.ensured++;return'new-endpoint';}

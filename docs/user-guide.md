@@ -257,7 +257,7 @@ nxbridge 不会替你批准。
 
 也可以在 nxbridge 配置里直接写明某一项：`partners.codex.model`、`partners.codex.effort`、`partners.codex.service_tier`，Claude 是 `partners.claude.model` 和 `partners.claude.effort`。写明的项优先于上面的默认值。
 
-服务档位有三种：`standard` 标准，`fast` 优先处理（更快，费用更高），`flex` 弹性处理（费用更低，可能更慢）。
+服务档位有两种：`standard` 标准，`fast` 优先处理（更快，费用更高）。
 
 推荐的模型在你的模型服务里用不了时，新建会报错并说明原因，不会换成别的模型，按上面任一方式换一个就行。
 
@@ -266,7 +266,7 @@ nxbridge 不会替你批准。
 要改正在用的后台搭档，直接告诉 Claude 或 Codex 想换成什么，或者在终端运行：
 
 ```sh
-nxbridge partner-profile codex --model <模型> --effort <推理强度> --service-tier <standard|fast|flex>
+nxbridge partner-profile codex --model <模型> --effort <推理强度> --service-tier <standard|fast>
 ```
 
 - 搭档正在工作时不会被打断，等这一轮做完再换。

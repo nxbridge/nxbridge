@@ -3,11 +3,162 @@ import assert from 'node:assert/strict';
 import { RpcClient, clearRpcFaults, type RpcMessage } from '../ipc/rpc.js';
 import { readCodexThread, readCodexItems } from '../hosts/codex/codex-evidence.js';
 import {TurnHealthTracker} from '../broker/health/turn-health.js';
+import { CodexNativeRpc } from '../hosts/codex/codex-native-rpc.js';
+import { CodexOwnedRoutes, type OwnedCodexRoute } from '../hosts/codex/codex-owned-routes.js';
+import { RuntimeRecoveryHold } from '../shared/errors.js';
 
 function mockRpc(handle:(message:RpcMessage)=>unknown,endpoint?:string){
   const requests:RpcMessage[]=[];const rpc=new RpcClient(message=>{requests.push(message);queueMicrotask(()=>{try{rpc.receive({id:message.id,result:handle(message)});}catch(error){rpc.receive({id:message.id,error:error as any});}});},()=>{},endpoint);
   return{rpc,requests};
 }
+
+function delayedNative(){
+  const sent:RpcMessage[]=[];let ready=false;
+  const rpc=new CodexNativeRpc(message=>{
+    sent.push(message);
+    const result=message.method==='thread/loaded/list'?{data:['root']}:message.method==='thread/turns/list'?{data:[]}:
+      ready?{thread:{id:'root'}}:undefined;
+    if(result)queueMicrotask(()=>rpc.receive({id:message.id,result}));
+  },()=>{},'test://passive-native-reply');
+  return{rpc,sent,ready:()=>{ready=true;}};
+}
+
+test('被动迟到回执只保留有限旧请求，丢弃与断线都不能调用旧成功回调',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});
+  const sent:RpcMessage[]=[],observed:number[]=[],rpc=new RpcClient(message=>sent.push(message),()=>{});
+  t.after(()=>rpc.close());
+  for(let index=0;index<65;index++){
+    const failed=assert.rejects(rpc.request('read',{},{timeout:1,onLateSuccess:()=>observed.push(index)}),{code:'timeout'});
+    t.mock.timers.tick(1);await failed;
+  }
+  rpc.receive({id:sent[0]!.id,result:{}});assert.deepEqual(observed,[]);
+  rpc.receive({id:sent[64]!.id,result:{}});assert.deepEqual(observed,[64]);
+  rpc.close();rpc.receive({id:sent[63]!.id,result:{}});assert.deepEqual(observed,[64]);
+});
+
+test('慢读取的原请求迟到成功仅解除自己的等待，不新增队列探针',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});
+  const f=delayedNative(),permit={};t.after(()=>f.rpc.close());f.rpc.threadGuard=()=>permit;
+  const original=f.rpc.request('thread/read',{threadId:'root'},{timeout:750});
+  const failed=assert.rejects(original,{code:'native_thread_unconfirmed'});
+  t.mock.timers.tick(750);await failed;await new Promise<void>(resolve=>setImmediate(resolve));
+  await assert.rejects(f.rpc.request('thread/read',{threadId:'root'}),{code:'native_thread_wedged'});
+  const before=f.sent.length;
+  f.rpc.receive({id:f.sent[0]!.id,result:{thread:{id:'root'}}});
+  assert.equal(f.sent.length,before,'迟到回执不能主动查询原线程');
+  await assert.rejects(original,{code:'native_thread_unconfirmed'},'原请求的超时结果不被改写');
+  f.ready();assert.equal((await f.rpc.request('thread/read',{threadId:'root'})).thread.id,'root');
+});
+
+test('并发超时逐项核对迟到成功，写入仍为未知且不重发',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});
+  const f=delayedNative(),permit={};t.after(()=>f.rpc.close());f.rpc.threadGuard=()=>permit;
+  const read=f.rpc.request('thread/read',{threadId:'root'},{timeout:750}),write=f.rpc.request('turn/start',{threadId:'root'},{timeout:750,mutation:true});
+  const failures=Promise.all([assert.rejects(read,{code:'native_thread_unconfirmed'}),assert.rejects(write,{code:'timeout',uncertain:true})]);
+  t.mock.timers.tick(750);await failures;await new Promise<void>(resolve=>setImmediate(resolve));
+  const before=f.sent.length;
+  f.rpc.receive({id:f.sent[0]!.id,result:{thread:{id:'root'}}});
+  await assert.rejects(f.rpc.request('thread/read',{threadId:'root'}),{code:'native_thread_wedged'});
+  f.rpc.receive({id:f.sent[1]!.id,result:{turn:{id:'original-turn'}}});
+  assert.equal(f.sent.length,before);
+  await assert.rejects(write,{code:'timeout',uncertain:true},'原写入结果仍需既有回执核对');
+  f.ready();assert.equal((await f.rpc.request('thread/read',{threadId:'root'})).thread.id,'root');
+  assert.equal(f.sent.filter(message=>message.method==='turn/start').length,1);
+});
+
+for(const changed of ['permit','connection'])test('原请求迟到成功不解除后来代次的等待：'+changed,async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});
+  const f=delayedNative();t.after(()=>f.rpc.close());let permit={};f.rpc.threadGuard=()=>permit;
+  const first=assert.rejects(f.rpc.request('thread/read',{threadId:'root'},{timeout:750}),{code:'native_thread_unconfirmed'});
+  t.mock.timers.tick(750);await first;await new Promise<void>(resolve=>setImmediate(resolve));
+  let current=f;
+  if(changed==='connection'){
+    f.rpc.close();current=delayedNative();t.after(()=>current.rpc.close());current.rpc.threadGuard=()=>permit;
+    const next=assert.rejects(current.rpc.request('thread/read',{threadId:'root'},{timeout:750}),{code:'native_thread_unconfirmed'});
+    t.mock.timers.tick(750);await next;await new Promise<void>(resolve=>setImmediate(resolve));
+  }else permit={};
+  const before=current.sent.length;
+  f.rpc.receive({id:f.sent[0]!.id,result:{thread:{id:'root'}}});
+  await assert.rejects(current.rpc.request('thread/read',{threadId:'root'}),{code:'native_thread_wedged'});
+  assert.equal(current.sent.length,before);
+});
+
+test('同线程控制超时后保留写入不确定性，重复核验只用独立接口直到确认卸载',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});
+  const sent:RpcMessage[]=[];let now=0,wedged=true,loaded=true;
+  const rpc=new CodexNativeRpc(message=>{
+    sent.push(message);
+    const reply=message.method==='thread/loaded/list'?{data:loaded?['root','other']:['other']}:message.method==='thread/turns/list'?{data:[]}:!wedged||message.params?.threadId==='other'?{thread:{id:message.params.threadId}}:undefined;
+    if(reply)queueMicrotask(()=>rpc.receive({id:message.id,result:reply}));
+  },()=>{},'test://owned-native-queue',()=>now);
+  t.after(()=>rpc.close());
+  const original=assert.rejects(rpc.request('turn/start',{threadId:'root'},{timeout:10,mutation:true}),{code:'timeout',uncertain:true});
+  t.mock.timers.tick(10);await original;
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  await assert.rejects(rpc.request('thread/queue/add',{threadId:'root'},{mutation:true,beforeSend:()=>assert.fail('本地门禁不能标记已提交')}),{code:'native_thread_wedged',uncertain:false,phase:'prepare'});
+  assert.equal(sent.filter(message=>message.params?.threadId==='root'&&message.method!=='thread/turns/list').length,1);
+  assert.equal((await rpc.request('thread/read',{threadId:'other'})).thread.id,'other');
+  now+=30001;wedged=false;
+  rpc.threadGuard=(_method,id)=>{if(id==='root')throw new RuntimeRecoveryHold('lease_lost','原生订阅已失效。');};
+  await assert.rejects(rpc.request('turn/start',{threadId:'root'},{mutation:true}),{code:'lease_lost',phase:'prepare'});
+  assert.equal(sent.filter(message=>message.method==='thread/read'&&message.params?.threadId==='root').length,0);
+  rpc.threadGuard=undefined;
+  for(let attempt=0;attempt<4;attempt++){
+    now+=30001;
+    await assert.rejects(rpc.request('turn/start',{threadId:'root'},{mutation:true}),{code:'native_thread_wedged',uncertain:false});
+  }
+  assert.equal(sent.filter(message=>message.method==='thread/read'&&message.params?.threadId==='root').length,0);
+  assert.equal(sent.filter(message=>message.method==='turn/start').length,1);
+  let absent=0;rpc.on('threadAbsent',id=>{assert.equal(id,'root');absent++;});
+  loaded=false;now+=30001;
+  await assert.rejects(rpc.request('turn/start',{threadId:'root'},{mutation:true}),{code:'native_thread_wedged',uncertain:false});
+  assert.equal(absent,1);assert.equal(sent.filter(message=>message.method==='turn/start').length,1);
+  assert.equal((await rpc.request('thread/read',{threadId:'root'})).thread.id,'root');
+});
+
+for(const method of ['thread/unloaded','thread/closed','thread/archived','thread/status/changed'])test('短超时探测停止追加线程请求，'+method+' 解除等待后仍核验新订阅',async t=>{
+  t.mock.timers.enable({apis:['setTimeout']});let allow=false;
+  const sent:RpcMessage[]=[];
+  const rpc=new CodexNativeRpc(message=>{
+    sent.push(message);
+    if(allow||message.method==='thread/loaded/list'||message.method==='thread/turns/list')queueMicrotask(()=>rpc.receive({id:message.id,result:{data:['root'],thread:{id:'root'}}}));
+  },()=>{},'test://native-unload-reset');
+  t.after(()=>rpc.close());
+  const timedOut=assert.rejects(rpc.request('thread/read',{threadId:'root'},{timeout:750}),{code:'native_thread_unconfirmed'});
+  t.mock.timers.tick(750);await timedOut;
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  for(let attempt=0;attempt<3;attempt++)await assert.rejects(rpc.request('thread/read',{threadId:'root'},{timeout:750}),{code:'native_thread_wedged'});
+  assert.equal(sent.filter(message=>message.method==='thread/read').length,1);
+  allow=true;
+  rpc.receive({method,params:{threadId:'root',status:{type:'notLoaded'}}});
+  rpc.threadGuard=()=>{throw new RuntimeRecoveryHold('owned_subscription_waiting','没有新的订阅回执。');};
+  await assert.rejects(rpc.request('thread/resume',{threadId:'root'}),{code:'owned_subscription_waiting'});
+  rpc.threadGuard=undefined;
+  assert.equal((await rpc.request('thread/read',{threadId:'root'})).thread.id,'root');
+});
+
+test('旧连接和旧路由的迟到回执不能撤销或签发当前路由的许可',t=>{
+  const routes=new CodexOwnedRoutes(),old=new RpcClient(()=>{},()=>{}),fresh=new RpcClient(()=>{},()=>{});
+  t.after(()=>{old.close();fresh.close();});
+  const route:OwnedCodexRoute={peer:{id:'p',host:'codex',owner:'nxbridge',sessionId:'root',kind:'root',name:'root',cwd:'/cwd',parentId:null,permission:'unknown',state:'ready',updatedAt:0},
+    endpoint:{peerId:'p',address:'test://route',epoch:'1',runtimeId:'runtime',mode:'app-server',pid:12,procStart:'first',active:true,seenAt:0}};
+  let current=route;
+  routes.bind(()=>current);
+  routes.subscribed(route,old);
+  const identity=routes.leaseIdentity(route,old);
+  assert.equal(routes.permits(route,old),true);
+  current={...route,endpoint:{...route.endpoint,epoch:'2',procStart:'second'}};
+  routes.subscribed(current,fresh);
+  assert.notEqual(routes.leaseIdentity(current,fresh),identity);
+  routes.subscribed(route,old);
+  routes.revoke(route.endpoint.address,'root',old);
+  assert.equal(routes.permits(route,old),false);
+  assert.equal(routes.permits(current,fresh),true);
+  const oldOwner=current;
+  current={...current,peer:{...current.peer,owner:'user'}};
+  assert.equal(routes.permits(current,fresh),false);
+  assert.equal(routes.permits(oldOwner,fresh),false);
+});
 
 for(const state of ['idle','active'])test('尚未物化的 '+state+' 线程保留元数据，首次输入后重新读取轮次且不触发协议熔断',async t=>{
   let materialized=false;const endpoint='test://not-materialized/'+state;

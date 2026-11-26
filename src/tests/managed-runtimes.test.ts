@@ -132,8 +132,11 @@ test('退休的原生代次不制造活动预约歧义；无关损坏归属保�
   assert.equal(ownedProcesses(home).notes.length,1);assert.equal(await managedRuntimeState(home,ended),'dead');
   assert.equal(await managedRuntimeState(home,record(home,'reserved')),'unknown');
   const adapter=new CodexAdapter(DEFAULT_CONFIG,home);t.after(()=>adapter.close());const seen:string[]=[];
+                                                        
+  const declared:string[]=[];
+  t.mock.method(adapter as any,'declareRuntimeNative',async(saved:ManagedRuntime)=>{declared.push(saved.id);return identity;});
   t.mock.method(adapter,'connect',async(endpoint:string)=>{seen.push(endpoint);return{} as any;});
-  assert.equal(await adapter.ensureEndpoint(home,'a'),active.endpoint);assert.deepEqual(seen,[active.endpoint]);assert.equal(runtimeFor(home,{peerId:'a'})!.value.id,active.id);
+  assert.equal(await adapter.ensureEndpoint(home,'a'),active.endpoint);assert.deepEqual(declared,[active.id]);assert.deepEqual(seen,[active.endpoint]);assert.equal(runtimeFor(home,{peerId:'a'})!.value.id,active.id);
   }finally{unlinkSync(malformed);}
 });
 

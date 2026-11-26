@@ -14,7 +14,7 @@ export async function partnerProfileCommand(args:string[]):Promise<unknown>{
     const value=args[++index];if(!value||value.startsWith('--'))throw new BridgeError('invalid_arguments','参数缺少值：'+flag);
     if(flag==='--model'||flag==='--effort'||flag==='--service-tier'){
       const field=flag==='--model'?'model':flag==='--effort'?'effort':'serviceTier';
-      if(field==='serviceTier'&&(host!=='codex'||!['standard','fast','flex'].includes(value)))throw new BridgeError('invalid_arguments','--service-tier 仅用于 Codex，取值为 standard、fast 或 flex。');
+      if(field==='serviceTier'&&(host!=='codex'||!['standard','fast'].includes(value)))throw new BridgeError('invalid_arguments','--service-tier 仅用于 Codex，取值为 standard 或 fast。');
       if(profile[field]!==undefined)throw new BridgeError('invalid_arguments','参数不能重复：'+flag);profile[field]=value;}
     else if(['--pair','--member','--session'].includes(flag))target.push(flag,value);
     else throw new BridgeError('invalid_arguments','未知参数：'+flag);

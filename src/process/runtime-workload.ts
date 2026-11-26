@@ -43,7 +43,13 @@ export interface RuntimeWorkload {
 }
 
                                    
-export async function assertRuntimeWorkloadIdle({ native, owners, infrastructure }: RuntimeWorkload): Promise<void> {
+export async function assertRuntimeWorkloadIdle(workload: RuntimeWorkload): Promise<void> {
+  const stale = await inspectRuntimeWorkload(workload);
+  if (stale && await inspectRuntimeWorkload(workload))
+    throw new BridgeError('runtime_workload_active', '原运行时的进程在核验期间发生变化，稍后再试。');
+}
+
+async function inspectRuntimeWorkload({ native, owners, infrastructure }: RuntimeWorkload): Promise<boolean> {
   const containers = new Map<string, OwnedProcessRecord>();
   for (const owner of owners) if (owner.windowsJob || owner.posixGroup) {
     const key = JSON.stringify([generation(owner.identity), owner.windowsJob, !!owner.posixGroup]), previous = containers.get(key);
@@ -95,10 +101,22 @@ export async function assertRuntimeWorkloadIdle({ native, owners, infrastructure
       collect([current]);
     }
   }
+  let stale = false;
   const inspect = async (processes: ProcessIdentity[]) => {
-    for (const process of processes) {
-      if (!structural.has(generation(process)) && !await infrastructure?.(process))
-        throw new BridgeError('runtime_workload_active', `原运行时还有无法证明可安全回收的进程（PID ${process.pid}），等待它结束后再试。`);
+    for (const candidate of processes) {
+      if (structural.has(generation(candidate))) continue;
+      let failure: {error: unknown} | undefined;
+      try { if (await infrastructure?.(candidate)) continue; }
+      catch (error) { failure = {error}; }
+      if (await ownedProcessState(candidate) === 'dead') {
+                                                
+        stale = true;
+        continue;
+      }
+      if (failure) throw failure.error;
+      const image = candidate.image ? path.basename(candidate.image) : candidate.name;
+      const name = /^[\w.+-]{1,64}$/.test(image) ? `，程序 ${image}` : '';
+      throw new BridgeError('runtime_workload_active', `原运行时还有无法证明可安全回收的进程（PID ${candidate.pid}），其父进程为 ${candidate.parentPid}${name}。等待它结束后再试。`);
     }
   };
   await inspect([...scope.values()]);
@@ -114,6 +132,7 @@ export async function assertRuntimeWorkloadIdle({ native, owners, infrastructure
     }
   }
   if (await ownedProcessState(native) !== 'alive') throw unavailable();
+  return stale;
 }
 
 export interface McpCommand { command: string; args?: readonly string[] }

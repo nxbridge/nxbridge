@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {fixture, lifecycle} from './support/broker-fixture.js';
 import { temporary } from './support/temporary.js';
 import { registration } from './support/registration.js';
-import { PartnerProfiles, modelProfileSchema, profileChangeFailure } from '../broker/profiles/partner-profile.js';
+import { PartnerProfiles, modelProfileSchema, codexProfileSchema, profileChangeFailure } from '../broker/profiles/partner-profile.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
 import {DeliveryError} from '../shared/errors.js';
 import {type Endpoint,type ModelProfile,type Peer} from '../types.js';
@@ -19,15 +19,46 @@ import { randomUUID } from 'node:crypto';
 import {atomicJson} from '../shared/files.js';
 import { claudeChild, claudeChildFile, type ClaudeChildRecord } from '../hosts/claude/claude-child.js';
 import { formatPartnerProfile } from '../app/commands/partner-profile-command.js';
-import { mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { partnerProfileCommand } from '../app/commands/partner-profile-command.js';
 
 const actor={host:'claude' as const,sessionId:'c',callId:'profile'};
+
+test('可选档位只保留 standard 与 fast，CLI 和配置请求不能选择 flex',async()=>{
+  assert.equal(codexProfileSchema.safeParse({serviceTier:'standard'}).success,true);
+  assert.equal(codexProfileSchema.safeParse({serviceTier:'fast'}).success,true);
+  assert.equal(codexProfileSchema.safeParse({serviceTier:'flex'}).success,false);
+  await assert.rejects(partnerProfileCommand(['codex','--service-tier','flex']),{code:'invalid_arguments',message:/standard 或 fast/});
+});
 function owned(t:Parameters<typeof fixture>[0]){
   const f=fixture(t);f.store.pair(f.c.id,f.x.id);f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'ready',model:'old',effort:'low'});
   const calls:ModelProfile[]=[];
   (f.codex as unknown as {setProfile:(peer:Peer,endpoint:Endpoint,profile:ModelProfile,guard:()=>void)=>Promise<ModelProfile>}).setProfile=async(peer,_endpoint,profile,guard)=>{guard();calls.push(profile);return{model:peer.model,effort:peer.effort,...profile};};
   return{...f,calls};
 }
+
+test('旧持久选择中的 flex 单独撤销，保留其它选择和原生观测且诊断不重复',async t=>{
+  const f=owned(t);f.store.updatePeer(f.x.id,{serviceTier:'flex'});const peer=f.store.peer(f.x.id);
+  f.store.setSetting('partnerProfile:'+peer.id,{requested:{model:'chosen',effort:'high',serviceTier:'flex'},resolved:{model:'chosen',effort:'high',serviceTier:'flex'},sources:{model:'explicit',effort:'explicit',serviceTier:'explicit'},explicitFields:['model','effort','serviceTier'],source:'explicit',status:'pending',at:1,sessionId:peer.sessionId});
+  assert.deepEqual(f.broker.profiles.requested(peer),{model:'chosen',effort:'high'});
+  assert.deepEqual(f.broker.profiles.intent(peer)?.resolved,{model:'chosen',effort:'high'});
+  assert.deepEqual(f.broker.profiles.intent(peer)?.explicitFields,['model','effort']);
+  assert.equal(f.broker.profiles.intent(peer)?.sources?.serviceTier,undefined);
+  assert.equal(f.broker.profiles.intent(peer)?.warnings?.length,1);assert.equal(f.broker.profiles.intent(peer)?.warnings?.length,1);
+  assert.match((f.broker.status() as any).capabilities.profile_warnings.join('\n'),/flex.*没有改动/);
+  await (f.broker as any).profileCoordination.apply(peer);
+  assert.deepEqual(f.calls,[{model:'chosen',effort:'high'}]);assert.equal(f.store.peer(peer.id).serviceTier,'flex');
+  assert.equal(f.broker.profiles.blocks(f.store.peer(peer.id)),false);
+});
+
+test('只选了旧 flex 的待生效意图不会拦住消息，也不会修改宿主档位',async t=>{
+  const f=owned(t),peer=f.store.peer(f.x.id);
+  f.store.setSetting('partnerProfile:'+peer.id,{requested:{serviceTier:'flex'},source:'explicit',status:'failed',blocked:true,error:{code:'profile_verification_failed',message:'旧档位不匹配'},at:1,sessionId:peer.sessionId});
+  assert.deepEqual(f.broker.profiles.requested(peer),{});assert.equal(f.broker.profiles.blocks(peer),false);
+  assert.equal(f.broker.profiles.view(peer).status,'applied');assert.equal(f.broker.profiles.intent(peer)?.error,undefined);
+  await (f.broker as any).profileCoordination.apply(peer);assert.equal(f.calls.length,0);
+});
 
 test('搭档设置在空闲时核验生效，观察事件不覆盖持久选择；reset 保持当前会话设置',async t=>{
   const f=owned(t),before=f.store.peer(f.x.id).sessionId;
@@ -168,12 +199,12 @@ test('新 Claude 原生设置或环境覆盖与选择冲突时，首份任务保
 
 test('新 Codex 启动和安全权限降级都保留模型与 effort；不采用请求时清理空线程',async()=>{
   const calls:{method:string;params:any}[]=[];let starts=0;
-  const rpc={request:async(method:string,params:any)=>{calls.push({method,params});if(method==='thread/start'){starts++;return{thread:{id:'new'},model:'chosen',reasoningEffort:'high',...(starts===1?{approvalPolicy:'on-request',approvalsReviewer:'user',sandbox:{type:'workspaceWrite'}}:{approvalPolicy:'never',approvalsReviewer:'user',sandbox:{type:'dangerFullAccess'}})};}return{};}} as RpcClient;
+  const rpc={request:async(method:string,params:any)=>{calls.push({method,params});if(method==='thread/start'){starts++;return{thread:{id:'new'},model:'chosen',reasoningEffort:'high',...(starts===1?{approvalPolicy:'on-request',approvalsReviewer:'user',sandbox:{type:'workspaceWrite'}}:{approvalPolicy:'never',approvalsReviewer:'user',sandbox:{type:'dangerFullAccess'}})};}return method==='thread/loaded/list'?{data:[]}:{};}} as RpcClient;
   await startOwnedCodex(rpc,'/project','prompting',undefined,undefined,{model:'chosen',effort:'high'});
   const requests=calls.filter(call=>call.method==='thread/start');assert.equal(requests.length,2);
   for(const call of requests){assert.equal(call.params.model,'chosen');assert.equal(call.params.config.model_reasoning_effort,'high');}
   assert.equal(requests[1]!.params.approvalPolicy,ownedCodexPolicy('bypass').approvalPolicy);
-  (rpc as any).request=async(method:string)=>method==='thread/start'?{thread:{id:'wrong'},model:'wrong',approvalPolicy:'never',approvalsReviewer:'user',sandbox:{type:'dangerFullAccess'}}:{};
+  (rpc as any).request=async(method:string)=>method==='thread/start'?{thread:{id:'wrong'},model:'wrong',approvalPolicy:'never',approvalsReviewer:'user',sandbox:{type:'dangerFullAccess'}}:method==='thread/loaded/list'?{data:[]}:{};
   await assert.rejects(startOwnedCodex(rpc,'/project','bypass',undefined,undefined,{model:'chosen'}),{code:'profile_verification_failed'});
 });
 
@@ -190,6 +221,65 @@ test('Codex 标准档明确覆盖宿主档位，未采用时清理空线程并�
   const request=rpc.request.bind(rpc);
   rpc.request=async(method,params,options)=>{if(method==='thread/delete')throw Error('无法删除空线程');return request(method,params,options);};
   await assert.rejects(startOwnedCodex(rpc,'/project','bypass',undefined,undefined,{serviceTier:'fast'}),(error:Error)=>!error.message.includes('新会话已撤掉')&&/空线程尚未确认卸载/.test(error.message));
+});
+
+test('新 Codex 的 null 档位投影用新生效记录核验，不同档位仍清理空线程',async t=>{
+  for(const actualTier of ['opaque-tier-a','other-tier']){
+    const home=temporary(t),file=path.join(home,'new.jsonl'),calls:{method:string;params:any}[]=[];
+    writeFileSync(file,JSON.stringify({type:'session_meta',payload:{id:'new'}})+'\n','utf8');
+    const rpc={request:async(method:string,params:any)=>{
+      calls.push({method,params});
+      if(method==='thread/start')return{thread:{id:'new',path:file},serviceTier:null,approvalPolicy:'never',approvalsReviewer:'user',sandbox:{type:'dangerFullAccess'}};
+      if(method==='thread/settings/update'){
+        assert.equal(Object.hasOwn(params,'serviceTier'),false,'只能证明，不能把要求的档位重新写入');
+        appendFileSync(file,JSON.stringify({type:'event_msg',payload:{type:'thread_settings_applied',thread_id:'new',thread_settings:{service_tier:actualTier}}})+'\n','utf8');
+      }
+      return{data:[]};
+    }} as RpcClient;
+    if(actualTier==='opaque-tier-a')assert.equal((await startOwnedCodex(rpc,home,'bypass',undefined,undefined,{serviceTier:'opaque-tier-a'})).serviceTier,'opaque-tier-a');
+    else await assert.rejects(startOwnedCodex(rpc,home,'bypass',undefined,undefined,{serviceTier:'opaque-tier-a'}),{code:'profile_service_tier_unavailable'});
+    assert.equal(calls.some(call=>call.method==='thread/delete'),actualTier!=='opaque-tier-a');
+    assert.equal(calls.some(call=>call.method==='turn/start'),false);
+  }
+});
+
+test('Codex 搭档设置回读与初次核验共用新档位证据，缺字段不能继承旧值',async t=>{
+  for(const actualTier of ['priority','flex',undefined]){
+    const home=temporary(t),store=new Store(':memory:'),file=path.join(home,'profile.jsonl');t.after(()=>store.close());
+    const peer=store.register(registration('codex','profile-tier'));store.updatePeer(peer.id,{owner:'nxbridge',serviceTier:'fast'});
+    const endpoint={...store.endpoint(peer.id)!,runtimeId:randomUUID()};
+    saveManagedRuntime(home,{id:endpoint.runtimeId,peerId:peer.id,owner:managedMarker(home),kind:'owned',state:'ready',endpoint:endpoint.address,pid:endpoint.pid!,procStart:endpoint.procStart!,createdAt:Date.now()});
+    const line=(settings:object)=>JSON.stringify({type:'event_msg',payload:{type:'thread_settings_applied',thread_id:peer.sessionId,thread_settings:settings}})+'\n';
+    const nativeSettings={model:'chosen',reasoning_effort:'high',permission_profile:{type:'disabled'},approval_policy:'never',approvals_reviewer:'user'};
+    writeFileSync(file,JSON.stringify({type:'session_meta',payload:{id:peer.sessionId}})+'\n'+line({...nativeSettings,...(actualTier===undefined?{}:{service_tier:actualTier})}),'utf8');
+    const adapter=new CodexAdapter(DEFAULT_CONFIG,home);t.after(()=>adapter.close());
+    const calls:{method:string;params:any}[]=[];
+    const rpc={closed:false,close:()=>{},request:async(method:string,params:any,options?:{beforeSend?:()=>void})=>{
+      options?.beforeSend?.();
+      calls.push({method,params});
+      if(method==='thread/settings/update')appendFileSync(file,line({...nativeSettings,...(actualTier===undefined?{}:{service_tier:actualTier})}),'utf8');
+      return{thread:{id:peer.sessionId,path:file,status:{type:'idle'},model:'chosen',reasoningEffort:'high'},model:'chosen',reasoningEffort:'high',serviceTier:null,approvalPolicy:'never'};
+    }};
+    const current=store.peer(peer.id),profiles=new PartnerProfiles(store,home,DEFAULT_CONFIG);profiles.set(current,{serviceTier:'fast'});
+    (adapter as any).connect=async()=>rpc;
+    (adapter as any).clients.set(endpoint.address,rpc);
+    (adapter as any).ownedRoutes.subscribed({peer:current,endpoint},rpc);
+    if(actualTier===undefined){
+      await assert.rejects(adapter.readProfile(current,endpoint,()=>{}),{code:'profile_unverified'});
+      assert.deepEqual(calls.map(call=>call.method),['thread/read']);
+      continue;
+    }
+    const actual=await adapter.readProfile(current,endpoint,()=>{});
+    assert.equal(actual.serviceTier,actualTier==='priority'?'fast':actualTier??null);
+    assert.equal(calls.some(call=>call.method==='thread/settings/update'),false);
+    assert.deepEqual(calls.map(call=>call.method),['thread/read']);
+    if(actualTier==='priority'){profiles.applied(current,actual);assert.equal(profiles.blocks(current),false);}
+    else assert.throws(()=>profiles.applied(current,actual),{code:'profile_verification_failed'});
+    calls.length=0;
+    const switched=await adapter.setProfile(current,endpoint,{serviceTier:'fast'},()=>{});
+    assert.equal(switched.serviceTier,actual.serviceTier);
+    assert.equal(calls.filter(call=>call.method==='thread/settings/update'&&Object.hasOwn(call.params,'serviceTier')).length,1,'设置请求只提交一次，证明不修正被拒绝的值');
+  }
 });
 
 test('只给原生明确拒绝的新搭档推荐模型附上换模型提示',t=>{
@@ -217,14 +307,18 @@ test('提交边界区分读取失败与提交后回读失败，不让 RPC 缺省
 test('Codex 长会话设置只读取摘要；提交前失败不暂停，提交后超时保留不确定性',async t=>{
   const home=temporary(t),store=new Store(':memory:');t.after(()=>store.close());
   const peer=store.register(registration('codex','long-session'));store.updatePeer(peer.id,{owner:'nxbridge'});
-  const current=store.peer(peer.id),endpoint=store.endpoint(peer.id)!;
-  saveManagedRuntime(home,{id:randomUUID(),peerId:peer.id,owner:managedMarker(home),kind:'owned',state:'ready',endpoint:endpoint.address,createdAt:Date.now()});
+  const current=store.peer(peer.id),endpoint={...store.endpoint(peer.id)!,runtimeId:randomUUID()};
+  saveManagedRuntime(home,{id:endpoint.runtimeId,peerId:peer.id,owner:managedMarker(home),kind:'owned',state:'ready',endpoint:endpoint.address,pid:endpoint.pid!,procStart:endpoint.procStart!,createdAt:Date.now()});
   const adapter=new CodexAdapter(DEFAULT_CONFIG,home);t.after(()=>adapter.close());
   const calls:{method:string;params:any}[]=[];let fail:'pre'|'post'|undefined,rejected=false;
-  (adapter as any).connect=async()=>({request:async(method:string,params:any)=>{
+  const rpc={closed:false,close:()=>{},request:async(method:string,params:any,options?:{beforeSend?:()=>void})=>{
+    options?.beforeSend?.();
     calls.push({method,params});if(method==='thread/read'&&(fail==='pre'||fail==='post'&&calls.some(call=>call.method==='thread/settings/update')))throw new DeliveryError(rejected?'-32602':'timeout','宿主回读失败');
     return{thread:{id:peer.sessionId,status:{type:'idle'},model:'chosen',reasoningEffort:'high'}};
-  }});
+  }};
+  (adapter as any).connect=async()=>rpc;
+  (adapter as any).clients.set(endpoint.address,rpc);
+  (adapter as any).ownedRoutes.subscribed({peer:current,endpoint},rpc);
   fail='pre';await assert.rejects(adapter.setProfile(current,endpoint,{model:'chosen'},()=>{}),{uncertain:false});
   assert.equal(calls.some(call=>call.method==='thread/settings/update'),false);
   calls.length=0;fail='post';await assert.rejects(adapter.setProfile(current,endpoint,{model:'chosen'},()=>{}),{uncertain:true});

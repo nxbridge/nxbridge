@@ -1358,6 +1358,8 @@ test('Mod 上报加载时的插件版本，状态栏按集成问题给出用户�
   h.response('status',{...status([]),partner:{state:'paused'}});await h.tick();assert.equal(h.statuses.at(-1),'Codex 窗口被你中断了，消息在等待（在该窗口继续后送达）');
                                   
   h.response('status',{...status([]),partner:{state:'paused',owner:'nxbridge',pause_reason:'restart_incomplete'}});await h.tick();assert.match(h.statuses.at(-1)!,/后台 Codex 的重启没有完整完成.*nxbridge status/);
+  h.response('status',{...status([]),partner:{state:'paused',owner:'nxbridge',pause_reason:'restart_incomplete',pause_detail:{code:'service_tier_mismatch',saved:'standard',live:'fast'}}});await h.tick();assert.match(h.statuses.at(-1)!,/服务档位和原来对不上（原来 standard，现在 fast）.*已暂停投递，消息已保留/);
+  h.response('status',{...status([]),partner:{state:'paused',owner:'nxbridge',pause_reason:'restart_incomplete',pause_detail:{code:'service_tier_unverified'}}});await h.tick();assert.match(h.statuses.at(-1)!,/没能确认服务档位和原来一致.*已暂停投递/);
   h.response('status',{...status([]),partner:{state:'paused',owner:'nxbridge'}});await h.tick();assert.equal(h.statuses.at(-1),'后台 Codex 已暂停，消息已保留（运行 nxbridge status 查看原因）');
   h.response('status',{...status([]),partner:{state:'paused',owner:'user'}});await h.tick();assert.equal(h.statuses.at(-1),'Codex 窗口暂停了，消息在等待（在该窗口继续后送达）');
   h.response('status',{...status([]),partner:{state:'paused',owner:'user',pause_reason:'interrupted'}});await h.tick();assert.equal(h.statuses.at(-1),'Codex 窗口被你中断了，消息在等待（在该窗口继续后送达）');
@@ -2065,9 +2067,9 @@ test('Mod 的 partner_profile 和 select_partner 新建参数原样转给后台�
   const read=h.calls.filter(c=>c.operation==='partner-profile').at(-1);assert.equal(read.action,'get');assert.equal('model' in read,false);
   assert.match((await h.run('tool.call',{tool:'mcp__nxbridge__partner_profile',action:'set',model:'x',agentId:'sub'})).deny,/root session only/);
   h.response('selection-commit',{status:'paired',partner_name:'新后台'});
-  await h.run('tool.call',{tool:'mcp__nxbridge__select_partner',selection_id:'s1',action:'create',model:'gpt-x',effort:'low',service_tier:'flex',tool_use_id:'t3'});
+  await h.run('tool.call',{tool:'mcp__nxbridge__select_partner',selection_id:'s1',action:'create',model:'gpt-x',effort:'low',service_tier:'fast',tool_use_id:'t3'});
   const commit=h.calls.filter(c=>c.operation==='selection-commit').at(-1);
-  assert.deepEqual({action:commit.action,model:commit.model,effort:commit.effort,serviceTier:commit.serviceTier},{action:'create',model:'gpt-x',effort:'low',serviceTier:'flex'});
+  assert.deepEqual({action:commit.action,model:commit.model,effort:commit.effort,serviceTier:commit.serviceTier},{action:'create',model:'gpt-x',effort:'low',serviceTier:'fast'});
   await h.run('tool.call',{tool:'mcp__nxbridge__select_partner',selection_id:'s2',key:'k',tool_use_id:'t4'});
   const choose=h.calls.filter(c=>c.operation==='selection-commit').at(-1);assert.equal('model' in choose,false);assert.equal('effort' in choose,false);
 });

@@ -6,6 +6,11 @@ export class DeliveryError extends BridgeError {
   constructor(code: string, message: string, public uncertain = false) { super(code, message); }
 }
 
+                              
+export class RuntimeRecoveryHold extends DeliveryError {
+  readonly phase = 'prepare';
+}
+
 export function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }

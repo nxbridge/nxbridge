@@ -48,13 +48,48 @@ test('显式默认值逐项覆盖冻结值，数值零不会被当作缺省，�
 
 test('档位、模型、推理强度按单字段选取并报告来源',t=>{
   const home=temporary(t);
-  writeConfiguration(home,[{key:'partners.codex.model',value:'configured'},{key:'partners.codex.service_tier',value:'fast'}],'terminal');
-  const expected=resolveProfileDefaults(home,loadBridgeConfig(home),'codex',{serviceTier:'flex'});
-  assert.deepEqual(expected,{profile:{model:'configured',effort:'xhigh',serviceTier:'flex'},sources:{model:'config',effort:'recommended',serviceTier:'explicit'}});
+  writeConfiguration(home,[{key:'partners.codex.model',value:'configured'},{key:'partners.codex.service_tier',value:'standard'}],'terminal');
+  const expected=resolveProfileDefaults(home,loadBridgeConfig(home),'codex',{serviceTier:'fast'});
+  assert.deepEqual(expected,{profile:{model:'configured',effort:'xhigh',serviceTier:'fast'},sources:{model:'config',effort:'recommended',serviceTier:'explicit'}});
   assert.equal((configurationStatus(home).partner_defaults.codex as typeof expected).sources.serviceTier,'config');
   writeConfiguration(home,[{key:'partners.codex.profile_source',value:'host'},{key:'partners.codex.service_tier'}],'terminal');
   assert.deepEqual(resolveProfileDefaults(home,loadBridgeConfig(home),'codex'),{profile:{model:'configured'},sources:{model:'config',effort:'host',serviceTier:'host'}});
   assert.throws(()=>writeConfiguration(home,[{key:'partners.codex.service_tier',value:'default'}],'terminal'),{code:'invalid_config'});
+  assert.throws(()=>writeConfiguration(home,[{key:'partners.codex.service_tier',value:'flex'}],'terminal'),{code:'invalid_config',message:/standard 或 fast/});
+});
+
+test('升级兼容读取旧 flex 配置并显示诊断，明确保存只清理托管值',t=>{
+  for(const filename of ['config.managed.toml','config.toml','config.json']){
+    const home=temporary(t),file=path.join(home,filename),raw=filename.endsWith('.json')
+      ?JSON.stringify({partnerProfiles:{codex:{source:'host',model:'original',effort:'max',serviceTier:'flex'}}})
+      :'# 保留原配置\r\n[partners.codex]\r\nprofile_source="host"\r\nmodel="original"\r\neffort="max"\r\nservice_tier="flex"\r\n';
+    writeFileSync(file,raw,'utf8');
+    const config=loadBridgeConfig(home);
+    assert.deepEqual(profileDefaults(home,config,'codex'),{model:'original',effort:'max'});
+    assert.equal(config.profileWarnings?.length,1);assert.match(config.profileWarnings![0]!,/flex.*未设置/);
+    assert.match(configurationStatus(home).warnings.join('\n'),/flex.*未设置/);
+    assert.equal(readFileSync(file,'utf8'),raw,'兼容读取不改写原文件');
+    writeConfiguration(home,[{key:'questions.timeout_ms',value:123}],'terminal');
+    assert.equal(loadBridgeConfig(home).questionTimeoutMs,123);
+    assert.deepEqual(profileDefaults(home,loadBridgeConfig(home),'codex'),{model:'original',effort:'max'});
+    if(filename==='config.managed.toml'){
+      assert.doesNotMatch(readFileSync(file,'utf8'),/service_tier/);assert.equal(loadBridgeConfig(home).profileWarnings,undefined);
+    }else assert.equal(readFileSync(file,'utf8'),raw,'手写配置与旧备份仍保留原字节');
+    if(filename==='config.toml')assert.throws(()=>writeConfiguration(home,[{key:'partners.codex.service_tier',value:'flex'}],'terminal'),{code:'config_user_override'});
+    else assert.throws(()=>writeConfiguration(home,[{key:'partners.codex.service_tier',value:'flex'}],'terminal'),{code:'invalid_config'});
+  }
+});
+
+test('旧 flex 的手写覆盖按未设置处理，broker 状态可见且修复后诊断消失',t=>{
+  const f=fixture(t),home=f.broker.home;
+  writeConfiguration(home,[{key:'partners.codex.service_tier',value:'fast'}],'terminal');
+  const user=path.join(home,'config.toml');writeFileSync(user,'[partners.codex]\nservice_tier="flex"\n','utf8');
+  (f.broker as any).applyConfiguration();
+  assert.equal(f.broker.config.partnerProfiles?.codex?.serviceTier,undefined);
+  const status=f.broker.status() as any;
+  assert.equal(status.capabilities.profile_warnings.length,1);assert.match(formatGlobalStatus(status),/flex.*未设置/);
+  writeFileSync(user,'[partners.codex]\nservice_tier="standard"\n','utf8');(f.broker as any).applyConfiguration();
+  assert.equal(f.broker.config.partnerProfiles?.codex?.serviceTier,'standard');assert.equal((f.broker.status() as any).capabilities.profile_warnings,undefined);
 });
 
 test('首次原生模型持久冻结，延迟 effort 只接受同模型快照且每个字段只捕获一次',t=>{

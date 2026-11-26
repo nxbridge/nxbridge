@@ -475,11 +475,11 @@ nxbridge setup --clear-claude-command
 1. **这次创建时指定的值（模型自定义）：** AI 新建后台搭档（`select_partner` 的 `create`）时传入，服务档位用 `service_tier`。命令行没有单独的新建命令；后台 Codex 和 Linux / WSL 托管子进程的 Claude 可以新建后用 `nxbridge partner-profile` 修改，Windows 原生后台 Claude 不能中途修改，要在新建时指定或用下面的配置。
 2. **nxbridge 配置里写明的值：** `partners.<codex|claude>.model`、`partners.<codex|claude>.effort`、`partners.codex.service_tier`。
 3. **`partners.<codex|claude>.profile_source` 决定的默认值：**
-   - `recommended`（默认）：nxbridge 推荐的值，不受 Codex 的 `config.toml` 和 Claude 设置影响。后台 Codex 用 `gpt-6.2-sol`、推理强度 `xhigh`、标准服务档位；后台 Claude 用 `claude-opus-5-5`、推理强度 `xhigh`。`config.toml` 里设了 `fast` 或 `flex` 时，也会明确按标准档启动。
+   - `recommended`（默认）：nxbridge 推荐的值，不受 Codex 的 `config.toml` 和 Claude 设置影响。后台 Codex 用 `gpt-6.2-sol`、推理强度 `xhigh`、标准服务档位；后台 Claude 用 `claude-opus-5-5`、推理强度 `xhigh`。`config.toml` 里设了其他服务档位时，也会明确按标准档启动。
    - `host`（遵循配置）：用宿主自己的设置（Codex 的 `config.toml`、Claude 的 settings）。这份设置和你自己的 Codex / Claude 共用，默认模型一变，之后新建的后台搭档也跟着变。
    - `frozen`：记下下一个新建搭档实际用上的值，以后新建的都沿用。记下的值存在 nxbridge 私有状态里；改回别的值会清除它。
 
-- 服务档位可选 `standard`（标准）、`fast`（优先处理，更快，费用更高）和 `flex`（弹性处理，费用更低，可能更慢）。Codex 收到的分别是 `default`、`priority` 和 `flex`。
+- 服务档位可选 `standard`（标准）和 `fast`（优先处理，更快，费用更高）。Codex 收到的分别是 `default` 和 `priority`。
 - 新建的后台 Codex 在接手第一项任务前，先核对 Codex 实际采用的服务档位。Codex 没有采用时，撤掉这个还没开始工作的会话，消息留着不发，报 `profile_service_tier_unavailable`。
 - nxbridge 推荐的模型在你的模型服务里用不了时，报告宿主给出的原因，不改用别的模型。可以新建时指定别的模型，或把 `profile_source` 改成 `host`。
 - `status`、`doctor` 和 `config get` / `config list` 按项显示实际值和来源：nxbridge 推荐、nxbridge 配置、此搭档单独指定、宿主配置、冻结。
@@ -488,7 +488,7 @@ nxbridge setup --clear-claude-command
 **修改已有的后台搭档：**
 
 ```sh
-nxbridge partner-profile codex --model <模型> --effort <推理强度> --service-tier <standard|fast|flex>
+nxbridge partner-profile codex --model <模型> --effort <推理强度> --service-tier <standard|fast>
 nxbridge partner-profile claude --effort high
 nxbridge partner-profile codex --reset
 ```
@@ -793,7 +793,7 @@ max_references = 1024
 | `hosts.{codex,claude}.command / binary / home` | 启动命令、程序路径、配置目录 | 敏感 |
 | `hosts.codex.endpoint / auth_token_env` | 现有 App Server 地址；认证 token 所在的环境变量名（只存名字，不存值） | 敏感 |
 | `partners.{codex,claude}.model / effort` | 新建后台搭档用的模型和推理强度，写明时优先于 `profile_source` 的默认值 | 敏感 |
-| `partners.codex.service_tier` | 新建后台 Codex 用的服务档位：`standard`、`fast` 或 `flex`，写明时优先于 `profile_source` 的默认值 | 敏感 |
+| `partners.codex.service_tier` | 新建后台 Codex 用的服务档位：`standard` 或 `fast`，写明时优先于 `profile_source` 的默认值 | 敏感 |
 | `partners.{codex,claude}.profile_source` | `recommended`（默认）用 nxbridge 推荐的值；`host` 遵循宿主自己的配置；`frozen` 记下下一个新建搭档实际用的值，以后新建都沿用 | 敏感 |
 | `hosts.claude.sdk_user_prompt` | 默认 `false`。设为 `true` 时，经 Claude SDK 提交、又不来自 Claude 桌面端或 VS Code 的主会话输入（例如 Paseo 这类自带界面的工具）也算本人输入，用于 nxbridge 的新工作阶段、解除中断，以及用户活动和空闲判断。Claude 本身照常处理这些输入，与这个设置无关。每次遇到这类输入时重新读取配置，改完从下一条输入起生效。配置确认、开关和配对仍只认原有的本人来源，被拒时提示改用系统终端的 `nxbridge` 命令。打开后，脚本或工具通过 SDK 运行的 Claude（如 `claude -p`）发出的输入也会算作本人输入 | 敏感 |
 

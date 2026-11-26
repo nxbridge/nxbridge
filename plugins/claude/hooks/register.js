@@ -107,7 +107,11 @@ const profileHeldText = view => !view?.delivery_held || !profileWanted(view) ? u
   : view.status === 'pending' ? `后台 Codex 正在换成${profileWanted(view)}，换好后再收新消息（一直停在这里时运行 nxbridge partner-profile codex --reset）`
   : view.status === 'applied' ? `后台 Codex 正在重新核对${profileWanted(view)}是否仍然生效，核对完再收新消息（一直停在这里时运行 nxbridge partner-profile codex --reset）`
   : `后台 Codex 换成${profileWanted(view)}的结果不明，新消息先不发给它（运行 nxbridge partner-profile codex --reset 放弃这次修改）`;
-const pausedText = partner => partner?.pause_reason === 'restart_incomplete' ? '后台 Codex 的重启没有完整完成，已暂停投递，消息已保留（运行 nxbridge status 查看）'
+                                                                  
+const restartPauseText = detail => detail?.code === 'service_tier_mismatch' ? '后台 Codex 重启后服务档位和原来对不上' + (detail.saved !== undefined || detail.live !== undefined ? '（原来 ' + (detail.saved ?? '未指定') + '，现在 ' + (detail.live ?? '未指定') + '）' : '') + '，为免改用别的档位已暂停投递，消息已保留（运行 nxbridge status 查看）'
+  : detail?.code === 'service_tier_unverified' ? '后台 Codex 重启后没能确认服务档位和原来一致，为免改用别的档位已暂停投递，消息已保留（运行 nxbridge status 查看）'
+  : '后台 Codex 的重启没有完整完成，已暂停投递，消息已保留（运行 nxbridge status 查看）';
+const pausedText = partner => partner?.pause_reason === 'restart_incomplete' ? restartPauseText(partner.pause_detail)
   : partner?.pause_reason === 'interrupted' && partner.owner === 'nxbridge' ? '后台 Codex 这一轮被中断了，消息在等待（运行 nxbridge status 查看）'
   : partner?.pause_reason === 'interrupted' || partner?.owner === undefined ? 'Codex 窗口被你中断了，消息在等待（在该窗口继续后送达）'
   : partner.owner === 'nxbridge' ? '后台 Codex 已暂停，消息已保留（运行 nxbridge status 查看原因）'

@@ -5,6 +5,7 @@ import { storageError, type StoragePhase } from '../../storage/storage-errors.js
 export const errors:Record<string,string>={
   shared_runtime:'runtime also hosts another Codex root session; restart refused; nothing stopped; tell user',
   subagent_active:'own subagent thread(s) still running on this runtime; restart refused; nothing stopped; retry once after they finish; no loop',
+  subagent_control_unverified:'subagent workload check unconfirmed; runtime preserved; retry after native child unload; no loop',
   storage_busy:'nxbridge storage busy; retry only when uncertain=false and phase=prepare|enqueue; otherwise check delivery before retry',
   member_disabled:'nxbridge is off for this member; nothing sent or started; pair + queued msgs kept. Human re-enables from either window: Claude /nxbridge on <host>, Codex nxbridge on <host>; independent terminal nxbridge on <host> --member <id>',
   member_enable_human_required:'only human input can enable either side: Claude /nxbridge on [codex|claude|self], Codex nxbridge on [codex|claude|self], or independent terminal nxbridge on <host> --member <id>',

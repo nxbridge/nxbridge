@@ -46,4 +46,14 @@ test('POSIX 隔离后台可保留已配置的 MCP，分离的工具仍在运行�
   await stopOwnedProcess(tool);
   await assertRuntimeWorkloadIdle({native,owners,infrastructure});
   assert.equal(await ownedProcessState(mcp),'alive');
+                          
+  let inspected=false;
+  await assertRuntimeWorkloadIdle({native,owners,infrastructure:async candidate=>{
+    assert.equal(candidate.pid,mcp.pid);
+    inspected=true;
+    await stopOwnedProcess(mcp);
+    return false;
+  }});
+  assert.equal(inspected,true);
+  assert.equal(await ownedProcessState(native),'alive');
 });

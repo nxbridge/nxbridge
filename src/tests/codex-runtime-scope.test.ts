@@ -2,11 +2,15 @@ import test, {type TestContext} from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import {writeFileSync} from 'node:fs';
-import {assertCodexRuntimeScope} from '../hosts/codex/codex-restart.js';
+import {randomUUID} from 'node:crypto';
+import {assertCodexRuntimeScope, forgetAbsentChildControls, probeCodexChildWork} from '../hosts/codex/codex-restart.js';
 import {CodexAdapter, type CodexThread} from '../hosts/codex/adapter.js';
-import {RpcClient} from '../ipc/rpc.js';
+import {removeManagedRuntime, runtimeFor, saveManagedRuntime, type ManagedRuntime} from '../hosts/managed-runtimes.js';
+import {managedMarker} from '../install/installation.js';
+import {RpcClient, type RpcMessage} from '../ipc/rpc.js';
 import {processIdentity} from '../process/process.js';
 import {BridgeError} from '../shared/errors.js';
+import {atomicJson,readJson} from '../shared/files.js';
 import {DEFAULT_CONFIG,DEFAULT_RETENTION} from '../config/defaults.js';
 import {type Endpoint,type Peer} from '../types.js';
 import {modelError} from '../integration/mcp/model-output.js';
@@ -16,11 +20,16 @@ import { temporary } from './support/temporary.js';
 
 function native(t:TestContext,values:CodexThread[],loaded=values.map(thread=>thread.id)){
   const threads=new Map(values.map(thread=>[thread.id,thread])),queue=new Map<string,unknown[]>(),terminals=new Map<string,unknown[]>(),calls:string[]=[];
+  let silent:string|undefined;
+  let terminalReply:Pick<RpcMessage,'result'|'error'>|undefined;
   const rpc=new RpcClient(message=>{
     calls.push(message.method!);const id=message.params?.threadId,thread=threads.get(id);
+    if(message.method===silent)return;
+    if(message.method==='thread/backgroundTerminals/list'&&terminalReply){queueMicrotask(()=>rpc.receive({id:message.id,...terminalReply}));return;}
     let result:unknown;
     switch(message.method){
       case'thread/loaded/list':result={data:loaded};break;
+      case'thread/list':result={data:values};break;
       case'thread/read':result={thread};break;
       case'thread/turns/list':if(thread?.ephemeral){queueMicrotask(()=>rpc.receive({id:message.id,error:{code:-32600,message:'ephemeral threads do not support thread/turns/list'}}));return;}result={data:[...(thread?.turns??[])].reverse()};break;
       case'thread/queue/list':result={data:queue.get(id)??[]};break;
@@ -28,16 +37,23 @@ function native(t:TestContext,values:CodexThread[],loaded=values.map(thread=>thr
       default:assert.fail('不应调用原生变更：'+message.method);
     }
     queueMicrotask(()=>rpc.receive({id:message.id,result}));
-  },()=>{});t.after(()=>rpc.close());return{rpc,threads,queue,terminals,calls};
+  },()=>{});t.after(()=>rpc.close());
+  const home=temporary(t),runtime:ManagedRuntime={id:randomUUID(),peerId:'member',owner:managedMarker(home),kind:'owned',state:'ready',endpoint:'private',pid:1,procStart:'native-1',createdAt:1};
+  saveManagedRuntime(home,runtime);
+  const scope=(generation=runtime)=>assertCodexRuntimeScope(rpc,'root',{
+    observed:ids=>forgetAbsentChildControls(home,generation,id=>ids.has(id)),
+    probe:id=>probeCodexChildWork(home,generation,id,async()=>loaded.includes(id),(method,beforeSend)=>rpc.request(method,{threadId:id,limit:1},{timeout:20,beforeSend}),()=>{}),
+  });
+  return{rpc,home,runtime,threads,queue,terminals,calls,scope,silence:(method?:string)=>{silent=method;},replyTerminals:(reply:typeof terminalReply)=>{terminalReply=reply;}};
 }
 const child=(id:string,parent='root',status='idle'):CodexThread=>({id,cwd:'/project',parentThreadId:parent,status:{type:status}});
 
 test('原生父链覆盖嵌套子代理及未加载的中间父线程，全部核验只读',async t=>{
   const f=native(t,[child('parent'),child('grandchild','parent'),child('old','root','notLoaded')],['root','grandchild','old']);
-  await assertCodexRuntimeScope(f.rpc,'root');
-  assert.ok(f.calls.includes('thread/backgroundTerminals/list'));assert.ok(f.calls.every(method=>/^(thread\/(loaded\/list|read|turns\/list|queue\/list|backgroundTerminals\/list))$/.test(method)));
+  await f.scope();
+  assert.ok(f.calls.includes('thread/backgroundTerminals/list'));assert.ok(f.calls.every(method=>/^(thread\/(loaded\/list|list|read|turns\/list|queue\/list|backgroundTerminals\/list))$/.test(method)));
   f.threads.get('grandchild')!.status={type:'active'};
-  await assert.rejects(assertCodexRuntimeScope(f.rpc,'root'),{code:'subagent_active'});
+  await assert.rejects(f.scope(),{code:'subagent_active'});
 });
 
 for(const [name,thread,code] of [
@@ -50,24 +66,93 @@ for(const [name,thread,code] of [
   ['元数据空闲但轮次未结束',{...child('turn'),turns:[{id:'in-progress',status:'inProgress'}]},'subagent_active'],
   ['状态未知的子代理',{...child('unknown'),status:undefined},'subagent_active'],
 ] satisfies [string,CodexThread,string][])test('宿主范围不放行'+name,async t=>{
-  const f=native(t,[thread]);await assert.rejects(assertCodexRuntimeScope(f.rpc,'root'),{code});
+  const f=native(t,[thread]);await assert.rejects(f.scope(),{code});
 });
 
 test('自有临时子代理只在原生状态空闲且没有排队和后台任务时允许停止',async t=>{
-  const thread={...child('ephemeral-child'),ephemeral:true},f=native(t,[thread]);await assertCodexRuntimeScope(f.rpc,'root');
+  const thread={...child('ephemeral-child'),ephemeral:true},f=native(t,[thread]);await f.scope();
   assert.equal(f.calls.includes('thread/turns/list'),false);
-  thread.status={type:'active'};await assert.rejects(assertCodexRuntimeScope(f.rpc,'root'),{code:'subagent_active'});
-  thread.status={type:'idle'};f.queue.set(thread.id,[{id:'queued'}]);await assert.rejects(assertCodexRuntimeScope(f.rpc,'root'),{code:'delivery_unsettled'});
+  thread.status={type:'active'};await assert.rejects(f.scope(),{code:'subagent_active'});
+  thread.status={type:'idle'};f.queue.set(thread.id,[{id:'queued'}]);await assert.rejects(f.scope(),{code:'delivery_unsettled'});
 });
 
 test('子代理排队、后台终端和未落盘末轮分别阻止停止，不清除原生工作',async t=>{
   const f=native(t,[child('child')]);
-  f.queue.set('child',[{id:'queued'}]);await assert.rejects(assertCodexRuntimeScope(f.rpc,'root'),{code:'delivery_unsettled'});
-  f.queue.clear();f.terminals.set('child',[{processId:'still-running'}]);await assert.rejects(assertCodexRuntimeScope(f.rpc,'root'),{code:'session_busy'});
+  f.queue.set('child',[{id:'queued'}]);await assert.rejects(f.scope(),{code:'delivery_unsettled'});
+  f.queue.clear();f.terminals.set('child',[{processId:'still-running'}]);await assert.rejects(f.scope(),{code:'session_busy'});
   f.terminals.clear();const thread=f.threads.get('child')!;thread.turns=[{id:'last-child-turn',status:'completed'}];
-  await assert.rejects(assertCodexRuntimeScope(f.rpc,'root'),{code:'history_not_persisted'});
+  await assert.rejects(f.scope(),{code:'history_not_persisted'});
   thread.path=path.join(temporary(t),'child.jsonl');writeFileSync(thread.path,JSON.stringify({type:'event_msg',payload:{type:'task_complete',turn_id:'last-child-turn'}})+'\n','utf8');
-  await assertCodexRuntimeScope(f.rpc,'root');
+  await f.scope();
+});
+
+test('无子线程订阅时只用全局目录和加载列表，原生确认卸载后才放行',async t=>{
+  const loaded=['root','child'],f=native(t,[child('child')],loaded);
+  await assert.rejects(assertCodexRuntimeScope(f.rpc,'root'),{code:'subagent_active'});
+  assert.ok(f.calls.every(method=>method==='thread/list'||method==='thread/loaded/list'));
+  loaded.pop();await assertCodexRuntimeScope(f.rpc,'root');
+});
+
+test('子代理工作探针超时后，反复核验不再提交控制请求，原生卸载后清除预约',async t=>{
+  const loaded=['root','child'],f=native(t,[child('child')],loaded);
+  f.silence('thread/backgroundTerminals/list');let stopped=0;
+  const stop=async()=>{await f.scope();stopped++;};
+  await assert.rejects(stop(),{code:'subagent_control_unverified'});
+  assert.ok(runtimeFor(f.home,{id:f.runtime.id})?.value.childControlChecks?.pending.child);
+  const calls=f.calls.length;
+  await assert.rejects(stop(),{code:'subagent_control_unverified'});
+  assert.ok(f.calls.slice(calls).every(method=>['thread/loaded/list','thread/list','thread/turns/list'].includes(method)));
+  assert.equal(stopped,0);
+  loaded.pop();await stop();assert.equal(stopped,1);
+  assert.equal(runtimeFor(f.home,{id:f.runtime.id})?.value.childControlChecks,undefined);
+});
+
+test('收到明确的子代理忙碌回执会清除预约，旧代次不能更新新宿主记录',async t=>{
+  const f=native(t,[child('child')]);
+  f.terminals.set('child',[{processId:'running'}]);
+  await assert.rejects(f.scope(),{code:'session_busy'});
+  assert.equal(runtimeFor(f.home,{id:f.runtime.id})?.value.childControlChecks,undefined);
+  f.terminals.clear();f.silence('thread/queue/list');
+  await assert.rejects(f.scope(),{code:'subagent_control_unverified'});
+  const replacement={...runtimeFor(f.home,{id:f.runtime.id})!.value,procStart:'native-2'};
+  saveManagedRuntime(f.home,replacement);
+  assert.throws(()=>forgetAbsentChildControls(f.home,f.runtime,()=>false),{code:'runtime_changed'});
+  f.silence();await f.scope(replacement);
+  assert.equal(runtimeFor(f.home,{id:f.runtime.id})?.value.childControlChecks,undefined);
+});
+
+for(const [label,reply] of [
+  ['缺少有效列表',{result:{data:{}}}],
+  ['分页不完整',{result:{data:[],nextCursor:'more'}}],
+  ['游标无效',{result:{data:[],nextCursor:12}}],
+  ['原生方法不可用',{error:{code:-32601,message:'Method not found'}}],
+  ['原生错误',{error:{code:-32600,message:'Thread not found'}}],
+] satisfies [string,Pick<RpcMessage,'result'|'error'>][])test('子代理回执'+label+'时保留预约，重复核验只使用独立证据',async t=>{
+  const f=native(t,[child('child')]);
+  f.replyTerminals(reply);
+  await assert.rejects(f.scope(),{code:'subagent_control_unverified'});
+  assert.ok(runtimeFor(f.home,{id:f.runtime.id})?.value.childControlChecks?.pending.child);
+  const count=f.calls.length;
+  f.replyTerminals(undefined);
+  await assert.rejects(f.scope(),{code:'subagent_control_unverified'});
+  assert.ok(f.calls.slice(count).every(method=>['thread/loaded/list','thread/list','thread/turns/list'].includes(method)));
+});
+
+test('旧版托管记录保留未确认子代理探针，完整加载列表确认卸载后清除',async t=>{
+  const loaded=['root','child'],f=native(t,[child('child')],loaded);
+  removeManagedRuntime(runtimeFor(f.home,{id:f.runtime.id})!);
+  const file=path.join(f.home,'run','codex-runtime.json'),raw={peerId:f.runtime.peerId,endpoint:f.runtime.endpoint,pid:f.runtime.pid,procStart:f.runtime.procStart,createdAt:f.runtime.createdAt};
+  atomicJson(file,raw);
+  const legacy=runtimeFor(f.home,{id:'legacy'})!.value;
+  await f.scope(legacy);
+  f.silence('thread/queue/list');
+  await assert.rejects(f.scope(legacy),{code:'subagent_control_unverified'});
+  assert.ok(runtimeFor(f.home,{id:'legacy'})?.value.childControlChecks?.pending.child);
+  const count=f.calls.length;
+  await assert.rejects(f.scope(runtimeFor(f.home,{id:'legacy'})!.value),{code:'subagent_control_unverified'});
+  assert.ok(f.calls.slice(count).every(method=>['thread/loaded/list','thread/list','thread/turns/list'].includes(method)));
+  loaded.pop();await f.scope(legacy);
+  assert.deepEqual(readJson(file),raw);
 });
 
 function bridge(t:TestContext){
@@ -138,8 +223,10 @@ test('升级刷新停用未加载子代理，原生结束通知和再次启动�
   const identity=await processIdentity(process.pid);
   for(const peer of [f.first,f.second])for(const endpoint of f.store.endpoints(peer.id))f.store.saveEndpoint({...endpoint,procStart:identity.startedAt});
   f.store.updatePeer(f.first.id,{state:'paused'});
-  f.codex.observe=async(peer,endpoint)=>{observed.push(peer.id);f.codex.emit('register',registration('codex',peer.sessionId!,{kind:'subagent',parentId:peer.parentId??undefined,state:'offline',endpoint}),peer.id);};
-  await f.broker.start();assert.ok(observed.includes(f.first.id));assert.equal(f.store.endpoint(f.first.id),undefined);assert.ok(f.store.endpoint(f.x.id));
+  let observedFirst!:()=>void;
+  const observedTarget=new Promise<void>(resolve=>observedFirst=resolve);
+  f.codex.observe=async(peer,endpoint)=>{observed.push(peer.id);f.codex.emit('register',registration('codex',peer.sessionId!,{kind:'subagent',parentId:peer.parentId??undefined,state:'offline',endpoint}),peer.id);if(peer.id===f.first.id)observedFirst();};
+  await f.broker.start();await observedTarget;assert.ok(observed.includes(f.first.id));assert.equal(f.store.endpoint(f.first.id),undefined);assert.ok(f.store.endpoint(f.x.id));
   const adapter=new CodexAdapter(DEFAULT_CONFIG,temporary(t));t.after(()=>adapter.close());
   adapter.on('state',(sessionId,state,address)=>f.codex.emit('state',sessionId,state,address));
   f.store.register(registration('codex','child',{kind:'subagent',parentId:'x',endpoint:{...f.endpoint,epoch:'child'}}));

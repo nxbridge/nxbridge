@@ -1,32 +1,39 @@
 import {createReadStream,existsSync} from 'node:fs';
+import {randomUUID} from 'node:crypto';
 import { createInterface } from 'node:readline';
-import { readSessionProfile, resumeSession, snapshotLiveSession, type SessionPolicy, type SessionProfile } from './codex-session-profile.js';
-import {BridgeError,describeError} from '../../shared/errors.js';
+import { planCodexResume, readSessionProfile, resumeSession, snapshotLiveSession, verifyRestartProfileCurrent, type SessionPolicy, type SessionProfile } from './codex-session-profile.js';
+import {BridgeError,RuntimeRecoveryHold,describeError} from '../../shared/errors.js';
 import {type Endpoint,type Peer} from '../../types.js';
 import {readJson} from '../../shared/files.js';
 import {removeOwnedSocket} from '../../ipc/home.js';
-import { liveProcess, processIdentity, type ProcessIdentity } from '../../process/process.js';
+import type { ProcessIdentity } from '../../process/process.js';
 import type { RpcClient } from '../../ipc/rpc.js';
-import { readCodexThread } from './codex-evidence.js';
-import { ownedProcessState, stopOwnedProcess } from '../../process/process-stop.js';
+import { catalogCodexThreads, readCodexThread } from './codex-evidence.js';
+import { stopOwnedProcess } from '../../process/process-stop.js';
 import { retireDeadOwnedProcess, ownedProcesses, ownedRecordState, releaseOwnedProcess, type OwnedProcessRecord } from '../../process/owned-processes.js';
-import { runtimeFor, removeManagedRuntime, saveManagedRuntime, type ManagedRuntime } from '../managed-runtimes.js';
+import { runtimeFor, removeManagedRuntime, saveManagedRuntime, writeExistingRuntime, type ManagedRuntime, type RuntimeRecord } from '../managed-runtimes.js';
 import { assertRuntimeWorkloadIdle, configuredMcpInfrastructure, mcpCommands, nxbridgeMcpCommands, nxbridgeRuntimeInfrastructure } from '../../process/runtime-workload.js';
 import type { TargetSelector } from '../../broker/pairing/admin-target.js';
-import { verifyDedicatedCodex } from './codex-isolation.js';
+import { verifyCodexNativeGeneration, verifyDedicatedCodex } from './codex-isolation.js';
 import { codexThreadIdle } from './codex-thread-state.js';
 import { codexParent, codexSubagent } from './codex-lineage.js';
 import type { CodexThread } from './adapter.js';
 import { completeRestartProfile, prepareRestartProfile } from './codex-restart-profile.js';
+import type { CodexServiceTierError } from './codex-service-tier.js';
 
 export interface CodexRestartResult {endpoint:string;oldPid:number;pid:number;resumed:any;notes?:string[]}
 export interface RestartSelector extends TargetSelector {partner?:true}
+export type CodexChildWorkMethod='thread/queue/list'|'thread/backgroundTerminals/list';
+export interface CodexChildWorkPage {data:unknown[];nextCursor?:string|null}
 interface Runtime {endpoint:string;pid:number;procStart?:string}
 interface CodexStopOptions {
   peer:Peer;endpoint:Endpoint;home:string;connect:(address:string)=>Promise<RpcClient>;guard:()=>void;
   profile?:SessionProfile;inspect?:(address:string)=>Promise<RpcClient>;verifyDelivery?:(thread:any)=>Promise<void>;observeThread?:(thread:any)=>void;onStopped?:()=>void;
+  acquire?: (rpc:RpcClient,runtime:ManagedRuntime)=>Promise<SessionProfile>;
   borrowLostSocket?:(saved:ManagedRuntime,native:ProcessIdentity)=>Promise<RpcClient>;
   beforeStop?:()=>void|Promise<void>;
+  restoring?:boolean;
+  childControl?:(rpc:RpcClient,method:CodexChildWorkMethod,id:string,beforeSend:()=>void)=>Promise<CodexChildWorkPage>;
 }
 
 function runtimeOwners(home:string,saved:ManagedRuntime):OwnedProcessRecord[]{
@@ -52,21 +59,50 @@ function idle(thread:any,allowUnloaded=false):void{
   if(!codexThreadIdle(thread)&&!(allowUnloaded&&thread.status?.type==='notLoaded'&&!thread.status.activeFlags?.length&&!thread.turns?.some((turn:any)=>turn.status==='inProgress')))throw new BridgeError('session_busy','目标仍在运行或等待输入/审批，未执行重启；请在空闲后重试。');
 }
 
-                                      
-export async function assertCodexRuntimeScope(rpc:RpcClient,id:string):Promise<void>{
-  const loaded=new Set<string>(),threads=new Map<string,CodexThread>();let cursor:string|undefined;
-  const unverified=()=>new BridgeError('restart_verification_failed','无法完整核验宿主子线程的身份或状态，未执行重启。');
+                                        
+export async function loadedCodexThreads(rpc:RpcClient):Promise<Set<string>>{
+  const loaded=new Set<string>(),cursors=new Set<string>(),deadline=performance.now()+5000;
+  let cursor:string|undefined;
+  const unverified=()=>new BridgeError('restart_verification_failed','没能完整读取 Codex 正在加载的会话列表。');
   for(let pageIndex=0;pageIndex<10;pageIndex++){
-    const page=await rpc.request('thread/loaded/list',{limit:100,...(cursor?{cursor}:{})});
+    const remaining=Math.ceil(deadline-performance.now());
+    if(remaining<=0)throw unverified();
+    const page=await rpc.request('thread/loaded/list',{limit:100,...(cursor?{cursor}:{})},{timeout:remaining});
     if(!Array.isArray(page.data))throw unverified();
     for(const value of page.data){const threadId=typeof value==='string'?value:value?.id;if(typeof threadId!=='string'||!threadId)throw unverified();loaded.add(threadId);}
-    cursor=page.nextCursor??undefined;if(!cursor)break;
+    if(page.nextCursor==null)return loaded;
+    if(typeof page.nextCursor!=='string'||!page.nextCursor||cursors.has(page.nextCursor))throw unverified();
+    cursor=page.nextCursor;cursors.add(cursor!);
   }
-  if(cursor)throw unverified();
-                                          
-  const read=async(threadId:string)=>{let thread=threads.get(threadId);if(!thread){const result=await rpc.request('thread/read',{threadId,includeTurns:false});if(result.thread?.id!==threadId)throw unverified();thread=result.thread as CodexThread;threads.set(threadId,thread);}return thread;};
+  throw unverified();
+}
+
+                               
+export function confirmCodexThreadAbsent(rpc:RpcClient,id:string):void{
+  if(!rpc.closed)(rpc as RpcClient&{confirmThreadAbsent?:(id:string)=>void}).confirmThreadAbsent?.(id);
+}
+
+export async function codexThreadLoaded(rpc:RpcClient,id:string):Promise<boolean>{
+  if((await loadedCodexThreads(rpc)).has(id))return true;
+  confirmCodexThreadAbsent(rpc,id);return false;
+}
+
+                                      
+export async function assertCodexRuntimeScope(rpc:RpcClient,id:string,options:{inspectOnly?:boolean;probe?:(id:string)=>Promise<void>;observed?:(ids:ReadonlySet<string>)=>void}={}):Promise<void>{
+  const loaded=await loadedCodexThreads(rpc);if(!loaded.delete(id))confirmCodexThreadAbsent(rpc,id);
+  options.observed?.(loaded);
+  const threads=await catalogCodexThreads(rpc,loaded);
+  const unverified=()=>new BridgeError('restart_verification_failed','没能确认 Codex 子任务的身份或状态，未执行重启。');
+  const read=async(threadId:string)=>{
+    let thread=threads.get(threadId);
+    if(!thread){
+      thread=(await catalogCodexThreads(rpc,new Set([threadId]))).get(threadId);
+      if(!thread||thread.id!==threadId)throw unverified();
+      threads.set(threadId,thread);
+    }
+    return thread;
+  };
   for(const threadId of loaded){
-    if(threadId===id)continue;
     const metadata=await read(threadId),seen=new Set<string>();let current=metadata,verified=false;
     for(let depth=0;depth<64;depth++){
       if(seen.has(current.id))throw unverified();seen.add(current.id);
@@ -75,11 +111,76 @@ export async function assertCodexRuntimeScope(rpc:RpcClient,id:string):Promise<v
       if(parent===id){verified=true;break;}current=await read(parent);
     }
     if(!verified)throw unverified();
-    const thread=metadata.ephemeral?metadata:await readCodexThread(rpc,threadId);
-    if(!codexThreadIdle(thread)&&!(thread.status?.type==='notLoaded'&&!thread.status.activeFlags?.length&&!thread.turns?.some(turn=>turn.status==='inProgress')))
+    if(!codexThreadIdle(metadata)&&!(metadata.status?.type==='notLoaded'&&!metadata.status.activeFlags?.length))
       throw new BridgeError('subagent_active','Codex 还有子代理在运行，未执行重启；等它们结束后再试一次。');
-    await assertNoPendingCodexWork(rpc,threadId,{allowUnloaded:thread.status?.type==='notLoaded'});
-    if(!thread.ephemeral&&thread.turns?.length)await durable(thread);
+    if(options.inspectOnly)continue;
+    if(!options.probe){
+      if(!await codexThreadLoaded(rpc,threadId))continue;
+      throw new BridgeError('subagent_active','Codex 子代理尚未卸载，暂不能核验其后台工作已结束；稍后再试。');
+    }
+    if(!metadata.ephemeral){
+      const page=await rpc.request('thread/turns/list',{threadId,limit:1,sortDirection:'desc',itemsView:'summary'},{timeout:3000});
+      if(!Array.isArray(page.data))throw unverified();
+      const latest=page.data[0];
+      if(latest?.status==='inProgress')throw new BridgeError('subagent_active','Codex 子代理的轮次尚未结束，未执行重启。');
+      if(latest)await durable({...metadata,turns:[latest]});
+    }
+    await options.probe(threadId);
+  }
+}
+
+function currentChildControls(home:string,runtime:ManagedRuntime):RuntimeRecord{
+  const record=runtimeFor(home,{id:runtime.id,endpoint:runtime.endpoint});
+  if(record){
+    const current=record.value;
+    if(current.kind===runtime.kind&&current.state!=='failed'&&current.owner===runtime.owner&&current.peerId===runtime.peerId&&current.pid&&current.procStart
+      &&current.pid===runtime.pid&&current.procStart===runtime.procStart)return record;
+  }
+  throw new BridgeError('runtime_changed','核验子代理时原生进程代次或归属已改变。');
+}
+
+                                   
+export function forgetAbsentChildControls(home:string,runtime:ManagedRuntime,present:(id:string)=>boolean):void{
+  const record=currentChildControls(home,runtime),current=record.value,checks=current.childControlChecks;
+  if(!checks||checks.pid!==current.pid||checks.procStart!==current.procStart)return;
+  const pending=Object.fromEntries(Object.entries(checks.pending).filter(([id])=>present(id)));
+  if(Object.keys(checks.pending).length===Object.keys(pending).length)return;
+  if(Object.keys(pending).length)checks.pending=pending;else delete current.childControlChecks;
+  writeExistingRuntime(record);
+}
+
+                                     
+export async function probeCodexChildWork(home:string,runtime:ManagedRuntime,id:string,loaded:()=>Promise<boolean>,read:(method:CodexChildWorkMethod,beforeSend:()=>void)=>Promise<CodexChildWorkPage>,guard:()=>void):Promise<void>{
+  const hold=()=>new BridgeError('subagent_control_unverified','此子代理的原生工作核验未确认。已保留原会话；等它实际卸载后再重试。');
+  for(const method of ['thread/queue/list','thread/backgroundTerminals/list'] as const){
+    if(!await loaded()){
+      forgetAbsentChildControls(home,runtime,value=>value!==id);return;
+    }
+    const token=randomUUID();let sent=false,confirmed=false;
+    try{
+      const result=await read(method,()=>{
+        guard();
+        const record=currentChildControls(home,runtime),current=record.value,saved=current.childControlChecks;
+        const pending=saved&&saved.pid===current.pid&&saved.procStart===current.procStart?saved.pending:{};
+        if(Object.hasOwn(pending,id))throw hold();
+        current.childControlChecks={pid:current.pid!,procStart:current.procStart!,pending:{...pending,[id]:token}};
+        writeExistingRuntime(record);sent=true;
+      });
+      if(!Array.isArray(result?.data)||result.nextCursor!=null)throw hold();
+      confirmed=true;
+      if(result.data.length)throw method==='thread/queue/list'
+        ?new BridgeError('delivery_unsettled','子代理还有排队输入，未执行重启。')
+        :new BridgeError('session_busy','子代理还有后台终端任务，未执行重启。');
+    }catch(error){
+                                          
+      if(!sent||confirmed)throw error;
+      throw hold();
+    }finally{
+      if(sent&&confirmed){
+        const {value:current}=currentChildControls(home,runtime);
+        if(current.childControlChecks?.pending[id]===token)forgetAbsentChildControls(home,current,value=>value!==id);
+      }
+    }
   }
 }
 
@@ -91,18 +192,15 @@ export async function assertNoPendingCodexWork(rpc:RpcClient,id:string,options:{
       throw error;
     }),
   ]);
-  if(queue.data?.length)throw new BridgeError('delivery_unsettled','原生线程还有排队输入，未执行重启；请先处理队列。');
+  if(!Array.isArray(queue.data)||!terminals.unloaded&&!Array.isArray(terminals.data))
+    throw new BridgeError('runtime_workload_unverified','Codex 没返回可核对的排队输入或终端列表。');
+  if(queue.data.length)throw new BridgeError('delivery_unsettled','Codex 会话里还有排着队的输入，未执行重启；请先让它处理完。');
   if(terminals.data?.length)throw new BridgeError('session_busy','目标还有后台终端任务，未执行重启；请先等待任务结束。');
   if(terminals.unloaded){
                                               
     const thread=(await rpc.request('thread/read',{threadId:id,includeTurns:false})).thread;
     if(thread?.id!==id||thread.status?.type!=='notLoaded'||thread.status.activeFlags?.length)throw new BridgeError('session_busy','线程已重新加载或状态无法核验，未停止运行时。');
-    let cursor:string|undefined;
-    do{
-      const page=await rpc.request('thread/loaded/list',{limit:100,...(cursor?{cursor}:{})});
-      if((page.data??[]).some((value:any)=>(typeof value==='string'?value:value.id)===id))throw new BridgeError('session_busy','线程在核验期间重新加载，未停止运行时。');
-      cursor=page.nextCursor??undefined;
-    }while(cursor);
+    if(await codexThreadLoaded(rpc,id))throw new BridgeError('session_busy','Codex 会话在核对期间又被加载了，这次没有停止它。');
   }
 }
 
@@ -122,19 +220,20 @@ async function durable(thread:any):Promise<void>{
 
 export async function restartCodexRuntime(options:CodexStopOptions&{
   start:()=>Promise<string>;onVerifying?:(runtimeId:string,endpoint:string)=>void;onPolicy?:(policy:SessionPolicy,runtimeId:string,endpoint:string)=>void;
+  restore:(rpc:RpcClient,id:string,profile:SessionProfile,runtime:ManagedRuntime)=>ReturnType<typeof resumeSession>;
 }):Promise<CodexRestartResult>{
-  const stopped=await stopCodexRuntime(options),id=options.peer.sessionId!;
+  const stopped=await stopCodexRuntime({...options,restoring:true}),id=options.peer.sessionId!;
   try{
     const address=await options.start(),fresh=await options.connect(address);
     const pending=runtimeFor(options.home,{endpoint:address});if(!pending)throw new BridgeError('runtime_missing','新运行时缺少启动记录。');
     if(!pending.value.sessionVerification){pending.value.sessionVerification={sessionId:id,profile:stopped.profile};saveManagedRuntime(options.home,pending.value);}
     options.onVerifying?.(pending.value.id,address);
-    const restored=await resumeSession(fresh,id,{profile:stopped.profile,home:options.endpoint.configHome,cwd:options.peer.cwd});
+    const restored=await options.restore(fresh,id,stopped.profile,pending.value);
     const runtime=runtimeFor(options.home,{endpoint:address});if(!runtime?.value.pid)throw new BridgeError('runtime_missing','新运行时缺少已核验的进程记录。');
     options.onPolicy?.(restored.policy,runtime.value.id,address);
     completeRestartProfile(options.home,runtime.value);delete runtime.value.sessionVerification;saveManagedRuntime(options.home,runtime.value);
     return{endpoint:address,oldPid:stopped.oldPid,pid:runtime.value.pid,resumed:restored.resumed,notes:stopped.notes};
-  }catch(error){throw new BridgeError('restart_incomplete',`旧托管进程已停止，但原会话 ${id} 未完整恢复；已暂停自动投递。原因：`+describeError(error));}
+  }catch(error){throw Object.assign(new BridgeError('restart_incomplete',`旧托管进程已停止，但原会话 ${id} 未完整恢复；已暂停自动投递。原因：`+describeError(error)),{pauseDetail:(error as Partial<CodexServiceTierError>|null)?.pauseDetail});}
 }
 
                                               
@@ -142,27 +241,34 @@ export async function stopCodexRuntime(options:CodexStopOptions):Promise<{oldPid
   const {peer,endpoint,home,connect,guard}=options,id=peer.sessionId!,record=runtimeFor(home,{endpoint:endpoint.address});
   if(!record)throw new BridgeError('unowned_runtime','没有 nxbridge 托管运行时记录，未执行重启；用户 daemon 或远程宿主需要原生重载。');
   const filename=record.file,saved=record.value;
-  if(!options.borrowLostSocket&&saved.pid&&saved.procStart&&await ownedProcessState({pid:saved.pid,startedAt:saved.procStart})==='alive')await verifyDedicatedCodex(saved.endpoint,await processIdentity(saved.pid));
   if(ownedProcesses(home).records.some(r=>r.releasedToUser&&(r.identity.pid===saved.pid||r.proof.launchId===saved.id||r.proof.launchId===saved.endpoint)))throw new BridgeError('shared_runtime','这个 App Server 还有你的窗口在用，nxbridge 不会重启它。请在对应的 Codex 窗口里退出后重新打开。');
   const verify=async()=>{
     const current=existsSync(filename)?readJson<ManagedRuntime>(filename):undefined;
-    if(!current||current.pid!==saved.pid||current.procStart!==saved.procStart||current.endpoint!==saved.endpoint
+    if(saved.endpoint!==endpoint.address||!current||current.pid!==saved.pid||current.procStart!==saved.procStart||current.endpoint!==saved.endpoint
       ||(options.beforeStop||options.borrowLostSocket)&&(current.id!==saved.id||current.owner!==saved.owner||current.peerId!==peer.id||current.sessionId&&current.sessionId!==id))
       throw new BridgeError('runtime_changed','运行时归属记录已经变化，未执行重启。');
-    if(saved.endpoint!==endpoint.address||!saved.pid||!saved.procStart||!liveProcess(saved.pid))throw new BridgeError('unowned_runtime','目标不是当前可核验的 nxbridge 托管进程，未执行重启。');
-    const identity=await processIdentity(saved.pid);
-    if(identity.startedAt!==saved.procStart||!/^codex(?:\.exe)?$/i.test(identity.name))throw new BridgeError('unowned_runtime','无法核验托管 App Server 的进程代次，未执行重启。');
-    return identity;
+    return verifyCodexNativeGeneration(saved);
   };
   const originalNative=await verify();
+  if(!options.borrowLostSocket)await verifyDedicatedCodex(saved.endpoint,originalNative);
   const rpc=options.borrowLostSocket?await options.borrowLostSocket(saved,originalNative):await(options.inspect??connect)(endpoint.address);
   try{
   const inspectThread=(thread:any,allowUnloaded=false)=>{options.observeThread?.(thread);idle(thread,allowUnloaded);};
-  await assertCodexRuntimeScope(rpc,id);
-                                                  
+  if(options.acquire&&await codexThreadLoaded(rpc,id))throw new RuntimeRecoveryHold('owned_subscription_waiting','要等后台 Codex 这个会话闲下来、被 Codex 卸载后，才能完成迁移前的核对；消息已保留。');
+  await assertCodexRuntimeScope(rpc,id,{inspectOnly:!!options.childControl,observed:loaded=>forgetAbsentChildControls(home,saved,threadId=>loaded.has(threadId))});
+                                  
+  const acquired=await options.acquire?.(rpc,saved);
   const live={thread:await readCodexThread(rpc,id)};inspectThread(live.thread,true);await durable(live.thread);
-  const profile=options.profile??(codexThreadIdle(live.thread)?await snapshotLiveSession(rpc,id,live.thread.path!):await readSessionProfile(live.thread.path,id));
-  if(!profile.verified||!profile.complete)throw new BridgeError('profile_unavailable','无法核验原会话完整持久设置，未停止原运行时。');
+  let profile:SessionProfile;
+  try{
+    profile=options.profile??acquired??(codexThreadIdle(live.thread)?await snapshotLiveSession(rpc,id,live.thread.path!):await readSessionProfile(live.thread.path,id));
+    if(!profile.verified||!profile.complete)throw new BridgeError('profile_unavailable','无法核验原会话完整持久设置，未停止原运行时。');
+    if(options.restoring)planCodexResume(id,profile,peer.cwd,{exact:true});
+  }catch(error){
+    if(options.restoring&&error instanceof RuntimeRecoveryHold&&error.code==='owned_profile_unverified')
+      throw new RuntimeRecoveryHold(error.code,'无法确认后台 Codex 原来的模型、推理强度、服务档位和安全设置，为免换成别的设置，这次没有重启，原来的进程照常运行。');
+    throw error;
+  }
   const unloaded=live.thread.status?.type==='notLoaded';
   await verify();await assertNoPendingCodexWork(rpc,id,{allowUnloaded:unloaded});
   const verified=await readCodexThread(rpc,id);inspectThread(verified,true);
@@ -170,7 +276,9 @@ export async function stopCodexRuntime(options:CodexStopOptions):Promise<{oldPid
   if(options.verifyDelivery){await durable(verified);await options.verifyDelivery(verified);}guard();
   let stopSubmitted=false;
   try{
-    await assertCodexRuntimeScope(rpc,id);
+    await assertCodexRuntimeScope(rpc,id,{observed:loaded=>forgetAbsentChildControls(home,saved,threadId=>loaded.has(threadId)),
+      ...(options.childControl?{probe:(threadId:string)=>probeCodexChildWork(home,saved,threadId,()=>codexThreadLoaded(rpc,threadId),
+        (method,beforeSend)=>options.childControl!(rpc,method,threadId,beforeSend),guard)}:{})});
     inspectThread(await readCodexThread(rpc,id),true);
     let owners:OwnedProcessRecord[]|undefined;
     if(options.beforeStop||options.borrowLostSocket){
@@ -186,7 +294,9 @@ export async function stopCodexRuntime(options:CodexStopOptions):Promise<{oldPid
     }
     guard();
     const preserve=options.beforeStop||options.borrowLostSocket?prepareRestartProfile(home,saved,profile):undefined;
-    if(options.beforeStop){await options.beforeStop();guard();}
+    if(options.beforeStop)await options.beforeStop();
+    if(options.restoring)await verifyRestartProfileCurrent(profile);
+    if(options.restoring||options.beforeStop)guard();
     if(rpc.closed)throw new BridgeError('disconnected','原生连接在停止前断开，未停止原会话。');
     preserve?.();
     stopSubmitted=true;
