@@ -6,11 +6,65 @@ import {TurnHealthTracker} from '../broker/health/turn-health.js';
 import { CodexNativeRpc } from '../hosts/codex/codex-native-rpc.js';
 import { CodexOwnedRoutes, type OwnedCodexRoute } from '../hosts/codex/codex-owned-routes.js';
 import { RuntimeRecoveryHold } from '../shared/errors.js';
+import { CodexAdapter } from '../hosts/codex/adapter.js';
+import { DEFAULT_CONFIG } from '../config/defaults.js';
+import { temporary } from './support/temporary.js';
 
 function mockRpc(handle:(message:RpcMessage)=>unknown,endpoint?:string){
   const requests:RpcMessage[]=[];const rpc=new RpcClient(message=>{requests.push(message);queueMicrotask(()=>{try{rpc.receive({id:message.id,result:handle(message)});}catch(error){rpc.receive({id:message.id,error:error as any});}});},()=>{},endpoint);
   return{rpc,requests};
 }
+
+test('创建回执在正式登记前只允许初始化，核验完成后才能提交工作',async t=>{
+  const adapter=new CodexAdapter(DEFAULT_CONFIG,temporary(t)),routes=(adapter as any).ownedRoutes as CodexOwnedRoutes,calls:string[]=[];
+  const route={peer:{id:'member',host:'codex',owner:'nxbridge',sessionId:'new'},endpoint:{peerId:'member',mode:'app-server',address:'test://created',epoch:'created',runtimeId:'runtime',pid:123,procStart:'native',active:true}} as OwnedCodexRoute;
+  const runtime={id:'runtime',peerId:'member',endpoint:route.endpoint.address,pid:123,procStart:'native'};
+  let selected:OwnedCodexRoute|undefined;
+  routes.bind(()=>selected,()=>selected?.peer.sessionId??undefined);
+  const rpc=new CodexNativeRpc(message=>{calls.push(message.method!);queueMicrotask(()=>rpc.receive({id:message.id,result:{ok:true}}));},()=>{},route.endpoint.address);
+  t.after(()=>adapter.close());(adapter as any).clients.set(route.endpoint.address,rpc);
+  (adapter as any).installThreadGuard(rpc,route.endpoint.address,(id:string,method:string)=>(adapter as any).observationPermit(route.endpoint.address,id,rpc,(adapter as any).ownedNativeScope(runtime),method));
+  routes.created(route,rpc);
+  assert.equal((adapter as any).ownedNativeScope(runtime).root,'new');
+  await rpc.request('thread/settings/update',{threadId:'new'});await rpc.request('thread/name/set',{threadId:'new'});
+  await assert.rejects(rpc.request('turn/start',{threadId:'new'}),{code:'owned_subscription_waiting'});
+  selected={peer:{...route.peer},endpoint:{...route.endpoint,bindingEpoch:'registered'}};
+  assert.equal(routes.adoptCreation(selected,rpc),false);assert.equal(routes.permits(selected,rpc),false);
+  await assert.rejects(rpc.request('turn/start',{threadId:'new'}),{code:'owned_subscription_waiting'});
+  routes.creationReady(route,rpc);assert.equal(routes.adoptCreation(selected,rpc),true);
+  await rpc.request('turn/start',{threadId:'new'});
+  assert.deepEqual(calls,['thread/settings/update','thread/name/set','turn/start']);
+});
+
+test('创建回执不转移给其他连接、成员或原生代次，登记后也不能再次提升旧回执',t=>{
+  const routes=new CodexOwnedRoutes(),rpc=new RpcClient(()=>{},()=>{}),other=new RpcClient(()=>{},()=>{});t.after(()=>{rpc.close();other.close();});
+  const route={peer:{id:'member',host:'codex',owner:'nxbridge',sessionId:'new'},endpoint:{peerId:'member',mode:'app-server',address:'test://created',epoch:'created',runtimeId:'runtime',pid:123,procStart:'native',active:true}} as OwnedCodexRoute;
+  const runtime={id:'runtime',peerId:'member',pid:123,procStart:'native'};
+  routes.created(route,rpc);
+  assert.equal(routes.nativeRoot(route.endpoint.address,other,runtime),undefined);
+  assert.equal(routes.nativeRoot(route.endpoint.address,rpc,{...runtime,peerId:'other'}),undefined);
+  assert.equal(routes.nativeRoot(route.endpoint.address,rpc,{...runtime,procStart:'replaced'}),undefined);
+  assert.equal(routes.creationIdentity(route.endpoint.address,'other',rpc,runtime),undefined);
+  routes.creationReady(route,rpc);
+  assert.equal(routes.adoptCreation(route,other),false);
+  assert.equal(routes.adoptCreation({peer:{...route.peer,id:'other'},endpoint:{...route.endpoint,peerId:'other'}},rpc),false);
+  assert.equal(routes.adoptCreation({peer:route.peer,endpoint:{...route.endpoint,procStart:'replaced'}},rpc),false);
+  assert.equal(routes.adoptCreation(route,rpc),true);
+  assert.equal(routes.adoptCreation({peer:route.peer,endpoint:{...route.endpoint,bindingEpoch:'later'}},rpc),false);
+  routes.revoke(route.endpoint.address,'new',rpc);assert.equal(routes.permits(route,rpc),false);
+});
+
+test('外部后台的创建回执只授予当前连接的线程许可，不授予进程代次权限',t=>{
+  const routes=new CodexOwnedRoutes(),rpc=new RpcClient(()=>{},()=>{}),other=new RpcClient(()=>{},()=>{});t.after(()=>{rpc.close();other.close();});
+  const route={peer:{id:'member',host:'codex',owner:'nxbridge',sessionId:'external'},endpoint:{peerId:'member',mode:'app-server',address:'test://external',epoch:'external',active:true,pid:null,procStart:null}} as OwnedCodexRoute;
+  routes.creationReady(route,rpc);
+  assert.equal(routes.adoptCreation({...route,endpoint:{...route.endpoint,bindingEpoch:'registered'}},other),false);
+  const registered={...route,endpoint:{...route.endpoint,bindingEpoch:'registered'}};
+  assert.equal(routes.adoptCreation(registered,rpc),true);assert.equal(routes.permits(registered,rpc),true);
+  assert.equal(routes.permits(registered,other),false);
+  assert.equal(routes.nativeHolds(route.endpoint.address,'external',rpc,{id:'fabricated',pid:123,procStart:'native'}),false);
+  rpc.close();assert.equal(routes.permits(registered,rpc),false);
+});
 
 function delayedNative(){
   const sent:RpcMessage[]=[];let ready=false;

@@ -43,7 +43,7 @@ const routeKey = ({peer,endpoint}:OwnedCodexRoute) => {
   return JSON.stringify([peer.id,peer.owner,peer.sessionId,endpoint.address,endpoint.epoch,endpoint.bindingEpoch,endpoint.runtimeId,native.pid,native.procStart]);
 };
 
-interface Subscription {lease:OwnedCodexLease;rpc:RpcClient}
+interface Subscription {memberId:string;sessionId:string;address:string;lease?:OwnedCodexLease;rpc:RpcClient;state:'creating'|'created'|'subscribed'}
 interface Pending {key:string;work:Promise<unknown>}
 
                                                  
@@ -66,9 +66,49 @@ export class CodexOwnedRoutes {
   sessionId(id:string):string|undefined{return this.identity?.(id);}
 
   subscribed(route:OwnedCodexRoute,rpc:RpcClient):void{
+    this.remember(route,rpc,'subscribed');
+  }
+
+                                       
+  created(route:OwnedCodexRoute,rpc:RpcClient):void{
+    this.remember(route,rpc,'creating');
+  }
+
+  creationReady(route:OwnedCodexRoute,rpc:RpcClient):void{
+    this.remember(route,rpc,'created');
+  }
+
+  private remember(route:OwnedCodexRoute,rpc:RpcClient,state:Subscription['state']):void{
     const lease=ownedCodexLease(route);
-    if(!lease||rpc.closed)return;
-    this.subscriptions.set(routeKey(route),{lease,rpc});
+    if(!route.peer.sessionId||rpc.closed||route.endpoint.runtimeId&&!lease)return;
+    this.subscriptions.set(routeKey(route),{memberId:route.peer.id,sessionId:route.peer.sessionId,address:route.endpoint.address,lease,rpc,state});
+  }
+
+  adoptCreation(route:OwnedCodexRoute,rpc:RpcClient):boolean{
+    if(rpc.closed||!this.current(route))return false;
+    const native=ownedCodexLease(route);
+    for(const [key,receipt] of this.subscriptions){
+      if(receipt.state!=='created'||receipt.rpc!==rpc||receipt.memberId!==route.peer.id||receipt.sessionId!==route.peer.sessionId||receipt.address!==route.endpoint.address)continue;
+      if(receipt.lease?(!native||receipt.lease.runtimeId!==native.runtimeId||receipt.lease.pid!==native.pid||receipt.lease.procStart!==native.procStart):!!route.endpoint.runtimeId)continue;
+      this.subscriptions.delete(key);this.subscribed(route,rpc);return true;
+    }
+    return false;
+  }
+
+  nativeRoot(address:string,rpc:RpcClient,runtime:{id:string;peerId?:string;pid?:number;procStart?:string}):string|undefined{
+    if(rpc.closed)return;
+    return [...this.subscriptions.values()].find(({lease,rpc:owner,state})=>state!=='subscribed'&&owner===rpc&&lease&&lease.memberId===runtime.peerId
+      &&lease.address===address&&lease.runtimeId===runtime.id&&lease.pid===runtime.pid&&lease.procStart===runtime.procStart)?.sessionId;
+  }
+
+  creationIdentity(address:string,id:string,rpc:RpcClient,runtime?:{id:string;pid?:number;procStart?:string}):object|undefined{
+    if(rpc.closed)return;
+    const receipt=[...this.subscriptions.values()].find(entry=>entry.state==='creating'&&entry.rpc===rpc&&entry.address===address&&entry.sessionId===id
+      &&(runtime?entry.lease?.runtimeId===runtime.id&&entry.lease.pid===runtime.pid&&entry.lease.procStart===runtime.procStart:!entry.lease));
+    if(!receipt)return;
+    const selected=this.source?.(receipt.memberId),identity=this.identity?.(receipt.memberId);
+    if(identity&&identity!==id||selected&&(selected.peer.owner!=='nxbridge'||selected.peer.sessionId&&selected.peer.sessionId!==id))return;
+    return receipt;
   }
 
   permits(route:OwnedCodexRoute,rpc?:RpcClient):boolean{
@@ -78,11 +118,11 @@ export class CodexOwnedRoutes {
                                           
   leaseIdentity(route:OwnedCodexRoute,rpc?:RpcClient):object|undefined{
     const lease=this.subscriptions.get(routeKey(route));
-    return lease&&!lease.rpc.closed&&(!rpc||lease.rpc===rpc)&&this.current(route)?lease:undefined;
+    return lease&&lease.state!=='creating'&&!lease.rpc.closed&&(!rpc||lease.rpc===rpc)&&this.current(route)?lease:undefined;
   }
 
   nativeHolds(address:string,threadId:string,rpc:RpcClient,runtime:{id:string;pid?:number;procStart?:string}):boolean{
-    return !rpc.closed&&[...this.subscriptions.values()].some(({lease,rpc:owner})=>owner===rpc&&lease.address===address&&lease.sessionId===threadId
+    return !rpc.closed&&[...this.subscriptions.values()].some(({lease,rpc:owner,state})=>state!=='creating'&&owner===rpc&&lease?.address===address&&lease.sessionId===threadId
       &&lease.runtimeId===runtime.id&&lease.pid===runtime.pid&&lease.procStart===runtime.procStart);
   }
 
@@ -91,7 +131,7 @@ export class CodexOwnedRoutes {
   }
 
   revoke(address:string,threadId?:string,rpc?:RpcClient):void{
-    for(const [id,entry] of this.subscriptions)if(entry.lease.address===address&&(!threadId||entry.lease.sessionId===threadId)&&(!rpc||entry.rpc===rpc))this.subscriptions.delete(id);
+    for(const [id,entry] of this.subscriptions)if(entry.address===address&&(!threadId||entry.sessionId===threadId)&&(!rpc||entry.rpc===rpc))this.subscriptions.delete(id);
   }
 
   reconcile(route:OwnedCodexRoute,attach:()=>Promise<unknown>):Promise<unknown>|undefined{

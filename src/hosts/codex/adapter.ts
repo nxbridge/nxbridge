@@ -163,6 +163,7 @@ async function openAppServerTransport(endpoint:string,config:BridgeConfig,bearer
 }
 
 const codexTransports=new WeakMap<RpcClient,{id:string;closed:Promise<void>}>();
+const creationControls=new Set(['thread/read','thread/resume','thread/settings/update','thread/name/set','thread/delete']);
 type ColdResumePlan={attempt:1|2;broker:OwnedIdentity};
 
                                                
@@ -266,7 +267,7 @@ export class CodexAdapter extends EventEmitter {
       }catch{                                          }
       if(rpc.closed)throw new BridgeError('disconnected','原生连接在确认进程代次时断开。');
       clearRpcFaults(endpoint);this.clients.set(endpoint,rpc);
-      this.installThreadGuard(rpc,endpoint,id=>this.observationPermit(endpoint,id,rpc));
+      this.installThreadGuard(rpc,endpoint,(id,method)=>this.observationPermit(endpoint,id,rpc,undefined,method));
       const forgetChild=(id:string)=>{
         if(!runtime?.peerId||!runtime.pid||!runtime.procStart||this.clients.get(endpoint)!==rpc)return;
         try{forgetAbsentChildControls(this.home,runtime,value=>value!==id);}
@@ -306,10 +307,10 @@ export class CodexAdapter extends EventEmitter {
     })();
     this.connecting.set(endpoint,ready);try{return await ready;}finally{this.connecting.delete(endpoint);}
   }
-  private installThreadGuard(rpc:RpcClient,address:string,leased:(id:string)=>object|boolean|undefined):void{
+  private installThreadGuard(rpc:RpcClient,address:string,leased:(id:string,method:string)=>object|boolean|undefined):void{
     if(!(rpc instanceof CodexNativeRpc))return;
     rpc.threadGuard=(method,id,options)=>{
-      const permit=leased(id);
+      const permit=leased(id,method);
       if(permit)return typeof permit==='object'?permit:undefined;
       const cold=options.beforeSend&&this.coldControls.get(options.beforeSend);
       if(method==='thread/resume'&&cold?.rpc===rpc&&cold.id===id)return;
@@ -366,7 +367,9 @@ export class CodexAdapter extends EventEmitter {
   private ownedNativeScope(runtime?:ManagedRuntime){
     if(!runtime?.peerId)return;
     const route=this.ownedRoutes.selected(runtime.peerId);
-    const root=this.ownedRoutes.sessionId(runtime.peerId)??route?.peer.sessionId??runtime.sessionId;
+    const rpc=this.clients.get(runtime.endpoint);
+    const root=this.ownedRoutes.sessionId(runtime.peerId)??route?.peer.sessionId??runtime.sessionId
+      ??(rpc?this.ownedRoutes.nativeRoot(runtime.endpoint,rpc,runtime):undefined);
                                   
     const isChild=(id:string)=>!!root&&id!==root&&id!==runtime.sessionId&&id!==route?.peer.sessionId;
     return{runtime,route,root,isChild};
@@ -374,7 +377,10 @@ export class CodexAdapter extends EventEmitter {
   private canObserveThread(address:string,id:string,rpc:RpcClient,scope=this.ownedNativeScope(runtimeFor(this.home,{endpoint:address})?.value)):boolean{
     return !!this.observationPermit(address,id,rpc,scope);
   }
-  private observationPermit(address:string,id:string,rpc:RpcClient,scope=this.ownedNativeScope(runtimeFor(this.home,{endpoint:address})?.value)):object|boolean{
+  private observationPermit(address:string,id:string,rpc:RpcClient,scope=this.ownedNativeScope(runtimeFor(this.home,{endpoint:address})?.value),method='thread/read'):object|boolean{
+    const creating=this.ownedRoutes.creationIdentity(address,id,rpc,scope?.runtime);
+                                        
+    if(creating)return creationControls.has(method)?creating:false;
     if(!scope)return true;
     const {runtime,route,root}=scope;
     if(route&&id===root){
@@ -482,13 +488,17 @@ export class CodexAdapter extends EventEmitter {
     const pending=this.attaching.get(key);if(pending)return pending;
     const work=(async()=>{
       const runtime=runtimeFor(this.home,{endpoint:endpoint.address})?.value,native=endpoint.native??endpoint;
-      if(peer.owner==='nxbridge'&&(runtime?.kind!=='owned'||runtime.state!=='ready'||runtime.peerId!==peer.id
+      const existing=this.clients.get(endpoint.address);
+      if(existing)this.ownedRoutes.adoptCreation({peer,endpoint},existing);
+      const external=!runtime&&existing&&this.ownedRoutes.permits({peer,endpoint},existing);
+      if(peer.owner==='nxbridge'&&!external&&(runtime?.kind!=='owned'||runtime.state!=='ready'||runtime.peerId!==peer.id
         ||runtime.sessionId&&runtime.sessionId!==peer.sessionId||!runtime.pid||!runtime.procStart
         ||endpoint.runtimeId&&endpoint.runtimeId!==runtime.id||native.pid&&native.pid!==runtime.pid||native.procStart&&native.procStart!==runtime.procStart))
         throw new RuntimeRecoveryHold('owned_route_unverified','还没确认这个后台 Codex 就是 nxbridge 启动的那个；消息已保留，确认后自动送达。');
       if(endpoint.configHome)this.configHomes.set(endpoint.address,endpoint.configHome);
       const rpc=await this.connect(endpoint.address);
       this.requireMember(peer.id);
+      this.ownedRoutes.adoptCreation({peer,endpoint},rpc);
       const currentRoute=()=>{
         options.prepare?.();
         const selected=this.ownedRoutes.selected(peer.id);
@@ -1132,16 +1142,31 @@ export class CodexAdapter extends EventEmitter {
     const endpoint=await this.ensureEndpoint(peer.cwd,peer.id,requesterSession,undefined,undefined,beforeLaunch),rpc=await this.connect(endpoint);
     const runtime=runtimeFor(this.home,{endpoint})?.value;
     const result=await startOwnedCodex(rpc,peer.cwd,sourcePermission,()=>{this.requireMember(peer.id);return beforeLaunch?.();},beforeCreate,this.modelProfile(peer),id=>{
-      if(runtime&&!this.invalidated.has(endpoint+'|'+id))this.ownedRoutes.subscribed({peer:{...peer,sessionId:id},endpoint:{address:endpoint,epoch:endpoint,peerId:peer.id,mode:'app-server',
-        runtimeId:runtime.id,pid:runtime.pid??null,procStart:runtime.procStart??null,active:true,seenAt:Date.now()}},rpc);
+      if(!this.invalidated.has(endpoint+'|'+id)){
+        this.ownedRoutes.created({peer:{...peer,sessionId:id},endpoint:{address:endpoint,epoch:endpoint,peerId:peer.id,mode:'app-server',
+          pid:runtime?.pid??null,procStart:runtime?.procStart??null,...(runtime?{runtimeId:runtime.id}:{}),active:true,seenAt:Date.now()}},rpc);
+      }
     }),thread=result.thread;
-    try{await rpc.request('thread/name/set',{threadId:thread.id,name:peer.name},{mutation:true});}
+    try{
+      await rpc.request('thread/name/set',{threadId:thread.id,name:peer.name},{mutation:true});
+      if(runtime?.peerId===peer.id){
+                                                      
+        const saved=runtimeFor(this.home,{id:runtime.id,endpoint});
+        if(!saved||saved.value.peerId!==peer.id||saved.value.pid!==runtime.pid||saved.value.procStart!==runtime.procStart
+          ||saved.value.sessionId&&saved.value.sessionId!==thread.id)throw new BridgeError('runtime_changed','新后台创建后运行时归属变了，未登记会话。');
+        saved.value.sessionId=thread.id;writeExistingRuntime(saved);
+      }
+    }
     catch(error){await unloadFailedOwnedCodex(rpc,thread.id,error);throw error;}
     const key=endpoint+'|'+thread.id,current=!rpc.closed&&this.clients.get(endpoint)===rpc&&!this.invalidated.has(key);
     if(current)this.attached.add(key);
     const registration={...threadRegistration({...thread,name:peer.name},endpoint,result)!,permission:codexPermission(result)};registration.endpoint.configHome=this.configHomes.get(endpoint);if(runtime){recordManagedSessionLaunch(this.home,thread.id,thread.cwd,runtime);registration.endpoint.runtimeId=runtime.id;registration.endpoint.pid=runtime.pid??null;registration.endpoint.procStart=runtime.procStart??null;
-      if(current)this.ownedRoutes.subscribed({peer:{...peer,sessionId:thread.id},endpoint:{...registration.endpoint,peerId:peer.id,active:true,seenAt:Date.now()}},rpc);
-    }return registration;
+    }
+    if(current){
+      this.ownedRoutes.creationReady({peer:{...peer,sessionId:thread.id},endpoint:{...registration.endpoint,peerId:peer.id,active:true,seenAt:Date.now()}},rpc);
+      const selected=this.ownedRoutes.selected(peer.id);if(selected&&selected.peer.sessionId===thread.id)this.ownedRoutes.adoptCreation(selected,rpc);
+    }
+    return registration;
   }
                                        
   async setProfile(peer:Peer,endpoint:Endpoint,profile:import('../../types.js').ModelProfile,guard:()=>void):Promise<EffectiveModelProfile>{
@@ -1269,7 +1294,8 @@ export class CodexAdapter extends EventEmitter {
     try{
       if(peer.owner==='nxbridge'){
         const runtime=runtimeFor(this.home,{endpoint:endpoint.address})?.value;
-        if(!runtime||runtime.peerId!==peer.id||!this.ownedRoutes.nativeHolds(endpoint.address,peer.sessionId!,rpc,runtime))
+        this.ownedRoutes.adoptCreation({peer,endpoint},rpc);
+        if(runtime?runtime.peerId!==peer.id||!this.ownedRoutes.nativeHolds(endpoint.address,peer.sessionId!,rpc,runtime):!this.ownedRoutes.permits({peer,endpoint},rpc))
           throw new RuntimeRecoveryHold('owned_subscription_waiting','和后台 Codex 的连接已经断了，没法正常退订；后台会话保留着，不会被强行结束。');
       }
       await rpc.request('thread/unsubscribe',{threadId:peer.sessionId});

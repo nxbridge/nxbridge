@@ -16,7 +16,9 @@ import {delay} from '../shared/time.js';
 import {ensureHome,removeOwnedSocket} from '../ipc/home.js';
 import {codexSocketAlias,codexSocketTargetMissing} from '../ipc/unix-socket.js';
 import {PACKAGE_ROOT} from '../shared/package-location.js';
-import {liveProcess} from '../process/process.js';
+import {codexArguments,liveProcess,processAncestors,processIdentity} from '../process/process.js';
+import {ownedProcessState} from '../process/process-stop.js';
+import {BridgeError} from '../shared/errors.js';
 import { FakeAdapter } from '../tests/support/fake-adapter.js';
 import { registration } from '../tests/support/registration.js';
 import { temporaryDirectory } from '../tests/support/temporary.js';
@@ -220,9 +222,26 @@ await server.connect(new StdioServerTransport());
     await assert.rejects(connectAppServer(source.address,config,undefined,home,{readOnly:true}),{code:'ENOENT'});
     assert.equal((await restored.request('thread/read',{threadId:peer.sessionId,includeTurns:false})).thread.id,peer.sessionId);
     let stopClaims=0;
-    const repair=await codex.restart(store.peer(peer.id),source,()=>{},{
-      lostSocketRecovery:true,beforeStop:()=>{stopClaims++;},
-    });
+    const repair=await(async()=>{
+      for(let attempt=1;;attempt++)try{
+        return await codex.restart(store.peer(peer.id),source,()=>{},{lostSocketRecovery:true,beforeStop:()=>{stopClaims++;}});
+      }catch(error){
+        const git=error instanceof BridgeError&&error.code==='runtime_workload_active'&&/PID (\d+)）[^\n]*父进程为 (\d+)，程序 git。/.exec(error.message);
+        if(!git||attempt===3)throw error;
+        assert.equal(stopClaims,0,'只能等待停止预约之前被安全门禁拒绝的调用');
+        assert.equal(await ownedProcessState({pid:source.pid!,startedAt:source.procStart!}),'alive');
+        const pid=Number(git[1]),parentPid=Number(git[2]);
+        const candidate=await processIdentity(pid).catch(error=>{if(error instanceof BridgeError&&error.code==='process_missing')return;throw error;});
+        if(!candidate){t.diagnostic(JSON.stringify({stopAttempt:attempt,pid,parentPid,gitAlreadyExited:true}));continue;}
+        if(candidate.parentPid!==parentPid||path.basename(candidate.image??candidate.name)!=='git')throw error;
+                                    
+        const argv=await codexArguments(candidate).catch(()=>[]);
+        const category=argv[1]&&['status','rev-parse','config','fetch','ls-remote','show','diff','log'].includes(argv[1])?argv[1]:'unknown';
+        const ancestry=await processAncestors(pid,4).catch(()=>[]);
+        t.diagnostic(JSON.stringify({stopAttempt:attempt,pid,parentPid,procStart:candidate.startedAt,category,ancestry:ancestry.map(({pid,parentPid})=>({pid,parentPid}))}));
+        await wait(async()=>await ownedProcessState(candidate)==='dead');
+      }
+    })();
     pids.add(repair.pid);addresses.add(repair.endpoint);
     assert.equal(stopClaims,1);assert.equal(repair.oldPid,source.pid);assert.equal(liveProcess(repair.oldPid),false);
     assert.equal(repair.resumed.thread.id,peer.sessionId);assert.notEqual(repair.endpoint,source.address);
