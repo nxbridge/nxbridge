@@ -63,6 +63,7 @@ test('窗口关闭保留原配对和 accepted；发送只保存一次，等待�
   closeHostedWindow(store,x);const actor={host:'claude' as const,sessionId:c.sessionId!,callId:'closed-send'};
   const first=await broker.dispatch('send',{actor,message:'原会话任务'}) as any;
   assert.equal(first.status,'selection_required');assert.equal(first.reason,'hosting');assert.equal(first.persisted,true);assert.equal(store.messages().length,1);
+  assert.equal(first.hosting.phase,'window_closed');
   assert.equal(store.message(first.message_id).state,'accepted');await broker.pump();assert.equal(codex.delivered.length,0);
   const repeated=await broker.dispatch('send',{actor,message:'原会话任务'}) as any;assert.equal(repeated.message_id,first.message_id);assert.equal(store.messages().length,1);
   await broker.dispatch('pair.selection.commit',{actor,selection_id:first.selection_id,action:'wait'});

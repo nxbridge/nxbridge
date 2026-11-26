@@ -97,12 +97,15 @@ test('停止前重新核验状态，晚到的任务和所有权变化阻止停�
 });
 
 test('原生队列和后台终端单独阻止停止；核验只读，不清队列或终止任务',async()=>{
-  const calls:string[]=[];let queue:any[]=[],terminals:any[]=[];
-  const rpc=new RpcClient(message=>{calls.push(message.method!);queueMicrotask(()=>rpc.receive({id:message.id,result:{data:message.method==='thread/queue/list'?queue:terminals}}));},()=>{});
+  const calls:string[]=[];let queue:unknown=[],terminals:unknown=[],nextCursor:string|undefined;
+  const rpc=new RpcClient(message=>{calls.push(message.method!);queueMicrotask(()=>rpc.receive({id:message.id,result:{data:message.method==='thread/queue/list'?queue:terminals,nextCursor}}));},()=>{});
   try{
     queue=[{id:'queued'}];await assert.rejects(assertNoPendingCodexWork(rpc,'x'),{code:'delivery_unsettled'});
     queue=[];terminals=[{processId:'running'}];await assert.rejects(assertNoPendingCodexWork(rpc,'x'),{code:'session_busy'});
     terminals=[];await assertNoPendingCodexWork(rpc,'x');
+    queue=undefined;await assert.rejects(assertNoPendingCodexWork(rpc,'x'),{code:'native_work_unverified'});
+    queue=[];terminals={};await assert.rejects(assertNoPendingCodexWork(rpc,'x'),{code:'native_work_unverified'});
+    terminals=[];nextCursor='later';await assert.rejects(assertNoPendingCodexWork(rpc,'x'),{code:'native_work_unverified'});
     assert.ok(calls.every(method=>method==='thread/queue/list'||method==='thread/backgroundTerminals/list'));
   }finally{rpc.close();}
 });

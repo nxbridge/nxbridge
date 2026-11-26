@@ -5,6 +5,8 @@ import type { Endpoint, Host, Pair, Peer } from '../../types.js';
 import {BridgeError,describeError} from '../../shared/errors.js';
 import { normalizedHome } from '../../integration/hooks/session-bindings.js';
 import { deterministicLaunchFailure, type LaunchPark } from '../../hosts/launch-park.js';
+import { codexRecycleFenced, type CodexRecycleOperation } from './codex-recycle.js';
+import { RECOVER_PARTNER_DESCRIPTION, RECYCLE_CLEANUP_USER_STEP, RECYCLE_OLD_UNKNOWN_USER_STEP } from '../stuck-session-text.js';
 
                                      
 export interface RecoveryNotice {
@@ -24,8 +26,10 @@ export interface ManagedIncident {
   launchPark?:LaunchPark;
   noticeId:string;wakeAdmitted?:boolean;noticeAdmitted?:boolean;notice?:RecoveryNotice;
   userAuthorization?:{id:string;unused:boolean};
+  recycle?:CodexRecycleOperation;
 }
 export const managedRecoveryKey=(peerId:string)=>'managedRecovery:'+peerId;
+const blocksOrdinary=(value:ManagedIncident|undefined)=>!!value?.recycle&&value.recycle.phase!=='handback';
 const delays=[0,30000,120000];
 const preconditions=new Set(['launch_proxy_unavailable','launch_probe_unavailable','bootstrap_required','claude_background_unavailable','claude_bypass_consent_required','claude_bypass_disabled','claude_inbound_restricted','claude_policy_unverified','claude_native_recovery_waiting','foreground_active','session_changed']);
 export function recoveryPrecondition(error:unknown):boolean{
@@ -42,6 +46,22 @@ export function recoveryUserStep(peer:Pick<Peer,'host'|'cwd'>,incident:ManagedIn
                                    
   if(incident.state==='unknown')return `运行 nxbridge status 核对上次启动结果；确认之前不要再次启动或恢复会话 ${sid}`;
   switch(incident.preconditionCode){
+    case 'codex_recycle_old_holder':
+      return RECYCLE_CLEANUP_USER_STEP;
+    case 'codex_recycle_old_unknown':
+      return RECYCLE_OLD_UNKNOWN_USER_STEP;
+    case 'codex_recycle_stop_cancelled':
+      return `如需继续，在独立终端运行 nxbridge open codex --member ${incident.peerId} 打开原会话`;
+    case 'codex_recycle_stop_deadline':{
+      const stage=incident.recycle,revision=stage?.phase==='held'?stage.basis?.decision.revision:undefined;
+      return revision?`nxbridge recover codex --member ${incident.peerId} --recycle --incident ${incident.id} --revision ${revision} --reason "填写原因"`:undefined;
+    }
+    case 'codex_recycle_launch_unknown':case 'codex_recycle_verify_unknown':case 'codex_recycle_ack_missing':
+      return `运行 nxbridge doctor 核对后台。需要人工接手时，用原来的 Codex 入口打开会话 ${sid}`;
+    case 'codex_recycle_partner_unreachable':{
+      const stage=incident.recycle,revision=stage?.phase==='held'?stage.basis?.decision.revision:undefined;
+      return revision?`在独立终端运行 nxbridge recover codex --member ${incident.peerId} --recycle --incident ${incident.id} --revision ${revision} --reason "填写原因"`:'运行 nxbridge recover codex --dry-run 核对当前回收证据';
+    }
     case 'owned_profile_unverified':case 'restart_profile_unverified':
       return '告诉 Claude，由它帮你查原来的设置并决定怎么处理';
                                                               
@@ -95,8 +115,8 @@ export function recoveryUserStep(peer:Pick<Peer,'host'|'cwd'>,incident:ManagedIn
       return '运行 nxbridge status 查看原因';
   }
 }
-export const recoverPartnerSchema=z.object({action:z.enum(['preview','retry','result']).default('preview'),incident_id:z.string().min(1).max(128).optional(),reason:z.string().trim().min(1).max(800).optional()}).strict();
-export const RECOVER_PARTNER_TOOL={name:'recover_partner',description:'inspect current partner recovery; retry requests the single extra same-session managed launch after automatic attempts exhaust. Requires incident_id + recorded reason; never touches user-opened windows, config or approvals. Repeating the same incident returns its existing result.',inputSchema:{type:'object' as const,properties:{action:{type:'string',enum:['preview','retry','result']},incident_id:{type:'string'},reason:{type:'string'}},additionalProperties:false},annotations:{readOnlyHint:false,destructiveHint:false,openWorldHint:false}};
+export const recoverPartnerSchema=z.object({action:z.enum(['preview','retry','result','recycle']).default('preview'),incident_id:z.string().min(1).max(128).optional(),evidence_revision:z.string().min(1).max(128).optional(),reason:z.string().trim().min(1).max(800).optional()}).strict();
+export const RECOVER_PARTNER_TOOL={name:'recover_partner',description:RECOVER_PARTNER_DESCRIPTION,inputSchema:{type:'object' as const,properties:{action:{type:'string',enum:['preview','retry','result','recycle']},incident_id:{type:'string'},evidence_revision:{type:'string'},reason:{type:'string'}},additionalProperties:false},annotations:{readOnlyHint:false,destructiveHint:true,openWorldHint:false}};
 
                                      
 export class ManagedRecovery {
@@ -105,15 +125,50 @@ export class ManagedRecovery {
   private clocks=new Map<string,{wall:number;mono:number}>();
   constructor(private storage:HealthStorage,private now=Date.now,private monotonic=()=>performance.now()){}
   get(peerId:string):ManagedIncident|undefined{return this.storage.setting(managedRecoveryKey(peerId));}
-  authorize(peerId:string,id:string):void{const value=this.get(peerId);if(!value||value.userAuthorization?.id===id)return;value.userAuthorization={id,unused:true};value.nextAt=0;if(value.state!=='unknown')value.state='pending';this.save(value);this.storage.event('recovery.user_authorized',{incidentId:value.id,peerId,requestId:id});}
+  authorize(peerId:string,id:string):void{const value=this.get(peerId);if(!value||blocksOrdinary(value)||value.userAuthorization?.id===id)return;value.userAuthorization={id,unused:true};value.nextAt=0;if(value.state!=='unknown')value.state='pending';this.save(value);this.storage.event('recovery.user_authorized',{incidentId:value.id,peerId,requestId:id});}
   private save(value:ManagedIncident):void{value.updatedAt=this.now();this.storage.setSetting(managedRecoveryKey(value.peerId),value);}
+                                          
+  updateRecycle(value:ManagedIncident,expected:CodexRecycleOperation|undefined,next:CodexRecycleOperation|undefined,commit?:(incident:ManagedIncident)=>void):ManagedIncident{
+    return this.storage.transaction(()=>{
+      const current=this.get(value.peerId);
+      if(!current||current.state==='closed'||current.id!==value.id||current.pairId!==value.pairId||current.sessionId!==value.sessionId||current.configHome!==value.configHome||current.recycle?.step!==expected?.step)
+        throw new BridgeError('incident_changed','回收核验期间，当前会话或恢复阶段已经改变。');
+      current.recycle=next;
+      if(next?.phase==='held'||next?.phase==='awaiting_partner'){
+        current.state='blocked';current.preconditionCode=next.phase==='held'?next.code:'codex_recycle_confirmation';current.precondition=next.phase==='held'?next.reason:undefined;
+      }else if(next?.phase==='ready'){
+        current.state='ready';delete current.preconditionCode;delete current.precondition;delete current.error;delete current.launchPark;
+      }else if(next?.phase==='handback'){
+        current.state='pending';current.nextAt=0;delete current.preconditionCode;delete current.precondition;
+      }else if(next){
+        current.state='recovering';delete current.preconditionCode;delete current.precondition;
+      }else{
+        current.state=current.attempts.filter(row=>!row.extra&&!row.user).length>=3?'exhausted':'pending';current.nextAt=0;
+        delete current.preconditionCode;delete current.precondition;delete current.error;
+      }
+      this.save(current);commit?.(current);return current;
+    });
+  }
+  recycleTransaction<T>(work:()=>T):T{return this.storage.transaction(work);}
+  closeRecycle(value:ManagedIncident,commit?:()=>void):void{
+    this.storage.transaction(()=>{
+      const current=this.get(value.peerId);
+      if(current?.id!==value.id||current.state==='closed'||current.recycle?.step!==value.recycle?.step)return;
+      commit?.();current.state='closed';this.save(current);
+    });
+  }
+  lastRecycle(peerId:string):number|undefined{return this.storage.setting('codexRecycleAt:'+peerId);}
+  recordRecycle(peerId:string,at:number):void{this.storage.setSetting('codexRecycleAt:'+peerId,at);this.stable.delete(peerId);}
   observe(peer:Peer,pair:Pair,endpoint?:Endpoint,proof:RecoveryProof={}):ManagedIncident{
     if(!peer.sessionId)throw new BridgeError('session_missing','恢复需要原会话 ID。');
     return this.storage.transaction(()=>{
       const previous=this.get(peer.id),home=normalizedHome(proof.configHome??endpoint?.configHome??previous?.configHome??'');
-      if(previous&&previous.sessionId===peer.sessionId&&previous.configHome===home&&previous.state!=='closed'){
+                                               
+      if(previous&&codexRecycleFenced(previous))return previous;
+      if(previous&&previous.sessionId===peer.sessionId&&previous.configHome===home&&previous.state!=='closed'
+        &&(!previous.recycle||previous.pairId===pair.id)){
                                                  
-        previous.pairId=pair.id;
+        if(!previous.recycle)previous.pairId=pair.id;
         this.reconcile(previous);return previous;
       }
       const value:ManagedIncident={version:1,id:randomUUID(),peerId:peer.id,pairId:pair.id,host:peer.host,sessionId:peer.sessionId!,configHome:home,openedAt:this.now(),updatedAt:this.now(),state:'pending',proof:{endpoint:endpoint?.address,runtimeId:endpoint?.runtimeId,pid:endpoint?.pid,procStart:endpoint?.procStart,configHome:endpoint?.configHome,...proof},attempts:[],nextAt:0,noticeId:randomUUID()};
@@ -122,20 +177,22 @@ export class ManagedRecovery {
   }
   private reconcile(value:ManagedIncident):void{
     if(this.reconciled.has(value.id))return;this.reconciled.add(value.id);
+    if(blocksOrdinary(value))return;
     const last=value.attempts.at(-1);
     if(last?.state==='claimed'){last.state='unknown';value.state='unknown';value.error='协调器在启动结果确认前退出，先核对原生进程。';}
     else if(!value.launchPark&&(value.nextAt>this.now()||value.updatedAt>this.now()))value.nextAt=this.now()+Math.min(120000,Math.max(0,value.nextAt-value.updatedAt));
     this.save(value);
   }
-  blocked(value:ManagedIncident,error:unknown,park?:LaunchPark):void{const current=this.get(value.peerId);if(!current||current.id!==value.id)return;Object.assign(value,current);const last=value.attempts.at(-1);if(last?.state==='claimed')last.state='failed';value.state='blocked';value.precondition=describeError(error).slice(0,1200);value.preconditionCode=String((error as {code?:string})?.code??'precondition_failed');value.error=value.precondition;value.launchPark=park;value.nextAt=park?Number.MAX_SAFE_INTEGER:this.now()+30000;this.stable.delete(value.peerId);this.save(value);}
-  rearm(value:ManagedIncident):void{delete value.launchPark;delete value.precondition;delete value.preconditionCode;delete value.error;value.nextAt=0;if(value.state==='blocked')value.state='pending';this.save(value);}
-  due(value:ManagedIncident):boolean{if(value.launchPark)return false;const wall=this.now(),mono=this.monotonic(),prior=this.clocks.get(value.id);this.clocks.set(value.id,{wall,mono});if(prior&&Math.abs((wall-prior.wall)-(mono-prior.mono))>10000&&value.nextAt>wall+120000){value.nextAt=wall+120000;this.save(value);}return value.state!=='closed'&&value.state!=='recovering'&&!(value.state==='exhausted'&&value.attempts.filter(row=>!row.extra&&!row.user).length>=3)&&value.nextAt<=wall;}
+  blocked(value:ManagedIncident,error:unknown,park?:LaunchPark):void{const current=this.get(value.peerId);if(!current||current.id!==value.id||blocksOrdinary(current))return;Object.assign(value,current);const last=value.attempts.at(-1);if(last?.state==='claimed')last.state='failed';value.state='blocked';value.precondition=describeError(error).slice(0,1200);value.preconditionCode=String((error as {code?:string})?.code??'precondition_failed');value.error=value.precondition;value.launchPark=park;value.nextAt=park?Number.MAX_SAFE_INTEGER:this.now()+30000;this.stable.delete(value.peerId);this.save(value);}
+  rearm(value:ManagedIncident):void{if(blocksOrdinary(this.get(value.peerId)))return;delete value.launchPark;delete value.precondition;delete value.preconditionCode;delete value.error;value.nextAt=0;if(value.state==='blocked')value.state='pending';this.save(value);}
+  due(value:ManagedIncident):boolean{if(blocksOrdinary(value)||value.launchPark)return false;const wall=this.now(),mono=this.monotonic(),prior=this.clocks.get(value.id);this.clocks.set(value.id,{wall,mono});if(prior&&Math.abs((wall-prior.wall)-(mono-prior.mono))>10000&&value.nextAt>wall+120000){value.nextAt=wall+120000;this.save(value);}return value.state!=='closed'&&value.state!=='recovering'&&!(value.state==='exhausted'&&value.attempts.filter(row=>!row.extra&&!row.user).length>=3)&&value.nextAt<=wall;}
                                            
-  absent(value:ManagedIncident):void{const current=this.get(value.peerId);if(!current||current.id!==value.id)return;if(current.attempts.at(-1)?.state==='unknown'){current.attempts.at(-1)!.state='failed';current.state='pending';this.save(current);Object.assign(value,current);}}
+  absent(value:ManagedIncident):void{const current=this.get(value.peerId);if(!current||current.id!==value.id||blocksOrdinary(current))return;if(current.attempts.at(-1)?.state==='unknown'){current.attempts.at(-1)!.state='failed';current.state='pending';this.save(current);Object.assign(value,current);}}
   private capKey(value:ManagedIncident):string{return'recoveryLaunches:'+JSON.stringify([process.platform,value.host,value.configHome,value.sessionId]);}
   claim(value:ManagedIncident,extraReason?:string):Attempt{
     return this.storage.transaction(()=>{
       const current=this.get(value.peerId);if(!current||current.id!==value.id)throw new BridgeError('incident_changed','恢复事件已经改变。');
+      if(blocksOrdinary(current))throw new BridgeError('recovery_in_progress','当前事件已有专用 Codex 恢复记录，未另行启动。');
       const extra=extraReason!==undefined,last=current.attempts.at(-1),user=current.userAuthorization?.unused===true;
       if(last?.state==='claimed'||last?.state==='unknown')throw new BridgeError('recovery_uncertain','上次启动结果尚未核验，未重复启动。');
       if(extra&&current.attempts.some(row=>row.extra))throw new BridgeError('recovery_exhausted','本次事件的额外恢复已使用，请查看已有结果。');
@@ -151,7 +208,7 @@ export class ManagedRecovery {
     });
   }
   settled(value:ManagedIncident,error?:unknown,uncertain=false):void{
-    const current=this.get(value.peerId);if(!current||current.id!==value.id)return;
+    const current=this.get(value.peerId);if(!current||current.id!==value.id||blocksOrdinary(current))return;
     const last=current.attempts.at(-1);
     if(error){
       if(last?.state==='claimed'){last.state=uncertain?'unknown':'failed';last.error=describeError(error).slice(0,1200);}
@@ -161,7 +218,7 @@ export class ManagedRecovery {
     this.save(current);Object.assign(value,current);
   }
   ready(peerId:string,healthy:boolean):void{
-    const value=this.get(peerId);if(!value||value.state==='closed')return;
+    const value=this.get(peerId);if(!value||value.state==='closed'||codexRecycleFenced(value)||value.recycle&&value.recycle.phase!=='ready')return;
     if(!healthy){this.stable.delete(peerId);return;}
     if(value.state!=='ready')this.settled(value);
     const at=this.monotonic(),wall=this.now(),prior=this.stable.get(peerId);

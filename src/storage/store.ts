@@ -55,7 +55,9 @@ export class Store {
     this.transaction(()=>repairPeerRecovery(this.db));
   }
 
-  close(): void { this.db.close(); }
+  close(): void { if(this.db.isOpen)this.db.close(); }
+                                           
+  seal():void{this.close();}
   private decode<T>(kind:string,id:string,raw:string):T|undefined{
     const stage='record:'+kind+':'+id;
     try{const value=JSON.parse(raw) as T;this.faults.recovered(stage);return value;}
@@ -96,6 +98,11 @@ export class Store {
   }
   setting<T>(key: string): T | undefined { const r=statement(this.db,'SELECT value FROM settings WHERE key=?').get(key);if(!r)return;try{return JSON.parse(r.value as string) as T;}catch{throw new BridgeError('record_invalid','状态记录无法解析：'+key);} }
   setSetting(key: string, value: unknown): void { statement(this.db,'INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at').run(key,JSON.stringify(value),Date.now()); }
+  ongoingCodexRecycles():string[]{
+    return statement(this.db,`SELECT json_extract(value,'$.peerId') AS id FROM settings
+      WHERE key>='managedRecovery:' AND key<'managedRecovery;' AND json_extract(value,'$.state')<>'closed'
+      AND json_extract(value,'$.recycle.phase') IS NOT NULL`).all().map(row=>String(row.id));
+  }
   retireFinalForwarding():void { statement(this.db,"DELETE FROM settings WHERE key LIKE 'codexFinalForward:%' OR key LIKE 'codexFinalForwardStreak:%'").run(); }
   warnHookContext(contextKey:string|undefined,sessionId:string,event:string,reason:string,peerId?:string):void{
     const key=contextKey??'session:'+sessionId,signature=JSON.stringify([sessionId,reason,peerId]),seen=this.hookContextWarnings.get(key)??new Set<string>();if(seen.has(signature))return;
@@ -387,6 +394,9 @@ export class Store {
   }
   deliveryIssueFacts(pairId:string,recipient:string):MessageFacts[]{
     return deliveryIssueRows(this.db,pairId,recipient).map(factsFrom);
+  }
+  recycleDeliveryFacts(pairId:string,recipient:string):MessageFacts[]{
+    return statement(this.db,'SELECT '+factColumns+" FROM messages WHERE pair_id=? AND recipient=? AND state IN ('accepted','held','sending','runtimeQueued','unknown') ORDER BY rowid").all(pairId,recipient).map(factsFrom);
   }
   lastMessageFacts(pairId:string,sender:string):MessageFacts|undefined{const row=statement(this.db,'SELECT '+factColumns+' FROM messages WHERE pair_id=? AND sender=? ORDER BY rowid DESC LIMIT 1').get(pairId,sender);return row?factsFrom(row):undefined;}
   hasQueuedMessages(pairId:string,recipient:string):boolean{return!!statement(this.db,"SELECT 1 FROM messages WHERE pair_id=? AND recipient=? AND state IN ('accepted','sending','runtimeQueued') LIMIT 1").get(pairId,recipient);}

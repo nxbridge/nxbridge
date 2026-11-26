@@ -118,6 +118,7 @@ mkdirSync(path.join(output,'tools'));
 writeFileSync(path.join(output,'tools','collect-macos-evidence.mjs'),"import '../macos-evidence.mjs';\n",'utf8');
 writeFileSync(path.join(output,'tools','macos-validation.md'),readFileSync(path.join(root,'tools','macos-validation.md'),'utf8'),'utf8');
 const notices=thirdPartyNotices(metafiles,root);writeFileSync(path.join(output,'THIRD-PARTY-NOTICES.md'),notices.text,'utf8');
+writeFileSync(path.join(output,'broker-custody-v1'),'1\n','utf8');
 for(const dependency of notices.packages.filter(item=>item.review))process.stderr.write('第三方许可证需要人工审阅：'+dependency.name+'@'+dependency.version+' '+dependency.license+'\n');
 const files={};
 function hashes(directory,prefix=''){

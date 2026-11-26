@@ -222,10 +222,21 @@ test('队列在模型采样前被暂时门禁拒绝后保留事实和原预约�
 
 test('后台暂时失去端点不会吞掉真人补额，也不会保留可占用唤醒通道的旧通知',t=>{
   const f=setup(t);f.finish('done');const endpoint=f.store.endpoint(f.x.id)!;
+  const original=f.pending()[0]!.id;
   f.guard.budget.admit(f.c.id,'used',turnNativeScope(f.fg(),f.store.endpoint(f.c.id)!));
   f.store.deactivate(f.x.id);f.guard.refresh(f.pair);assert.deepEqual(f.pending(),[]);
   t.mock.timers.tick(1);f.guard.human(f.fg(),'during-restart');assert.equal(f.guard.budget.status(f.c.id).used,0);
-  f.store.saveEndpoint({...endpoint,active:true});f.guard.refresh(f.pair);assert.equal(f.pending().length,1);
+  f.store.saveEndpoint({...endpoint,active:true});f.guard.refresh(f.pair);assert.deepEqual(f.pending().map(row=>row.id),[original]);
+});
+
+test('核验为已汇报后保留精确原轮次的提醒编号，但不再提供提醒',t=>{
+  const f=setup(t);f.guard.begin(f.bg(),'same-turn');
+  f.guard.complete(f.bg(),{turnId:'same-turn',completedAt:Date.now()});f.guard.refresh(f.pair);
+  const id=f.pending()[0]!.id;
+  f.store.accept(f.pair,f.bg(),'已汇报','proof');
+  f.guard.complete(f.bg(),{turnId:'same-turn',completedAt:Date.now(),stats:f.stats({workTools:1,actions:1,lastWorkAt:Date.now()-1})});f.guard.refresh(f.pair);
+  assert.deepEqual(f.pending(),[]);assert.equal(f.guard.status(f.fg()).reason,'reported');
+  assert.equal(f.store.setting<{noticeId?:string}>('turnEndFact:'+f.x.id)?.noticeId,id);
 });
 
 test('失败轮次不能被无错误字段的文件终态覆盖，重绑也不把已汇报的旧轮次改成未确认',async t=>{

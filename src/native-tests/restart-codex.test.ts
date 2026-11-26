@@ -1,9 +1,11 @@
 import { overrideEnvironment } from '../tests/support/environment.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {execFile,spawn} from 'node:child_process';
+import {promisify} from 'node:util';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import {mkdirSync,readdirSync,readFileSync,rmdirSync,unlinkSync,writeFileSync} from 'node:fs';
+import {existsSync,mkdirSync,readdirSync,readFileSync,rmdirSync,unlinkSync,writeFileSync} from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { readModelBody } from './model-http-fixture.js';
@@ -18,30 +20,56 @@ import {codexSocketAlias,codexSocketTargetMissing} from '../ipc/unix-socket.js';
 import {PACKAGE_ROOT} from '../shared/package-location.js';
 import {codexArguments,liveProcess,processAncestors,processIdentity} from '../process/process.js';
 import {ownedProcessState} from '../process/process-stop.js';
-import {BridgeError} from '../shared/errors.js';
+import {releaseOwnedProcess,rememberOwnedChild} from '../process/owned-processes.js';
+import {windowsHookIdentityHelper} from '../process/windows/windows-hook-identity.js';
+import {BridgeError,RuntimeRecoveryHold} from '../shared/errors.js';
 import { FakeAdapter } from '../tests/support/fake-adapter.js';
 import { registration } from '../tests/support/registration.js';
 import { temporaryDirectory } from '../tests/support/temporary.js';
 import { releaseNativeTestLaunches } from '../tests/support/native-launch.js';
-import {managedRuntimes,runtimeFor} from '../hosts/managed-runtimes.js';
+import {managedRuntimes,runtimeFor,saveManagedRuntime} from '../hosts/managed-runtimes.js';
 import { readCodexHistory } from '../hosts/codex/codex-history.js';
 import {readSessionProfile} from '../hosts/codex/codex-session-profile.js';
+import { collectCodexRecycleEvidence } from '../hosts/codex/codex-recycle.js';
+import { codexServerVersion } from '../hosts/codex/codex-client-identity.js';
 
-for(const named of [false,true])test('真实托管 Codex 安全重启原线程，保持历史/运行设置并加载新 MCP 和技能'+(named?'（命名权限）':'（旧式权限）'),{timeout:180000},async t=>{
+test('Windows 原生停止助手超过绝对期限时保留同代次隔离子进程',{skip:process.platform!=='win32'},async t=>{
+  const temp=temporaryDirectory();
+  const child=spawn(process.execPath,['-e','setInterval(() => {}, 1000)'],{windowsHide:true,stdio:'ignore'});
+  let owner:Awaited<ReturnType<typeof rememberOwnedChild>>;
+  t.after(async()=>{try{if(owner)await releaseOwnedProcess(owner);else child.kill();}finally{await temp.cleanup();}});
+  owner=await rememberOwnedChild(temp.directory,child,'host-control');
+  assert.ok(owner);
+  const helper=await windowsHookIdentityHelper(),deadline=BigInt(Date.now()-1000)*10000n+116444736000000000n;
+  const {stdout}=await promisify(execFile)(helper,['stop',String(owner.identity.pid),owner.identity.startedAt,'3000',String(deadline)],{windowsHide:true,timeout:5000});
+  assert.equal(JSON.parse(stdout),'pending');
+  assert.equal(await ownedProcessState(owner.identity),'alive');
+});
+
+for(const sample of [false,true,'idle'] as const)test(sample==='idle'?'真实空闲 Windows 后台独立核验后自动回收原会话':
+  '真实托管 Codex 安全重启原线程，保持历史/运行设置并加载新 MCP 和技能'+(sample?'（命名权限）':'（旧式权限）'),
+{timeout:180000,skip:sample==='idle'&&process.platform!=='win32'},async t=>{
+  const named=sample===true,clean=sample==='idle';
   const temp=temporaryDirectory(),home=path.join(temp.directory,'bridge'),codexhome=path.join(temp.directory,'codex');
   mkdirSync(codexhome,{recursive:true});
   const env={NXBRIDGE_HOME:home,CODEX_HOME:codexhome,CLAUDE_CONFIG_DIR:path.join(temp.directory,'claude'),OPENAI_API_KEY:'nxbridge-local-restart-test'};
   const restoreEnvironment=overrideEnvironment(env);
-  const config={...DEFAULT_CONFIG,codexHome:codexhome,...(process.env.NXBRIDGE_TEST_CODEX_BINARY?{codexBinary:process.env.NXBRIDGE_TEST_CODEX_BINARY}:{})};
+  const pinned=process.env.NXBRIDGE_TEST_CODEX_BINARY;
+  const triple=process.arch==='arm64'?'aarch64-pc-windows-msvc':'x86_64-pc-windows-msvc';
+  const direct=clean&&pinned&&/\.js$/.test(pinned)?path.join(path.dirname(pinned),'..','..','codex-win32-'+process.arch,'vendor',triple,'bin','codex.exe'):undefined;
+  const config={...DEFAULT_CONFIG,codexHome:codexhome,...(pinned?{codexBinary:direct&&existsSync(direct)?direct:pinned}:{})};
   const codex=new CodexAdapter(config,home),store=new Store(':memory:'),broker=new Broker(store,config,{codex,claude:new FakeAdapter()} as unknown as Adapters,home);
   const requests:any[]=[],pids=new Set<number>(),addresses=new Set<string>();let release!:()=>void,releaseDelivery=()=>{};
   const reasoning={type:'reasoning',id:named?'rs_00000000-0000-7000-8000-000000000001':'rs_0123456789abcdef0123456789abcdef',summary:[{type:'summary_text',text:'隔离的持久推理摘要'}],encrypted_content:'isolated-encrypted-restart-payload'};
   const held=new Promise<void>(resolve=>release=resolve);
+  let releaseActive=()=>{};
+  const activeReply=new Promise<void>(resolve=>releaseActive=resolve);
   const model=http.createServer(async(req,res)=>{
     try{
       const raw=await readModelBody(req);
       if(!req.url?.includes('/responses')){res.writeHead(200,{'content-type':'application/json'});res.end('{"data":[]}');return;}
-      requests.push(JSON.parse(raw.toString()));if(requests.length===1)await held;
+      const request=JSON.parse(raw.toString());requests.push(request);if(requests.length===1)await held;
+      if(JSON.stringify(request.input?.at(-1)).includes('隔离的活动回收轮次'))await activeReply;
       if(!named&&(requests.length===2||requests.length===4)){res.writeHead(429,{'content-type':'application/json'});res.end(JSON.stringify({error:{message:'隔离的重启前限流',type:'rate_limit_error'}}));return;}
       const item={type:'message',id:'restart-answer-'+requests.length,role:'assistant',status:'completed',content:[{type:'output_text',text:requests.length===1?'重启前的持久答案':'重启后的答案'}]};
       const output=requests.length===1?[reasoning,item]:[item];
@@ -53,7 +81,7 @@ for(const named of [false,true])test('真实托管 Codex 安全重启原线程�
   const wait=async(predicate:()=>boolean|Promise<boolean>)=>{const end=Date.now()+15000;while(!await predicate()){if(Date.now()>end)throw Error('重启隔离验收超时');await delay(50);}};
   let metadata:string;
   t.after(async()=>{
-    release();releaseDelivery();await broker.stop();
+    release();releaseDelivery();releaseActive();await broker.stop();
     for(const record of managedRuntimes(home)){if(record.value.pid)pids.add(record.value.pid);addresses.add(record.value.endpoint);}
     assert.deepEqual(await releaseNativeTestLaunches(home),[]);await wait(()=>[...pids].every(pid=>!liveProcess(pid)));
     for(const address of addresses)await removeOwnedSocket(home,address);
@@ -77,7 +105,12 @@ await server.connect(new StdioServerTransport());
   const skillText=(version:string)=>`---\nname: restart-marker\ndescription: RESTART_SKILL_${version}\n---\n隔离的重启技能。\n`;
   writeFileSync(skill,skillText('V1'),'utf8');
   const configText=(modelName:string,effort:string,tier:string|undefined=named?'opaque-tier-a':undefined)=>`model_provider = "restart_test"\nmodel = ${JSON.stringify(modelName)}\nmodel_reasoning_effort = ${JSON.stringify(effort)}\n${tier===undefined?'':'service_tier = '+JSON.stringify(tier)+'\n'}web_search = "disabled"\nsandbox_mode = "read-only"\napproval_policy = "never"\n[model_providers.restart_test]\nname = "隔离重启检查"\nbase_url = ${JSON.stringify(base)}\nwire_api = "responses"\nrequires_openai_auth = false\n[features]\napps = false\nremote_plugin = false\n[features.code_mode]\nenabled = false\ndirect_only_tool_namespaces = ["restart_probe"]\n[features.non_prefixed_mcp_tool_names]\nenabled = true\nserver_names = ["restart_probe"]\n[analytics]\nenabled = false\n[mcp_servers.restart_probe]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ${JSON.stringify([fixture,marker])}\n`;
-  const permissions=(text:string)=>{text=text.replace('requires_openai_auth = false','requires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0');return named?text.replace('sandbox_mode = "read-only"','default_permissions = "restart_profile"')+'\n[permissions.restart_profile.filesystem]\n":root" = "read"\n[permissions.restart_profile.network]\nenabled = false\n':text;};
+  const permissions=(text:string)=>{
+    text=text.replace('requires_openai_auth = false','requires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0')
+      .replace('remote_plugin = false','remote_plugin = false\nplugins = false\nplugin_discovery_prefetch = false');
+    if(clean)text=text.split('[mcp_servers.restart_probe]')[0]!;
+    return named?text.replace('sandbox_mode = "read-only"','default_permissions = "restart_profile"')+'\n[permissions.restart_profile.filesystem]\n":root" = "read"\n[permissions.restart_profile.network]\nenabled = false\n':text;
+  };
   writeFileSync(path.join(codexhome,'config.toml'),permissions(configText('gpt-6.1-sol','xhigh')),'utf8');
   await ensureHome(home);
                                    
@@ -108,9 +141,49 @@ await server.connect(new StdioServerTransport());
   const queued=(await rpc.request('thread/queue/list',{threadId:peer.sessionId,limit:100})).data;
   assert.equal(queued.length,1);await rpc.request('thread/queue/delete',{threadId:peer.sessionId,queuedSubmissionId:queued[0].id},{mutation:true});
   release();await wait(()=>completed.has(first.turn.id)&&store.peer(peer.id).state==='ready');
-  assert.ok(JSON.stringify(requests[0].input).includes('RESTART_MCP_V1_INSTRUCTIONS'),'首轮应加载 MCP instructions');
+  if(!clean)assert.ok(JSON.stringify(requests[0].input).includes('RESTART_MCP_V1_INSTRUCTIONS'),'首轮应加载 MCP instructions');
   assert.ok(JSON.stringify(requests[0].input).includes(missed.id),'历史补证的消息 ID 应实际进入模型上下文');
-  assert.ok(JSON.stringify(requests[0]).includes('RESTART_MCP_V1_TOOL'),'首轮应加载 MCP 工具');assert.ok(JSON.stringify(requests[0]).includes('RESTART_SKILL_V1'),'首轮应加载技能');
+  if(!clean)assert.ok(JSON.stringify(requests[0]).includes('RESTART_MCP_V1_TOOL'),'首轮应加载 MCP 工具');assert.ok(JSON.stringify(requests[0]).includes('RESTART_SKILL_V1'),'首轮应加载技能');
+                                                     
+  const originalRuntime=runtimeFor(home,{peerId:peer.id})!.value;
+  saveManagedRuntime(home,{...originalRuntime,sessionId:peer.sessionId!,version:originalRuntime.version??codexServerVersion(rpc)});
+  try{
+    const authoritative=(await rpc.request('thread/read',{threadId:peer.sessionId,includeTurns:false})).thread;
+    const originalEndpoint=store.endpoint(peer.id)!;
+    store.saveEndpoint({...originalEndpoint,nativeSession:{...originalEndpoint.nativeSession,transcriptPath:authoritative.path}});
+    const observation=await collectCodexRecycleEvidence({home,peer:store.peer(peer.id),endpoint:store.endpoint(peer.id)!,trigger:'native_thread_wedged',
+      connect:address=>connectAppServer(address,config,undefined,home,{readOnly:true}),
+      preflight:async(_runtime,profile,args,inspection)=>{
+        assert.equal(codexServerVersion(inspection),codexServerVersion(rpc));
+        assert.equal(args.threadId,peer.sessionId);assert.equal(args.modelProvider,'restart_test');
+        assert.equal(args.serviceTier,named?'opaque-tier-a':'default');
+        assert.equal(args.approvalsReviewer,profile.settings.approvalsReviewer);
+        if(named)assert.equal(args.permissions,'restart_profile');
+      }});
+    assert.equal(observation.evidence.kind,'available',JSON.stringify(observation.evidence));
+    if(observation.evidence.kind==='available'){
+      assert.equal(observation.evidence.old.pid,child.pid);
+      assert.deepEqual(observation.evidence.work.activeTurnIds,[]);
+    }
+    assert.equal(requests.length,1,'独立核验不提交恢复请求或模型输入');
+  }finally{if(!clean)saveManagedRuntime(home,originalRuntime);}
+  if(clean){
+    const lifecycle=(broker as any).memberLifecycle,wedge=t.mock.method(codex,'attach',async()=>{
+      throw new RuntimeRecoveryHold('native_thread_wedged','隔离测试：原生串行队列不可用');
+    });
+    try{await assert.rejects(lifecycle.prepare(store.peer(peer.id)),{code:'native_thread_wedged'});}finally{wedge.mock.restore();}
+    let status:any;
+    try{await wait(async()=>{await broker.pump();status=lifecycle.recoveryStatus(store.peer(peer.id));return status?.recycle?.phase==='ready';});}
+    catch(error){t.diagnostic(JSON.stringify({status,original:initial,rootPid:child.pid,wrapperPid:originalRuntime.wrapperPid}));throw error;}
+    const current=store.endpoint(peer.id)!;pids.add(current.pid!);addresses.add(current.address);
+    assert.notEqual(current.pid,child.pid);assert.equal(store.peer(peer.id).sessionId,peer.sessionId);
+    assert.equal(codex.hasSubscription(store.peer(peer.id),current),true);
+    assert.equal(requests.length,1,'自动恢复不能启动额外模型轮次');
+    assert.equal(status.recycle.work.activeTurnIds.length,0);
+    assert.deepEqual(status.recycle.work.roles,[]);
+    t.diagnostic(JSON.stringify({automatic:true,noTool:true,source:status.recycle.original_source.lineage,sameSession:true}));
+    return;
+  }
   if(!named){
     const failure=await rpc.request('turn/start',{threadId:peer.sessionId,input:[{type:'text',text:'隔离的用户恢复前失败轮次'}]});await wait(()=>completed.has(failure.turn.id));
     const failedThread=(await rpc.request('thread/read',{threadId:peer.sessionId,includeTurns:false})).thread;
@@ -215,6 +288,57 @@ await server.connect(new StdioServerTransport());
   const sessions=path.join(codexhome,'sessions'),rolloutIds=new Set(readdirSync(sessions,{recursive:true}).filter((file):file is string=>typeof file==='string'&&file.endsWith('.jsonl')).map(file=>JSON.parse(readFileSync(path.join(sessions,file),'utf8').split('\n')[0]!).payload.id));
   assert.deepEqual([...rolloutIds],[peer.sessionId]);
   await wait(()=>store.peer(peer.id).state==='ready');
+                                                    
+  const recycleSource=store.endpoint(peer.id)!,lifecycle=(broker as any).memberLifecycle;
+  if(process.platform==='linux'&&named){
+    const beforeActive=requests.length;
+    await restored.request('turn/start',{threadId:peer.sessionId,input:[{type:'text',text:'隔离的活动回收轮次'}]});
+    await wait(()=>requests.length>beforeActive&&store.peer(peer.id).state==='busy');
+  }
+  const beforeRecycle=requests.length;
+  const wedge=t.mock.method(codex,'attach',async()=>{throw new RuntimeRecoveryHold('native_thread_wedged','隔离测试：原生串行队列不可用');});
+  try{await assert.rejects(lifecycle.prepare(store.peer(peer.id)),{code:'native_thread_wedged'});}finally{wedge.mock.restore();}
+  assert.equal((store.setting<{trigger:string}>('codexRecycleCandidate:'+peer.id))?.trigger,'native_thread_wedged',
+    JSON.stringify({endpointRuntime:recycleSource.runtimeId,record:runtimeFor(home,{peerId:peer.id})?.value.sessionId,session:peer.sessionId}));
+  assert.ok((await restored.request('thread/loaded/list',{limit:100})).data.includes(peer.sessionId),'隔离回收触发时，旧会话必须仍在原生后台驻留');
+  let recycleStatus:ReturnType<typeof lifecycle.recoveryStatus>;
+  let acceptedRevision:string|undefined;
+  try{
+    await wait(async()=>{
+      await broker.pump();recycleStatus=lifecycle.recoveryStatus(store.peer(peer.id));
+      const revision=recycleStatus?.recycle?.revision;
+      if(recycleStatus?.recycle?.phase==='awaiting_partner'&&revision&&revision!==acceptedRevision){
+        acceptedRevision=revision;
+        await broker.dispatch('partner.recover',{actor:{host:'claude',sessionId:partner.sessionId,callId:'isolated-recycle:'+revision},
+          action:'recycle',incident_id:recycleStatus.incident_id,evidence_revision:revision,reason:'隔离验收同意这一代次的工作中断。'});
+      }
+      return recycleStatus?.recycle?.phase==='ready';
+    });
+  }catch(error){t.diagnostic(JSON.stringify(recycleStatus));throw error;}
+  const recycled=store.endpoint(peer.id)!;pids.add(recycled.pid!);addresses.add(recycled.address);
+  assert.notEqual(recycled.pid,recycleSource.pid);
+  assert.equal(store.peer(peer.id).sessionId,peer.sessionId);
+  assert.equal(await ownedProcessState({pid:recycleSource.pid!,startedAt:recycleSource.procStart!}),'dead');
+  assert.equal(codex.hasSubscription(store.peer(peer.id),recycled),true);
+  if(process.platform==='linux'&&named)assert.ok(acceptedRevision,'Linux 活动轮次必须由明确批准回收');
+  assert.equal(requests.length,beforeRecycle,'同会话回收无新任务提示或模型请求');
+  assert.deepEqual(store.message(uncertain.id),unknownBefore);
+  const finalProfile=await readSessionProfile(recycled.nativeSession?.transcriptPath,peer.sessionId!);
+  assert.equal(finalProfile.settings.serviceTier,named?'opaque-tier-a':'default');
+  assert.equal(finalProfile.settings.model,before.model);
+  assert.equal(finalProfile.settings.reasoningEffort,before.reasoningEffort);
+  assert.equal(finalProfile.settings.modelProvider,'restart_test');
+  assert.equal(finalProfile.activePermission?.id,before.activePermissionProfile?.id);
+  if(process.platform==='linux'&&named){
+    const freshRpc=await codex.connect(recycled.address),after=new Set<string>();
+    freshRpc.on('notification',message=>{if(message.method==='turn/completed'&&message.params.turn.status==='completed')after.add(message.params.turn.id);});
+    const next=await freshRpc.request('turn/start',{threadId:peer.sessionId,input:[{type:'text',text:'隔离验收回收后继续使用原会话'}]});
+    await wait(()=>after.has(next.turn.id)&&store.peer(peer.id).state==='ready');
+    assert.equal(requests.length,beforeRecycle+1);
+    assert.equal(JSON.stringify(requests.at(-1)).includes(uncertain.id),false);
+  }
+  t.diagnostic(JSON.stringify({automatic:acceptedRevision===undefined,loadedOriginal:true,sameSession:true,
+    scope:recycleStatus?.recycle?.work?.unattested??[],originalSource:recycleStatus?.recycle?.original_source?.lineage}));
   if(process.platform==='darwin'&&named){
     const source=store.endpoint(peer.id)!,target=codexSocketAlias(source.address.slice(7));
     unlinkSync(target);
@@ -249,13 +373,14 @@ await server.connect(new StdioServerTransport());
     const fresh=await codex.connect(repair.endpoint);
     assert.ok(JSON.stringify((await fresh.request('mcpServerStatus/list',{threadId:peer.sessionId,limit:100})).data).includes('RESTART_MCP_V2_TOOL'));
   }
+  const afterRecycleRequests=requests.length;
   const blocked=store.accept(pair,partner,'恢复失败后仍要保留的新消息','restart-failure');
   const invalidConfig=changedConfig+'\n[故意损坏的隔离配置',originalRestart=codex.restart.bind(codex);
                                         
   codex.restart=(target,address,guard,options)=>originalRestart(target,address,()=>{guard();writeFileSync(path.join(codexhome,'config.toml'),invalidConfig,'utf8');},options);
   await assert.rejects(broker.dispatch('codex.restart',{}),{code:'restart_incomplete'});await broker.pump();
   assert.equal(store.peer(peer.id).state,'paused');assert.equal(store.peer(peer.id).sessionId,peer.sessionId);
-  assert.equal(store.message(blocked.id).state,'accepted');assert.equal(store.message(blocked.id).attempts,0);assert.equal(requests.length,beforeRequests+1);
+  assert.equal(store.message(blocked.id).state,'accepted');assert.equal(store.message(blocked.id).attempts,0);assert.equal(requests.length,afterRecycleRequests);
   assert.match(readFileSync(durablePath,'utf8'),/重启前的持久答案/);assert.match(readFileSync(durablePath,'utf8'),/重启后的答案/);
   assert.equal(readFileSync(path.join(codexhome,'config.toml'),'utf8'),invalidConfig);
 });

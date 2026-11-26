@@ -14,7 +14,7 @@ export interface ManagedRuntime {
   id:string;peerId?:string;owner:string;kind:'owned'|'legacy';state:'starting'|'ready'|'failed';
   endpoint:string;pid?:number;procStart?:string;wrapperPid?:number;wrapperProcStart?:string;
   configHome?:string;launchMethod?:string;createdAt:number;error?:string;failureCode?:string;launchSettled?:boolean;bootstrapRevision?:string;
-  dedicated?:boolean;executable?:string;version?:string;sessionId?:string;profileId?:string;authenticatedLoopback?:boolean;
+  dedicated?:boolean;executable?:string;launchCommandKey?:string;version?:string;sessionId?:string;profileId?:string;authenticatedLoopback?:boolean;
   sessionVerification?:{sessionId:string;profile:SessionProfile;restartSourceId?:string};
   coldResumeUnconfirmed?:{sessionId:string;pid:number;procStart:string;attempts?:1|2;transportClosed?:boolean;broker?:OwnedIdentity;connectionId?:string};
   childControlChecks?:{pid:number;procStart:string;pending:Record<string,string>};

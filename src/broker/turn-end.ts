@@ -101,12 +101,9 @@ export class TurnEndCoordinator {
   }
   private cancel(role:Members,fact:Fact):void {
     if(!fact.noticeId)return;
-    const pending=this.notices.get(role.pair.id,role.foreground.id,fact.noticeId);
     this.notices.cancel(role.pair.id,role.foreground.id,fact.noticeId);
     this.budget.releaseUnsubmitted(role.foreground.id,fact.noticeId);
-    if(pending||fact.observed===undefined){
-      delete fact.noticeId;this.store.setSetting(factKey(role.background.id),fact);
-    }
+                                  
   }
   private retryHeld(role:Role,fact:Fact):boolean {
     const notice=fact.noticeId?this.notices.get(role.pair.id,role.foreground.id,fact.noticeId):undefined;
@@ -333,18 +330,18 @@ export class TurnEndCoordinator {
     }
     this.entered(peer,noticeId);if(turnId)this.started(peer,turnId,noticeId);return true;
   }
-  scan(peer:Peer):Promise<void> {
+  scan(peer:Peer,current?:()=>boolean):Promise<void> {
     if(peer.host!=='codex'||!peer.sessionId)return Promise.resolve();
     const existing=this.scans.get(peer.id);if(existing)return existing;
-    const work=this.read(peer).finally(()=>{if(this.scans.get(peer.id)===work)this.scans.delete(peer.id);});this.scans.set(peer.id,work);return work;
+    const work=this.read(peer,current).finally(()=>{if(this.scans.get(peer.id)===work)this.scans.delete(peer.id);});this.scans.set(peer.id,work);return work;
   }
-  private async read(peer:Peer):Promise<void> {
+  private async read(peer:Peer,currentObservation?:()=>boolean):Promise<void> {
     const endpoint=this.store.endpoint(peer.id);if(!endpoint)return;
     const scope=turnNativeScope(peer,endpoint),before=JSON.stringify(this.fact(peer));
     const file=this.options.source(peer),evidence=await readCodexTurnEvidence(file,peer.sessionId!);
     const current=this.store.peer(peer.id),active=this.store.endpoint(peer.id);
                                         
-    if(!active||turnNativeScope(current,active)!==scope||JSON.stringify(this.fact(current))!==before||evidence.status!=='supported'||!evidence.caughtUp)return;
+    if(currentObservation?.()===false||!active||turnNativeScope(current,active)!==scope||JSON.stringify(this.fact(current))!==before||evidence.status!=='supported'||!evidence.caughtUp)return;
                                             
                                              
     const own=this.store.setting<{sessionId:string;ids:string[]}>('turnEndOrigins:'+peer.id);

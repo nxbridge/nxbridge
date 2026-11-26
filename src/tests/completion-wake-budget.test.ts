@@ -56,6 +56,25 @@ test('确定提交前失败可沿用预约重试，结果未知和已开始的�
   budget.beforeSubmitFailed(peer,'retry',scope);assert.equal(budget.admit(peer,'retry',scope),undefined);
 });
 
+test('已撤销的未提交提醒可用同一编号重新竞争额度，已进入原生轮次的退费不可重投',()=>{
+  const f=setup(),budget=new CompletionWakeBudget(f.storage,1);
+  assert.ok(budget.admit(peer,'same',scope));
+  assert.ok(budget.beforeSubmitFailed(peer,'same',scope));
+  assert.ok(budget.releaseUnsubmitted(peer,'same'));
+  assert.equal(budget.status(peer).used,0);
+  assert.equal(budget.canAdmit(peer,'same','other-scope'),false);
+  assert.ok(budget.admit(peer,'unrelated',scope));
+  assert.equal(budget.canAdmit(peer,'same',scope),false);
+  assert.ok(budget.beforeSubmitFailed(peer,'unrelated',scope));
+  assert.ok(budget.releaseUnsubmitted(peer,'unrelated'));
+  const recovered=new CompletionWakeBudget(f.storage,1);
+  assert.ok(recovered.canAdmit(peer,'same',scope));assert.ok(recovered.admit(peer,'same',scope));
+  assert.equal(recovered.status(peer).used,1);
+  assert.ok(recovered.started(peer,'same',scope,'already-entered'));
+  assert.ok(recovered.completed(peer,'same',scope,'already-entered',true));
+  assert.equal(recovered.canAdmit(peer,'same',scope),false);assert.equal(recovered.admit(peer,'same',scope),undefined);
+});
+
 test('只有新人工输入开启新额度，旧输入和旧轮次的迟到结算都不能影响新额度',t=>{
   t.mock.timers.enable({apis:['Date'],now:10});
   const {budget}=setup();assert.ok(budget.human(peer,{id:'human-1',at:10}));

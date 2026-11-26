@@ -40,7 +40,15 @@ async function performRestart(params:RestartSelector,home:string):Promise<{text:
   }
 }
 
-export async function recoverCommand(params:TargetSelector&{turn_id?:string;preview?:boolean},home=bridgeHome()):Promise<unknown>{
+export async function recoverCommand(params:TargetSelector&{turn_id?:string;preview?:boolean;recycle?:true;incident_id?:string;evidence_revision?:string;reason?:string},home=bridgeHome()):Promise<unknown>{
+  if(params.recycle){
+    try{return await brokerCall('codex.recover',{...params,terminal_origin:params.preview?undefined:await externalTerminalOrigin()},
+      {home,start:false,mutation:!params.preview,timeout:params.preview?15000:75000});}
+    catch(error){
+      if(error instanceof DeliveryError&&error.uncertain)try{return await brokerCall('codex.recover',{...params,preview:true},{home,start:false,timeout:3000});}catch{}
+      throw error;
+    }
+  }
   const target=await brokerCall<{peer_id:string;runtime?:{pid:number;procStart:string}}>('codex.recover',{...params,turn_id:undefined,preview:true},{home});
   if(params.preview)return target;
   if(!params.preview){

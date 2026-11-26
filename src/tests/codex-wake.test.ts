@@ -26,6 +26,15 @@ test('忙碌轮次中断不认领消息；原窗口下一次取件只消费一�
   assert.deepEqual(result.messages,[]);assert.equal(f.store.message(pending.id).state,'contextObserved');assert.deepEqual(f.broker.receive(actor),result);assert.equal((f.broker.receive({...actor,callId:'next'}) as any).messages.length,0);assert.equal(f.store.message(old.id).state,'runtimeQueued');
 });
 
+test('唤醒持久记录保留原生轮次编号；提交尚在途时不能提前结算',async t=>{
+  const {store,x}=fixture(t),signals=new CodexWakeSignals(store,()=>1000);
+  await signals.signal(x.id,'scope','anchor',async accepted=>{
+    accepted('native-turn');assert.equal(signals.status(x.id)?.turnId,'native-turn');
+    assert.equal(signals.restartCandidate(x.id,'scope'),undefined);
+  });
+  assert.equal(signals.restartCandidate(x.id,'scope')?.turnId,'native-turn');
+});
+
 test('真实 MCP 工具完成历史能补证；失败工具、其他服务器及正文引用不能冒充回执',()=>{
   const item={type:'mcpToolCall',id:'native-mcp',server:'claude',tool:'receive_messages',status:'completed',result:{content:[{type:'text',text:JSON.stringify({messages:[{message_id:'one',message:'quoted-id'}]})}]}};
   assert.deepEqual(codexContextReceipts(item,'turn'),[{messageId:'one',turnId:'turn',itemId:'native-mcp'}]);

@@ -9,7 +9,8 @@ import {delay} from '../shared/time.js';
 import {BridgeError} from '../shared/errors.js';
 import {stateDirectory} from '../storage/state-directory.js';
 
-type Owner={pid:number;startedAt:string};
+export type StartupOwner={pid:number;startedAt:string};
+type Owner=StartupOwner;
 type Reservation={pid:number;generation:string;token:string;expires_at?:number};
 export type StartupReservation=(()=>Promise<void>)&{token:string;assertCurrent:()=>Promise<void>};
                                             
@@ -110,6 +111,14 @@ export async function assertStartupReservation(home:string,token?:string):Promis
   const local=token?active.get(token):undefined;
   if(local&&performance.now()>=local.deadline)throw new BridgeError('broker_reservation_lost','协调器启动预约已到期，本次未继续交接。');
   await checked(home,(_db,row)=>{if(row?.token!==token)throw new BridgeError('broker_reservation_lost','协调器启动预约已经改变，本次未继续交接。');},token);
+}
+
+export async function startupReservationDeadline(home:string,token:string,owner:Owner):Promise<number>{
+  return checked(home,(_db,row)=>{
+    if(!row?.expires_at||row.token!==token||row.pid!==owner.pid||row.generation!==owner.startedAt)
+      throw new BridgeError('broker_reservation_lost','协调器启动预约的进程代次或期限已改变。');
+    return row.expires_at;
+  });
 }
 
 export async function currentStartupToken(home:string):Promise<string>{

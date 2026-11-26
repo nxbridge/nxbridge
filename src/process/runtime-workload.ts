@@ -39,7 +39,15 @@ async function posixChildren(pids: number[], deadline: number): Promise<ProcessI
 export interface RuntimeWorkload {
   native: ProcessIdentity;
   owners: OwnedProcessRecord[];
-  infrastructure?: (candidate: ProcessIdentity) => boolean | Promise<boolean>;
+  infrastructure?: (candidate: ProcessIdentity,scope:{inWindowsJob:boolean;nativeChain:readonly ProcessIdentity[]}) => boolean | Promise<boolean>;
+}
+
+                                              
+export function ownedWindowsConsoleInfrastructure(candidate:ProcessIdentity,scope:{inWindowsJob:boolean;nativeChain:readonly ProcessIdentity[]}):boolean {
+  const system=process.env.SystemRoot;
+  if(process.platform!=='win32'||!scope.inWindowsJob||!system||!candidate.image
+    ||!sameDirectory(candidate.image,path.join(system,'System32','conhost.exe'))||!/^\d+$/.test(candidate.startedAt))return false;
+  return scope.nativeChain.some(parent=>parent.pid===candidate.parentPid&&/^\d+$/.test(parent.startedAt)&&BigInt(candidate.startedAt)>=BigInt(parent.startedAt));
 }
 
                                    
@@ -78,7 +86,7 @@ async function inspectRuntimeWorkload({ native, owners, infrastructure }: Runtim
       if (await ownedProcessState(container.identity) !== 'dead') throw unavailable();
     } else throw unavailable();
   }
-  const scope = new Map(roots.map(process => [generation(process), process]));
+  const scope = new Map(roots.map(process => [generation(process), process])),jobMembers=new Set<string>();
   const collect = (processes: ProcessIdentity[]) => {
     for (const process of processes) if (!ended(process)) scope.set(generation(process), process);
   };
@@ -87,6 +95,7 @@ async function inspectRuntimeWorkload({ native, owners, infrastructure }: Runtim
       const members = await processDescendants(container.identity, container);
       if (generation(native) !== generation(container.identity) && !members.some(member => generation(member) === generation(native))) throw unavailable();
       collect(members);
+      if(container.windowsJob)for(const member of members)jobMembers.add(generation(member));
     } catch {
       throw unavailable();
     }
@@ -106,7 +115,7 @@ async function inspectRuntimeWorkload({ native, owners, infrastructure }: Runtim
     for (const candidate of processes) {
       if (structural.has(generation(candidate))) continue;
       let failure: {error: unknown} | undefined;
-      try { if (await infrastructure?.(candidate)) continue; }
+      try { if (await infrastructure?.(candidate,{inWindowsJob:jobMembers.has(generation(candidate)),nativeChain:roots})) continue; }
       catch (error) { failure = {error}; }
       if (await ownedProcessState(candidate) === 'dead') {
                                                 

@@ -2,6 +2,7 @@ import { createReadStream, globSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import {BridgeError,RuntimeRecoveryHold,describeError} from '../../shared/errors.js';
+import { sameDirectory } from '../../shared/files.js';
 import type { RpcClient } from '../../ipc/rpc.js';
 import {delay} from '../../shared/time.js';
 import {CodexServiceTierError,nativeServiceTier,observedServiceTier} from './codex-service-tier.js';
@@ -13,8 +14,10 @@ export interface SessionPolicy {
 export interface SessionProfile {
   sessionId:string;file?:string;offset:number;settingsOffset?:number;complete:boolean;verified:boolean;meta:Record<string,any>;settings:Record<string,any>;
   live?:Record<string,any>;livePermissionConfig?:Record<string,unknown>;
+  activePermission?:{id:string;extends?:string}|null;
   appliedServiceTier?:{offset:number;present:boolean;value?:string|null};
   turn?:{id:string;state:'running'|'ready'|'paused';at:number};
+  rolloutWork?:{turnOffset:number;lastWorkOffset:number;lastWorkAt?:number};
   usage?:{inputTokens:number;at:number};
   compaction?:{id:string;at:number};
 }
@@ -45,10 +48,10 @@ async function verifyResumedTier(rpc:RpcClient,id:string,profile:SessionProfile,
 }
 
                                             
-export async function readSessionProfile(file:unknown,sessionId:string):Promise<SessionProfile>{
+export async function readSessionProfile(file:unknown,sessionId:string,options:{trackWork?:boolean}={}):Promise<SessionProfile>{
   const empty=():SessionProfile=>({sessionId,offset:0,complete:true,verified:false,meta:{},settings:{}});
   if(typeof file!=='string'||!file)return empty();
-  const key=JSON.stringify([file,sessionId]);let stream:ReturnType<typeof createReadStream>|undefined;
+  const key=JSON.stringify([file,sessionId,!!options.trackWork]);let stream:ReturnType<typeof createReadStream>|undefined;
   try{
     const stat=statSync(file);let cache=caches.get(key);
     if(cache&&!cache.invalid&&cache.dev===stat.dev&&cache.ino===stat.ino&&cache.size===stat.size&&cache.mtime===stat.mtimeMs)return structuredClone(cache);
@@ -60,12 +63,14 @@ export async function readSessionProfile(file:unknown,sessionId:string):Promise<
         while((newline=tail.indexOf('\n'))>=0){
           const line=tail.slice(0,newline);tail=tail.slice(newline+1);cache.offset+=Buffer.byteLength(line+'\n');
           if(!line.trim())continue;
-          if(cache.verified&&!/"(?:session_meta|turn_context|thread_settings_applied|task_started|task_complete|turn_aborted|token_count|compacted)"/.test(line))continue;
+          if(cache.verified&&!/"(?:session_meta|turn_context|thread_settings_applied|task_started|task_complete|turn_complete|turn_aborted|token_count|compacted)"/.test(line)
+            &&!(options.trackWork&&/"(?:exec_command_(?:begin|end)|mcp_tool_call_(?:begin|end)|function_call(?:_output)?|custom_tool_call(?:_output)?|patch_apply_(?:begin|end)|agent_message|agent_reasoning|reasoning|assistant)"/.test(line)))continue;
           let row:any;try{row=JSON.parse(line);}catch{cache.invalid=true;continue;}
                                             
           if(!cache.verified){
             if(row.type!=='session_meta'||row.payload?.id!==sessionId){cache.invalid=true;continue;}
-            const m=row.payload;cache.meta={id:m.id,cwd:m.cwd,model_provider:m.model_provider,cli_version:m.cli_version,history_mode:m.history_mode};cache.verified=true;
+            const m=row.payload;cache.meta={id:m.id,cwd:m.cwd,model_provider:m.model_provider,cli_version:m.cli_version,history_mode:m.history_mode,
+              ...(options.trackWork?{session_id:m.session_id,parent_thread_id:m.parent_thread_id,attached_thread:m.attached_thread,thread_source:m.thread_source,source:m.source}:{})};cache.verified=true;
           }else if(row.type==='session_meta')continue;
           else{
             const at=Date.parse(row.timestamp);
@@ -74,8 +79,23 @@ export async function readSessionProfile(file:unknown,sessionId:string):Promise<
               const inputTokens=row.payload.info?.last_token_usage?.input_tokens;
               if(Number.isSafeInteger(inputTokens)&&inputTokens>=0&&at>=(cache.compaction?.at??0))cache.usage={inputTokens,at};
             }
-            if(row.type==='event_msg'&&['task_started','task_complete','turn_aborted'].includes(row.payload?.type)&&typeof row.payload.turn_id==='string'){
-              const at=Date.parse(row.timestamp);if(Number.isFinite(at))cache.turn={id:row.payload.turn_id,state:row.payload.type==='task_started'?'running':row.payload.type==='turn_aborted'?'paused':'ready',at};
+            if(row.type==='event_msg'&&['task_started','task_complete','turn_complete','turn_aborted'].includes(row.payload?.type)&&typeof row.payload.turn_id==='string'){
+              if(Number.isFinite(at)){
+                cache.turn={id:row.payload.turn_id,state:row.payload.type==='task_started'?'running':row.payload.type==='turn_aborted'?'paused':'ready',at};
+                if(options.trackWork)(cache.rolloutWork??={turnOffset:0,lastWorkOffset:0}).turnOffset=cache.offset;
+              }
+            }
+            if(options.trackWork&&(row.type==='event_msg'&&/^(?:exec_command|mcp_tool_call|patch_apply)_(?:begin|end)$/.test(row.payload?.type)
+              ||row.type==='response_item'&&/^(?:function_call|custom_tool_call)(?:_output)?$/.test(row.payload?.type))){
+              const work=cache.rolloutWork??={turnOffset:0,lastWorkOffset:0};
+              work.lastWorkOffset=cache.offset;
+              if(Number.isFinite(at))work.lastWorkAt=at;
+            }
+            if(options.trackWork&&Number.isFinite(at)&&(row.type==='event_msg'&&['agent_message','agent_reasoning'].includes(row.payload?.type)
+              ||row.type==='response_item'&&(row.payload?.type==='reasoning'||row.payload?.type==='message'&&row.payload?.role==='assistant'))){
+                                                
+              const work=cache.rolloutWork??={turnOffset:0,lastWorkOffset:0};
+              work.lastWorkAt=Math.max(work.lastWorkAt??0,at);
             }
             const value=row.type==='turn_context'?row.payload:row.type==='event_msg'&&row.payload?.type==='thread_settings_applied'&&row.payload.thread_id===sessionId?row.payload.thread_settings:undefined;
             if(!value||typeof value!=='object')continue;
@@ -86,6 +106,12 @@ export async function readSessionProfile(file:unknown,sessionId:string):Promise<
                                                
               if(!cache.appliedServiceTier.present)delete cache.settings.serviceTier;
             }
+                                                       
+            if(Object.hasOwn(value,'active_permission_profile')){
+              const active=value.active_permission_profile;
+              cache.activePermission=active===null||active===undefined?null:
+                typeof active.id==='string'&&active.id?{id:active.id,...(typeof active.extends==='string'?{extends:active.extends}:{})}:undefined;
+            }else if(row.type==='event_msg'||Object.hasOwn(value,'permission_profile')||Object.hasOwn(value,'sandbox_policy'))cache.activePermission=null;
             for(const [source,target] of Object.entries(fields))if(Object.hasOwn(value,source))cache.settings[target]=value[source];
                                                          
             if(Object.hasOwn(value,'permission_profile')&&!Object.hasOwn(value,'sandbox_policy'))delete cache.settings.sandbox;
@@ -168,8 +194,21 @@ function sandboxCandidate(profile:SessionProfile):any{
   return{type:'workspaceWrite',writableRoots:[...new Set(entries.filter((e:any)=>e.access==='write'&&e.path?.type==='path'&&e.path.path!==cwd).map((e:any)=>e.path.path))],networkAccess:p.network==='enabled',excludeTmpdirEnvVar:!entries.some((e:any)=>e.path?.value?.kind==='tmpdir'&&e.access==='write'),excludeSlashTmp:!entries.some((e:any)=>e.path?.value?.kind==='slash_tmp'&&e.access==='write')};
 }
 
-async function persistedAfter(rpc:RpcClient,id:string,file:string,offset:number,settings:Record<string,unknown>):Promise<SessionProfile>{
-  await rpc.request('thread/settings/update',{threadId:id,...settings},{mutation:true});
+export const builtinCodexPermission=(id:string)=>[':read-only',':workspace',':danger-full-access'].includes(id);
+                                         
+export function withPersistedCodexPermission(profile:SessionProfile):SessionProfile {
+  const active=profile.activePermission;
+  if(!active||active.extends)return profile;
+  const live={activePermissionProfile:active};
+  if(builtinCodexPermission(active.id))return {...profile,live};
+  if(!/^[\w-]+$/.test(active.id))return profile;
+  const plan=permissionPlan(profile),definition='config' in plan.options?plan.options.config?.['permissions.nxbridge_transfer']:undefined;
+  if(!definition||plan.policy.unknown.length||plan.policy.narrowed.length||!samePermission(plan.permission,profile.settings.permissionProfile))return profile;
+  return {...profile,live,livePermissionConfig:{['permissions.'+active.id]:definition}};
+}
+
+async function persistedAfter(rpc:RpcClient,id:string,file:string,offset:number,settings:Record<string,unknown>,guard?:()=>void):Promise<SessionProfile>{
+  await rpc.request('thread/settings/update',{threadId:id,...settings},{mutation:true,beforeSend:guard});
   return readAppliedSessionSettings(file,id,offset);
 }
 
@@ -230,13 +269,15 @@ export function requireExactRestartProfile(profile:SessionProfile):void{
 }
 
                                       
-export async function verifyRestartProfileCurrent(profile:SessionProfile):Promise<void>{
-  const current=await readSessionProfile(profile.file,profile.sessionId);
+export async function verifyRestartProfileCurrent(profile:SessionProfile,options:{exact?:boolean;current?:SessionProfile}={}):Promise<void>{
+  const current=options.current??await readSessionProfile(profile.file,profile.sessionId);
   if(!current.verified||!current.complete||(current.settingsOffset??0)<(profile.settingsOffset??0)
-    ||(current.settingsOffset??0)>(profile.settingsOffset??0)&&(
+    ||(options.exact||(current.settingsOffset??0)>(profile.settingsOffset??0))&&(
       !samePermission(current.settings.permissionProfile,profile.settings.permissionProfile)
       ||knownTier(current)!==knownTier(profile)
-      ||['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots'].some(key=>!isDeepStrictEqual(current.settings[key],profile.settings[key]))))
+      ||options.exact&&profile.activePermission!==undefined&&!isDeepStrictEqual(current.activePermission,profile.activePermission)
+      ||(options.exact?['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots','collaborationMode','disabledPluginIds']:
+        ['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots']).some(key=>!isDeepStrictEqual(current.settings[key],profile.settings[key]))))
     throw new BridgeError('restart_profile_changed','原会话历史无法核验，或在自动重启快照后写入了不同的设置。已保留消息，等待确认原会话设置。');
 }
 
@@ -291,6 +332,42 @@ export function observedResumedTier(resumed:any,current:SessionProfile,original:
   if(expected!==undefined&&actual!==expected)throw new CodexServiceTierError({code:actual===undefined||actual===null?'service_tier_unverified':'service_tier_mismatch',saved:expected??undefined,...(typeof actual==='string'?{live:actual}:{})});
   if(wire===null&&typeof actual==='string')resumed.serviceTier=nativeServiceTier(actual);
   return actual;
+}
+
+function firstResumeAck(original:SessionProfile,ack:any,cwd:string){
+  const id=original.sessionId,{plan}=planCodexResume(id,original,cwd,{exact:true});
+  if(ack?.thread?.id!==id||ack.thread.status?.type==='notLoaded')
+    throw new BridgeError('session_changed','原生恢复没有确认加载原会话，消息继续保留。');
+  const file=ack.thread.path;
+  if(typeof file!=='string'||!original.file||!sameDirectory(file,original.file))
+    throw new BridgeError('policy_verification_failed','恢复回执没有指向原会话历史，消息继续保留。');
+  for(const key of ['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots']){
+    if(original.settings[key]===undefined||!isDeepStrictEqual(ack[key],original.settings[key]))
+      throw new BridgeError('policy_verification_failed','恢复回执未核验原会话设置：'+key+'。');
+  }
+  const active=original.live?.activePermissionProfile??original.activePermission??null,returned=ack.activePermissionProfile;
+  if((returned?.id??null)!==(active?.id??null)||(returned?.extends??null)!==(active?.extends??null))
+    throw new BridgeError('policy_verification_failed','恢复回执未核验原生命名权限，消息继续保留。');
+  return {id,file,plan};
+}
+
+                                                   
+export async function materializeCodexResumeSettings(rpc:RpcClient,original:SessionProfile,ack:any,cwd:string,guard:()=>void):Promise<void>{
+  const {id,file,plan}=firstResumeAck(original,ack,cwd);
+  await persistedAfter(rpc,id,file,original.offset,{approvalPolicy:plan.policy.approval},guard);
+}
+
+                                        
+export async function verifyCodexResumeAck(original:SessionProfile,ack:any,options:{
+  cwd:string;guard?:()=>void;requireFreshSettings?:boolean;
+}):Promise<{profile:SessionProfile;policy:SessionPolicy}>{
+  const {id,file,plan}=firstResumeAck(original,ack,options.cwd);
+  options.guard?.();
+  const current=await readAppliedSessionSettings(file,id,options.requireFreshSettings?original.offset:undefined);
+  await verifyRestartProfileCurrent(original,{exact:true,current});
+  options.guard?.();
+  observedResumedTier(ack,current,original);
+  return {profile:current,policy:{...plan.policy,source:'persisted',sandbox:current.settings.permissionProfile,unknown:[],narrowed:[],reason:undefined}};
 }
 
                               

@@ -179,8 +179,8 @@ export function migrateRetiredCompletions(home:string):void{
   }
 }
                                             
-export async function retireDeadOwnedProcess(record:OwnedProcessRecord,reason='dead-generation'):Promise<void>{
-  if(record.windowsHolder)await stopWindowsProcess(record.windowsHolder,3000);
+export async function retireDeadOwnedProcess(record:OwnedProcessRecord,reason='dead-generation',beforeSignal?:()=>void):Promise<void>{
+  if(record.windowsHolder)await stopWindowsProcess(record.windowsHolder,3000,{beforeSignal});
   forgetOwnedProcess(record,reason);
 }
 export async function ownedRecordState(record:OwnedProcessRecord):Promise<ProcessState>{

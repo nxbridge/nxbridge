@@ -16,6 +16,7 @@ export class RpcClient extends EventEmitter {
   readonly metrics={responses:0,bytes:0,parseMs:0,largestBytes:0,timeouts:0,rejected:0};
   closed=false;
   constructor(private sendWire:(message:RpcMessage)=>void,private closeWire:()=>void,readonly endpoint?:string) { super(); }
+  protected beforeWireSend():void{}
   receive(message:RpcMessage,measurement?:{bytes:number;parseMs:number}):void {
     if(measurement){this.metrics.responses++;this.metrics.bytes+=measurement.bytes;this.metrics.parseMs+=measurement.parseMs;this.metrics.largestBytes=Math.max(this.metrics.largestBytes,measurement.bytes);}
     if(message.id!==undefined&&!message.method){
@@ -45,6 +46,7 @@ export class RpcClient extends EventEmitter {
     const id=++this.sequence;
     return new Promise((resolve,reject)=>{
       options.beforeSend?.();
+      this.beforeWireSend();
       const timer=setTimeout(()=>{
         this.pending.delete(id);
         if(options.onLateSuccess){
@@ -58,8 +60,8 @@ export class RpcClient extends EventEmitter {
       try{this.sendWire({jsonrpc:'2.0',id,method,params});}catch(error){clearTimeout(timer);this.pending.delete(id);reject(new DeliveryError('disconnected',error instanceof Error?error.message:String(error),options.mutation??false));}
     });
   }
-  notify(method:string,params:unknown={}):void {if(!this.closed)this.sendWire({jsonrpc:'2.0',method,params});}
-  respond(id:string|number,result:unknown):void {if(!this.closed)this.sendWire({jsonrpc:'2.0',id,result});}
+  notify(method:string,params:unknown={}):void {if(!this.closed){this.beforeWireSend();this.sendWire({jsonrpc:'2.0',method,params});}}
+  respond(id:string|number,result:unknown):void {if(!this.closed){this.beforeWireSend();this.sendWire({jsonrpc:'2.0',id,result});}}
   disconnected(reason='连接已断开。',code='disconnected'):void {
     if(this.closed)return;this.closed=true;
                                             

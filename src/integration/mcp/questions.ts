@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
+import {QUESTION_POLL_HOLD_MS} from '../../shared/question-poll-budget.js';
 import { Store } from '../../storage/store.js';
 import { memberEnabled } from '../../broker/member-control.js';
 import {BridgeError} from '../../shared/errors.js';
@@ -52,7 +53,8 @@ export function questionResult(q:PartnerQuestion):Record<string,unknown>{
 
                                         
 export class Questions {
-  private waiters=new Map<string,Set<()=>void>>();
+  private waiters=new Map<string,Set<{handoff:boolean;finish:(error?:BridgeError)=>void}>>();
+  private waitingPaused=false;
   constructor(private store:Store,private config:BridgeConfig){}
   create(pair:Pair,sender:Peer,actor:Actor,input:{questions:unknown;turn_id?:string;tool_use_id?:string}):Record<string,unknown>{
     const key=JSON.stringify([sender.id,actor.sessionId,actor.binding?.epoch??null,actor.callId]),previous=this.store.questionByCall(key);
@@ -151,18 +153,40 @@ export class Questions {
   }
   private enabled(q:PartnerQuestion):boolean{return memberEnabled(this.store,this.store.peer(q.from))&&memberEnabled(this.store,this.store.peer(q.to));}
   recover():void{for(const q of this.store.questions(true))this.store.faults.sync('question_recover:'+q.id,()=>this.store.transaction(()=>{if(this.enabled(q)){q.terminalReason='broker_restarted';this.finish(q,'expired');}}));}
+  markHandoff(generation:string,updateId:string):void{this.store.setSetting('questionContinuity',{generation,updateId});}
+  recoverAfterStart():void{
+    const planned=this.store.transaction(()=>{
+      const marker=this.store.setting<{generation:string;updateId:string}>('questionContinuity');
+      if(!marker)return false;
+      this.store.setSetting('questionContinuity',null);return true;
+    });
+    if(planned)this.sweep();else this.recover();
+  }
+  pauseWaiters():void{
+    if([...this.waiters.values()].some(list=>[...list].some(waiter=>!waiter.handoff)))throw new BridgeError('handoff_legacy_wait','旧版调用正在等待问题结果，协调器更新已延后。');
+    this.waitingPaused=true;
+    for(const list of [...this.waiters.values()])for(const waiter of [...list])waiter.finish(handoffRetry());
+  }
+  resumeWaiters():void{this.waitingPaused=false;}
+  stopWaiters():void{
+    this.waitingPaused=true;
+    for(const list of [...this.waiters.values()])for(const waiter of [...list])waiter.finish(new BridgeError('stopping','协调器正在关闭，问题等待已结束。'));
+  }
   sweep():void{
     for(const q of this.store.questions(true))this.store.faults.sync('question_sweep:'+q.id,()=>this.store.transaction(()=>{if(!this.enabled(q))return;const pair=this.store.pairFor(q.from);if(!pair||pair.id!==q.pairId||pair.paused)this.finish(q,'cancelled');else if(q.expiresAt<=Date.now())this.finish(q,'timed_out');}));
                                                      
     for(const q of this.store.expiredQuestionRoutes())this.store.faults.sync('question_route:'+q.id,()=>this.store.transaction(()=>{if(this.enabled(q)){q.terminalReason='user_routing_timed_out';this.finish(q,'timed_out',undefined,undefined,false);}}));
   }
-  async wait(peer:Peer,id:string):Promise<Record<string,unknown>>{
+  async wait(peer:Peer,id:string,handoff=false):Promise<Record<string,unknown>>{
+    if(this.waitingPaused)throw handoffRetry();
     const q=this.get(peer,id);if(!active(q))return this.view(peer,id);
-    await new Promise<void>(resolve=>{
-      const wake=()=>{clearTimeout(timer);this.waiters.get(id)?.delete(wake);if(!this.waiters.get(id)?.size)this.waiters.delete(id);resolve();};
-      const timer=setTimeout(wake,Math.min(10000,Math.max(1,q.expiresAt-Date.now())));
-      const listeners=this.waiters.get(id)??new Set();listeners.add(wake);this.waiters.set(id,listeners);
+    await new Promise<void>((resolve,reject)=>{
+      const waiter={handoff,finish:(error?:BridgeError)=>{clearTimeout(timer);listeners.delete(waiter);if(!listeners.size)this.waiters.delete(id);if(error)reject(error);else resolve();}};
+      const timer=setTimeout(waiter.finish,Math.min(QUESTION_POLL_HOLD_MS,Math.max(1,q.expiresAt-Date.now())));
+      const listeners=this.waiters.get(id)??new Set();listeners.add(waiter);this.waiters.set(id,listeners);
     });return this.view(peer,id);
   }
-  private changed(id:string):void{for(const wake of [...(this.waiters.get(id)??[])])wake();}
+  private changed(id:string):void{for(const waiter of [...(this.waiters.get(id)??[])])waiter.finish();}
 }
+
+const handoffRetry=()=>new BridgeError('handoff_retry','协调器正在交接，请重连后继续等待同一问题。');

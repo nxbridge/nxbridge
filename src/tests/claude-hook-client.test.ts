@@ -54,7 +54,8 @@ test('Claude 薄 hook 逐次核验官方父会话；旧版可回退，身份冲�
   }unavailable=undefined;
   for(const config_home of ['relative-config',...(process.platform==='win32'?['\\\\server\\share']:[])])await assert.rejects(broker.dispatch('hook.client.claude',{hook_pid:parent.pid,config_home,cwd:root,started_at:Date.now(),elapsed_ms:0,input:{hook_event_name:'SessionStart',session_id:'claude-thin'}}),{code:'hook_identity_unavailable'});
   uncertain=true;const unknown=await invoke();assert.match(unknown.err,/结果未知/);assert.deepEqual(unknown.calls,['hook.client.claude']);uncertain=false;
-  const dispatch=broker.dispatch.bind(broker);t.mock.method(broker,'dispatch',async(method:string,params:any)=>{const result=await dispatch(method,params);if(method==='register')throw new BridgeError('starting','登记后出现同名错误');return result;});
+                                                       
+  const admitted=(broker as any).dispatchAdmitted.bind(broker);t.mock.method(broker as any,'dispatchAdmitted',async(method:string,params:any)=>{const result=await admitted(method,params);if(method==='register')throw new BridgeError('starting','登记后出现同名错误');return result;});
   const committed=await invoke();assert.match(committed.err,/登记后出现/);assert.deepEqual(committed.calls,['hook.client.claude']);t.mock.restoreAll();
   const end=await invoke('SessionEnd',{testEnv:{CLAUDE_CODE_MESSAGING_SOCKET:''}});assert.equal(end.err,'');assert.deepEqual(end.calls,['hook.client.claude']);assert.equal(store.bindings.current(peer.id)?.transitioning,true);
   save({...record,sessionId:'claude-resumed'});const resumed=await invoke('SessionStart',{session_id:'claude-resumed',source:'resume'});assert.equal(resumed.err,'');

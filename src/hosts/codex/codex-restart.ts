@@ -185,18 +185,19 @@ export async function probeCodexChildWork(home:string,runtime:ManagedRuntime,id:
 }
 
 export async function assertNoPendingCodexWork(rpc:RpcClient,id:string,options:{allowUnloaded?:boolean}={}):Promise<void>{
+  const unloaded=Symbol();
   const [queue,terminals]=await Promise.all([
     rpc.request('thread/queue/list',{threadId:id,limit:1}),
     rpc.request('thread/backgroundTerminals/list',{threadId:id,limit:1}).catch(error=>{
-      if(options.allowUnloaded&&error instanceof BridgeError&&error.message==='thread not found: '+id)return{unloaded:true};
+      if(options.allowUnloaded&&error instanceof BridgeError&&error.message==='thread not found: '+id)return unloaded;
       throw error;
     }),
   ]);
-  if(!Array.isArray(queue.data)||!terminals.unloaded&&!Array.isArray(terminals.data))
-    throw new BridgeError('runtime_workload_unverified','Codex 没返回可核对的排队输入或终端列表。');
-  if(queue.data.length)throw new BridgeError('delivery_unsettled','Codex 会话里还有排着队的输入，未执行重启；请先让它处理完。');
-  if(terminals.data?.length)throw new BridgeError('session_busy','目标还有后台终端任务，未执行重启；请先等待任务结束。');
-  if(terminals.unloaded){
+  if(!Array.isArray(queue?.data)||terminals!==unloaded&&!Array.isArray(terminals?.data))throw new BridgeError('native_work_unverified','原生队列或后台终端列表无法核验，未停止运行时。');
+  if(queue.data.length)throw new BridgeError('delivery_unsettled','原生线程还有排队输入，未执行重启；请先处理队列。');
+  if(terminals!==unloaded&&terminals.data.length)throw new BridgeError('session_busy','目标还有后台终端任务，未执行重启；请先等待任务结束。');
+  if(queue.nextCursor||terminals!==unloaded&&terminals.nextCursor)throw new BridgeError('native_work_unverified','原生队列或后台终端列表未完整返回，未停止运行时。');
+  if(terminals===unloaded){
                                               
     const thread=(await rpc.request('thread/read',{threadId:id,includeTurns:false})).thread;
     if(thread?.id!==id||thread.status?.type!=='notLoaded'||thread.status.activeFlags?.length)throw new BridgeError('session_busy','线程已重新加载或状态无法核验，未停止运行时。');

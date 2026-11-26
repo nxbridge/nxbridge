@@ -12,6 +12,7 @@ function controlThread(method:string,params:unknown):string|undefined{
 
 export class CodexNativeRpc extends RpcClient {
   private waiting=new Map<string,Waiting>();
+  private sealed=false;
   threadGuard?: (method:string,id:string,options:RpcRequestOptions)=>object|void;
 
   constructor(send:(message:RpcMessage)=>void,close:()=>void,endpoint:string,private now=()=>performance.now()){
@@ -23,12 +24,24 @@ export class CodexNativeRpc extends RpcClient {
     });
   }
 
+                                            
+  seal():void{this.sealed=true;}
+  hasHandoffPending():boolean{return [...this.waiting.values()].some(state=>state.checking);}
+
+                                        
+  resumeForHandoff(args:Record<string,unknown>,options:Required<Pick<RpcRequestOptions,'timeout'|'beforeSend'>>):Promise<any>{
+    return super.request('thread/resume',args,{...options,mutation:true});
+  }
+  protected override beforeWireSend():void{
+    if(this.sealed)throw Object.assign(new BridgeError('handoff_sealed','原协调器已封存，未向原生连接发送请求。'),{phase:'prepare'});
+  }
+
                                            
   confirmThreadAbsent(id:string):void{this.waiting.delete(id);this.emit('threadAbsent',id);}
 
   private hold(state:Pick<Waiting,'wedged'>):RuntimeRecoveryHold{
     return state.wedged
-      ?new RuntimeRecoveryHold('native_thread_wedged','后台 Codex 的这个会话卡住了：进程还在，但不再响应这个会话的请求。消息已保留。nxbridge 无法确认它是否还在干活，所以不会自动结束它，也暂时不能安全重启；你确认它没在工作后，可以让 Claude 帮你结束这个后台 Codex，再按原会话恢复。')
+      ?new RuntimeRecoveryHold('native_thread_wedged','后台 Codex 的这个会话卡住了：进程还在，但不再响应这个会话的请求。消息已保留；nxbridge 正在核对它是不是还在干活：没在干活就自动结束并按原会话恢复，可能还在干活就交给搭档决定。')
       :new RuntimeRecoveryHold('native_thread_unconfirmed','发给后台 Codex 的请求还没得到确认；消息已保留，正在重新确认。');
   }
 

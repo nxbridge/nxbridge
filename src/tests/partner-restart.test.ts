@@ -52,6 +52,49 @@ test('自动搭档重启只拒绝目标入站未确认消息，仍保留暂停�
   f.store.endContext(actor);await assert.rejects(f.broker.dispatch('codex.restart.target',{partner:true,native:{host:'claude',pid:102,procStart:'caller'}}),{code:'context_transition'});assert.equal(calls,0);
 });
 
+for(const change of ['quiesced','no-proof','wrong-thread','new-reservation','replaced-process','native-queued'] as const)test('旧唤醒预约只在原生达到重启核验点后结算：'+change,async t=>{
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),input={actor:{host:'claude',sessionId:'c',callId:'wake'},partner:true};
+  f.store.updatePeer(f.x.id,{owner:'nxbridge'});
+  const endpoint=f.store.endpoint(f.x.id)!,key='codexWake:'+f.x.id,scope=JSON.stringify([pair.id,'x',endpoint.epoch,endpoint.bindingEpoch]);
+  const anchor=f.store.accept(pair,f.c,'原已确认的消息','old-wake');f.store.claim(anchor.id);f.store.transition(anchor.id,'contextObserved');
+  const wake={scope,anchor:anchor.id,attempts:1,at:1};f.store.setSetting(key,wake);
+  assert.equal((await f.broker.dispatch('codex.restart.target',input) as any).peer_id,f.x.id);
+  assert.deepEqual(f.store.setting(key),wake);
+  let stopped=0;
+  (f.codex as any).restart=async(_peer:Peer,_endpoint:Endpoint,guard:(stage?:'prepare')=>void,options:any)=>{
+    guard('prepare');assert.throws(guard,{code:'delivery_unsettled'});
+    if(change==='native-queued')throw new BridgeError('delivery_unsettled','原生还有排队输入');
+    if(change==='new-reservation')f.store.setSetting(key,{...wake,at:2});
+    if(change==='replaced-process')f.store.saveEndpoint({...endpoint,procStart:'不同进程代次'});
+    if(change!=='no-proof')await options.verifyDelivery({id:change==='wrong-thread'?'other':'x'});
+    guard();stopped++;
+    return{oldPid:1,pid:2,resumed:{model:'gpt-6.1-sol'}};
+  };
+  if(change==='quiesced'){
+    assert.equal((await f.broker.dispatch('codex.restart',input) as any).restarted,true);assert.equal(stopped,1);assert.equal(f.store.setting(key),null);
+    assert.equal(f.store.events().filter(event=>event.type==='wake.quiesced').length,1);
+  }else{
+    await assert.rejects(f.broker.dispatch('codex.restart',input),{code:'delivery_unsettled'});assert.equal(stopped,0);
+    assert.deepEqual(f.store.setting(key),change==='new-reservation'?{...wake,at:2}:wake);
+  }
+  assert.equal(f.store.message(anchor.id).state,'contextObserved');assert.equal(f.codex.woken.length,0);
+});
+
+test('唤醒提交不明、多次预约或仍有待投递时，重启预检保留预约',async t=>{
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),input={actor:{host:'claude',sessionId:'c',callId:'wake'},partner:true};
+  f.store.updatePeer(f.x.id,{owner:'nxbridge'});
+  const endpoint=f.store.endpoint(f.x.id)!,key='codexWake:'+f.x.id;
+  const anchor=f.store.accept(pair,f.c,'待投递的消息','pending-wake');
+  const wake={scope:JSON.stringify([pair.id,'x',endpoint.epoch,endpoint.bindingEpoch]),anchor:anchor.id,attempts:1,at:1};
+  f.store.setSetting(key,wake);await assert.rejects(f.broker.dispatch('codex.restart.target',input),{code:'delivery_unsettled'});
+  f.store.transition(anchor.id,'contextObserved');
+  for(const patch of [{error:'原生提交状态未知'},{attempts:2},{exhausted:true}]){
+    const reservation={...wake,...patch};f.store.setSetting(key,reservation);
+    await assert.rejects(f.broker.dispatch('codex.restart.target',input),{code:'delivery_unsettled'});
+    assert.deepEqual(f.store.setting(key),reservation);
+  }
+});
+
 for(const partner of [false,true])test('旧未知来信只在完整核验后放行，原消息不改变也不重发：'+(partner?'搭档':'普通'),async t=>{
   const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),input={actor:{host:'claude',sessionId:'c',callId:'legacy'},...(partner?{partner:true}:{})},history=path.join(temporary(t),'history.jsonl');
   f.store.updatePeer(f.x.id,{owner:'nxbridge'});

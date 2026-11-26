@@ -7,6 +7,8 @@ import { spawnSync } from 'node:child_process';
 import {setTimeout as sleep} from 'node:timers/promises';
 import { RUNTIME_NOTICE_SUMMARY } from '../broker/health/runtime-notice-delivery.js';
 import { fixture } from './support/broker-fixture.js';
+import {writeHosting} from '../broker/recovery/session-hosting.js';
+import {RuntimeRecoveryHold} from '../shared/errors.js';
 
 async function harness(options:{deferPrompts?:boolean;noticeTurnId?:string;noticeBody?:string;startNoticeBeforeReceipt?:boolean}={}){
   let lastSelection:any;const timeouts=new Map<string,number|undefined>();
@@ -1476,6 +1478,25 @@ test('Mod 意外断开后的选择：原搭档排第一可恢复，已不存在�
   assert.match(created.asked.options[0].description,/无法确认它是否还在/);assert.equal(created.commit.action,'create');
 });
 
+test('后台订阅等待通过真实发送及状态结果进入 Mod，不误报关窗或要求托管选择',async t=>{
+  const f=fixture(t);f.store.pair(f.c.id,f.x.id);
+  const peer=f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'offline'});
+  writeHosting(f.store,peer,{verified:true});
+  f.codex.attachFailure=new RuntimeRecoveryHold('owned_subscription_waiting','等待原线程接回');
+  const actor={host:'claude' as const,sessionId:f.c.sessionId!,callId:'mod-owned-wait'};
+  const response=await f.broker.dispatch('send',{actor,message:'恢复后继续'});
+  const status=f.broker.status(actor) as any;
+  assert.equal(status.partner.hosting.phase,'background');
+  const h=await harness();h.response('send',response);h.response('status',status);
+  await h.run('session.start',{});await h.tick();
+  const sent=await h.run('tool.call',{tool:'SendMessage',to:'nxbridge:codex',message:'恢复后继续',tool_use_id:'owned-wait'});
+  assert.equal(sent.result.success,true);
+  assert.doesNotMatch(sent.result.message,/NOT delivered: hosting|next send asks user|window_closed/);
+  assert.ok(h.calls.some(call=>call.operation==='status'));
+  assert.doesNotMatch(h.statuses.filter(Boolean).join('\n'),/窗口已关闭/);
+  assert.ok(!h.calls.some(call=>call.operation==='selection-commit'));
+});
+
 test('Mod 会话托管转移：窗口关闭时配对保留，四选一由用户决定，关掉选择框只是这次不选；状态栏和 ListAgents 说明阶段与收紧的权限',async()=>{
   const hosting={preference:'user',phase:'window_closed',name:'长期会话',pair_id:'p',member_id:'cx',session_id:'01a1',cwd:'/work/app',wake_capable:false,held_unsent:2,uncertain:0};
   const selection={status:'selection_required',reason:'hosting',selection_id:'host',message_id:'m-1',expires_at:Date.now()+600000,current_pair_id:'p',hosting,candidates:[],allowed_actions:['adopt','wait','create','unpair','cancel']};
@@ -2072,6 +2093,18 @@ test('Mod 的 partner_profile 和 select_partner 新建参数原样转给后台�
   assert.deepEqual({action:commit.action,model:commit.model,effort:commit.effort,serviceTier:commit.serviceTier},{action:'create',model:'gpt-x',effort:'low',serviceTier:'fast'});
   await h.run('tool.call',{tool:'mcp__nxbridge__select_partner',selection_id:'s2',key:'k',tool_use_id:'t4'});
   const choose=h.calls.filter(c=>c.operation==='selection-commit').at(-1);assert.equal('model' in choose,false);assert.equal('effort' in choose,false);
+});
+
+test('Mod 回收工具原样转交事件与证据版本，子代理不能执行',async()=>{
+  const h=await harness();await h.run('session.start',{});
+  h.response('partner-recover' as any,{message:'not applied: facts changed'});
+  const args={action:'recycle',incident_id:'incident',evidence_revision:'revision',reason:'原工作可中断'};
+  const result=await h.run('tool.call',{tool:'mcp__nxbridge__recover_partner',...args,tool_use_id:'recycle-1'});
+  assert.match(JSON.parse(result.result).message,/facts changed/);
+  const sent=h.calls.find(c=>c.operation==='partner-recover');
+  assert.deepEqual(Object.fromEntries(Object.keys(args).map(key=>[key,sent[key]])),args);
+  assert.match((await h.run('tool.call',{tool:'mcp__nxbridge__recover_partner',...args,agentId:'sub'})).deny,/root session only/);
+  assert.equal(h.calls.filter(c=>c.operation==='partner-recover').length,1);
 });
 
 test('Mod 登记本会话实际模型和推理强度的原值供后台核对，只读，读不到的项不发送',async()=>{

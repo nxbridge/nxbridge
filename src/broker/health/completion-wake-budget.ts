@@ -3,7 +3,7 @@ import type {HealthStorage} from './contracts.js';
 export const COMPLETION_WAKE_LIMIT=4;
 interface Reservation {
   id:string;scope:string;at:number;turnId?:string;
-  retryable?:true;settled?:true;refunded?:true;
+  retryable?:true;settled?:true;refunded?:true;released?:true;
 }
 interface Budget {
   version:1;epoch:string;limit:number;used:number;human?:{id:string;at:number};reservations:Reservation[];
@@ -44,6 +44,10 @@ export class CompletionWakeBudget {
       const value=this.read(peerId);if(!value)return;
       const ceiling=this.ceiling(value),previous=value.reservations.find(entry=>entry.id===noticeId);
       if(previous){
+        if(previous.released&&previous.scope===scope&&value.used<ceiling){
+          delete previous.released;delete previous.settled;delete previous.refunded;delete previous.retryable;
+          value.used++;previous.at=Date.now();this.save(peerId,value);return{epoch:value.epoch};
+        }
         if(ceiling===0||value.used>ceiling||previous.scope!==scope||previous.settled||!previous.retryable)return;
         delete previous.retryable;this.save(peerId,value);return{epoch:value.epoch};
       }
@@ -55,7 +59,7 @@ export class CompletionWakeBudget {
   canAdmit(peerId:string,noticeId:string|undefined,scope:string):boolean {
     const value=this.read(peerId);if(!value)return false;
     const ceiling=this.ceiling(value),entry=value.reservations.find(entry=>entry.id===noticeId);
-    return entry?ceiling>0&&value.used<=ceiling&&entry.scope===scope&&!entry.settled&&entry.retryable===true:value.used<ceiling;
+    return entry?entry.scope===scope&&(entry.released?value.used<ceiling:ceiling>0&&value.used<=ceiling&&!entry.settled&&entry.retryable===true):value.used<ceiling;
   }
   reservedAllowed(peerId:string,noticeId:string,scope:string):boolean {
     const value=this.read(peerId);if(!value)return false;
@@ -77,7 +81,8 @@ export class CompletionWakeBudget {
       const value=this.read(peerId);if(!value)return false;
       const entry=value.reservations.find(entry=>entry.id===noticeId);
       if(!entry?.retryable||entry.settled)return false;
-      entry.settled=true;entry.refunded=true;value.used--;this.save(peerId,value);return true;
+                                             
+      entry.settled=true;entry.refunded=true;entry.released=true;value.used--;this.save(peerId,value);return true;
     });
   }
   started(peerId:string,noticeId:string,scope:string,turnId:string):boolean {

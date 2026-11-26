@@ -28,7 +28,7 @@ export class ModReadServer {
   private writes=new Map<string,Capability>();
   private pendingWrites=new Set<Promise<unknown>>();
   private pruning:Promise<void>;
-  constructor(home:string,private read:(actor:Actor,operation:ModReadOperation,receipt:ModReadReceipt,endpointEpoch:string,health?:TurnHealth)=>Promise<unknown>,private write?:(input:Record<string,unknown>,actor:Actor,receipt:ModReadReceipt,endpointEpoch:string,admit:()=>void)=>Promise<unknown>){
+  constructor(home:string,private read:(actor:Actor,operation:ModReadOperation,receipt:ModReadReceipt,endpointEpoch:string,health?:TurnHealth)=>Promise<unknown>,private write?:(input:Record<string,unknown>,actor:Actor,receipt:ModReadReceipt,endpointEpoch:string,admit:()=>void)=>Promise<unknown>,private paused=()=>false){
     this.pruning=pruneModReadReceipts(home).catch(error=>{process.stderr.write('nxbridge 只读票据清理：'+String(error)+'\n');});
   }
   async open(receipt:ModReadReceipt,actor:Actor,endpointEpoch:string):Promise<ModReadTransport>{
@@ -72,20 +72,20 @@ export class ModReadServer {
         const parsed=writeEnvelope.safeParse(envelope);if(!parsed.success){if(nonce&&['prepare','commit'].includes(phase!))this.writeReply(response,transport,phase!,nonce,409,{admitted:false});else this.reject(response);return;}
         if(parsed.data.phase==='prepare'){
                                                    
-          if(capability.prepared.size>=128){this.writeReply(response,transport,phase!,nonce!,409,{admitted:false});return;}
+          if(this.paused()||capability.prepared.size>=128){this.writeReply(response,transport,phase!,nonce!,409,{admitted:false});return;}
           const ticket=randomBytes(32).toString('hex');
           capability.prepared.set(ticket,{until:Date.now()+5000,nonce:nonce!,operation:parsed.data.operation});this.writeReply(response,transport,phase!,nonce!,200,{ready:true,ticket});return;
         }
         const ready=capability.prepared.get(parsed.data.ticket);capability.prepared.delete(parsed.data.ticket);
                                                        
         if(!ready||ready.nonce!==nonce){this.writeReply(response,transport,phase!,nonce!,409,{admitted:true,error:{code:'mod_commit_unknown',message:'commit ticket unavailable; outcome unknown; check result before retry',uncertain:true}});return;}
-        if(ready.until<Date.now()||ready.operation!==parsed.data.input.operation){this.writeReply(response,transport,phase!,nonce!,409,{admitted:false});return;}
+        if(this.paused()||ready.until<Date.now()||ready.operation!==parsed.data.input.operation){this.writeReply(response,transport,phase!,nonce!,409,{admitted:false});return;}
         const work=this.write!(parsed.data.input,capability.actor,capability.receipt,capability.endpointEpoch,()=>{submitted=true;});this.pendingWrites.add(work);
         let value:unknown;try{value=await work;}finally{this.pendingWrites.delete(work);}
         this.writeReply(response,transport,phase!,nonce!,200,{value});return;
       }
       let parsed:ReturnType<typeof requestSchema.parse>;try{parsed=requestSchema.parse(JSON.parse(raw));}catch{this.reject(response);return;}
-      if(capability.inflight.has(parsed.operation)){this.reject(response);return;}
+      if(this.paused()||capability.inflight.has(parsed.operation)){this.reject(response);return;}
       operation=parsed.operation;capability.inflight.add(operation);
       const value=await this.read(capability.actor,operation,capability.receipt,capability.endpointEpoch,parsed.nativeHealth),body=JSON.stringify(value);
       if(Buffer.byteLength(body)>32768)throw denied();

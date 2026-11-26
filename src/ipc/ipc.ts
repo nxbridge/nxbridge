@@ -25,6 +25,9 @@ import { backgroundRetryContext, recordBackgroundState, requireBackgroundRetry }
 import { randomUUID } from 'node:crypto';
 import { reserveBrokerStartup, startupHeldElsewhere, currentStartupToken, type StartupReservation } from '../broker/broker-startup.js';
 import { remainingTime } from '../shared/time-budget.js';
+import {QUESTION_POLL_RPC_MS} from '../shared/question-poll-budget.js';
+import { CUSTODY_ENV, type CustodyDescriptor } from '../broker/custody-protocol.js';
+import { CLI_PATH } from '../shared/package-location.js';
 
 export type ServiceOrigin=Pick<ProcessIdentity,'pid'|'startedAt'|'name'>[];
 let originQuery:Promise<ServiceOrigin>|undefined;
@@ -49,7 +52,11 @@ function lines(socket:net.Socket,receive:(line:string)=>void,maxLine?:number):vo
 }
 
 export async function connectBroker(home=bridgeHome(),timeout=2000,address=ipcAddress(home)):Promise<RpcClient>{
-  const token=ipcToken(home),socket=net.createConnection(address);
+  return connectLocalRpc(address,ipcToken(home),timeout);
+}
+
+export async function connectLocalRpc(address:string,token:string,timeout:number,maxLine?:number):Promise<RpcClient>{
+  const socket=net.createConnection(address);
   await new Promise<void>((resolve,reject)=>{
     const timer=setTimeout(()=>{socket.destroy();reject(new BridgeError('broker_timeout','协调器连接超时。'));},timeout);
     socket.once('connect',()=>{clearTimeout(timer);socket.off('error',reject);resolve();});
@@ -57,7 +64,7 @@ export async function connectBroker(home=bridgeHome(),timeout=2000,address=ipcAd
   });
   const rpc=new RpcClient(message=>socket.write(JSON.stringify({...message,token})+'\n'),()=>socket.destroy());
                                            
-  lines(socket,line=>{try{rpc.receive(JSON.parse(line));}catch{socket.destroy();}});
+  lines(socket,line=>{try{rpc.receive(JSON.parse(line));}catch{socket.destroy();}},maxLine);
   socket.on('close',()=>rpc.disconnected());socket.on('error',()=>rpc.disconnected());
   return rpc;
 }
@@ -71,7 +78,7 @@ async function pingBroker(home:string,timeout=500,deadline?:number):Promise<RpcC
   try{await rpc.request('ping',{}, {timeout:remainingTime(deadline,timeout)});return rpc;}catch(error){rpc.close();throw error;}
 }
 const brokerStarts=new Map<string,Promise<void>>();
-type BrokerStartOptions={bootstrap?:boolean;reserved?:boolean;deadline?:number};
+type BrokerStartOptions={bootstrap?:boolean;reserved?:boolean;deadline?:number;custody?:CustodyDescriptor};
 export async function ensureBroker(home=bridgeHome(),options:BrokerStartOptions={}):Promise<RpcClient>{
   if(options.bootstrap||options.reserved)return ensureBrokerNow(home,options);
   if(!installationEnabled(home))throw new BridgeError('uninstalled','nxbridge 已卸载；运行 setup 后重新启用。');
@@ -113,7 +120,7 @@ async function ensureBrokerNow(home:string,options:BrokerStartOptions):Promise<R
     throw new BridgeError('broker_start_pending','其他调用方的协调器启动尚未确认，本次未重复启动。');
   };
                                                  
-  if(process.platform==='win32'&&!options.reserved&&await startupHeldElsewhere(home,budget(1500))){const ready=await awaitStarter();if(ready)return ready;}
+  if(!options.reserved&&await startupHeldElsewhere(home,budget(1500))){const ready=await awaitStarter();if(ready)return ready;}
   const origin=await serviceOrigin(budget(10000));
   if(process.platform==='win32')requireBackgroundRetry(home,options.bootstrap,backgroundRetryContext(origin));
                                        
@@ -137,8 +144,8 @@ async function ensureBrokerNow(home:string,options:BrokerStartOptions):Promise<R
   try{return await pingBroker(home,500,options.deadline);}catch{}
   budget(2000);
   const runtime=installedEntry(home);
-  const startupToken=process.platform==='win32'?await currentStartupToken(home):undefined;
-  const environment=neutralEnvironment({NXBRIDGE_HOME:home,NXBRIDGE_SERVICE_ORIGIN:JSON.stringify(origin),NXBRIDGE_BROKER_STARTUP_TOKEN:startupToken},true);
+  const startupToken=process.platform==='win32'||options.reserved?await currentStartupToken(home):undefined;
+  const environment=neutralEnvironment({NXBRIDGE_HOME:home,NXBRIDGE_SERVICE_ORIGIN:JSON.stringify(origin),NXBRIDGE_BROKER_STARTUP_TOKEN:startupToken,[CUSTODY_ENV]:options.custody?JSON.stringify(options.custody):undefined},true);
   let launchError:unknown;
   if(process.platform==='win32'){
     requireBackgroundRetry(home,options.bootstrap);
@@ -168,16 +175,19 @@ async function ensureBrokerNow(home:string,options:BrokerStartOptions):Promise<R
 
 export async function detachService():Promise<void> {
                                                     
+  const raw=process.env[CUSTODY_ENV];
+  const startupToken=process.env.NXBRIDGE_BROKER_STARTUP_TOKEN;
+  delete process.env[CUSTODY_ENV];delete process.env.NXBRIDGE_BROKER_STARTUP_TOKEN;
   const runtime=installedEntry(bridgeHome());
-  const child=spawn(runtime.node,['--no-warnings',runtime.entry,'service'],{env:neutralEnvironment({NXBRIDGE_HOME:bridgeHome(),NXBRIDGE_SERVICE_ORIGIN:process.env.NXBRIDGE_SERVICE_ORIGIN}).env,detached:true,windowsHide:true,stdio:['ignore',process.stdout,process.stderr]});
+  const child=spawn(runtime.node,['--no-warnings',raw?CLI_PATH:runtime.entry,'service'],{env:neutralEnvironment({NXBRIDGE_HOME:bridgeHome(),NXBRIDGE_SERVICE_ORIGIN:process.env.NXBRIDGE_SERVICE_ORIGIN,NXBRIDGE_BROKER_STARTUP_TOKEN:startupToken,[CUSTODY_ENV]:raw}).env,detached:true,windowsHide:true,stdio:['ignore',process.stdout,process.stderr]});
   child.on('error',error=>{process.stderr.write(describeError(error)+'\n');process.exitCode=1;});
   child.unref();await rememberOwnedChild(bridgeHome(),child,'broker');
 }
 
                                                
-function brokerRequestTimeout(method:string,timeout?:number):number|undefined{return timeout??(['send','pair.selection.resolve','pair.selection.commit'].includes(method)?120000:undefined);}
-export async function brokerCall<T=any>(method:string,params:unknown={},options:{home?:string;start?:boolean;timeout?:number;mutation?:boolean;reserved?:boolean;deadline?:number}={}):Promise<T>{
-  const c=options.start===false?await connectBroker(options.home,remainingTime(options.deadline,Math.min(options.timeout??2000,2000))):await ensureBroker(options.home,{reserved:options.reserved,deadline:options.deadline});
+function brokerRequestTimeout(method:string,timeout?:number):number|undefined{return timeout??(method==='question.wait'?QUESTION_POLL_RPC_MS:['send','pair.selection.resolve','pair.selection.commit'].includes(method)?120000:undefined);}
+export async function brokerCall<T=any>(method:string,params:unknown={},options:{home?:string;start?:boolean;timeout?:number;mutation?:boolean;reserved?:boolean;deadline?:number;custody?:CustodyDescriptor}={}):Promise<T>{
+  const c=options.start===false?await connectBroker(options.home,remainingTime(options.deadline,Math.min(options.timeout??2000,2000))):await ensureBroker(options.home,{reserved:options.reserved,deadline:options.deadline,custody:options.custody});
   const timeout=brokerRequestTimeout(method,options.timeout);
   try{return await c.request<T>(method,params,{timeout:options.deadline===undefined?timeout:remainingTime(options.deadline,timeout??2000),mutation:options.mutation});}finally{c.close();}
 }
@@ -204,27 +214,39 @@ export class BrokerSession extends EventEmitter {
   close():void{this.closed=true;this.rpc?.close();this.rpc=undefined;}
 }
 
-export async function listenBroker(home:string,handler:(method:string,params:unknown)=>Promise<unknown>,address=ipcAddress(home)):Promise<{close:()=>Promise<void>}>{
-  const token=Buffer.from(ipcToken(home));
+export function localRpcServer(secret:string,handler:(method:string,params:unknown,socket:net.Socket)=>Promise<unknown>,privateChannel=false){
+  const token=Buffer.from(secret);
   const sockets=new Set<net.Socket>();
   const server=net.createServer(socket=>{
     sockets.add(socket);socket.on('close',()=>sockets.delete(socket));socket.on('error',()=>{});
     lines(socket,line=>{
       let request:RpcMessage&{token?:string};
       try{request=JSON.parse(line);}catch{socket.destroy();return;}
+      if(request===null||typeof request!=='object'){socket.destroy();return;}
       const offered=Buffer.from(typeof request.token==='string'?request.token:'');
       if(offered.length!==token.length||!timingSafeEqual(offered,token)){socket.destroy();return;}
       if(request.id===undefined||typeof request.method!=='string'){socket.destroy();return;}
-      void handler(request.method,request.params).then(result=>{
+      void handler(request.method,request.params,socket).then(result=>{
         if(!socket.destroyed)socket.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result})+'\n');
       },error=>{
+        if(privateChannel){
+          if(!socket.destroyed)socket.write(JSON.stringify({jsonrpc:'2.0',id:request.id,error:{code:error instanceof BridgeError?error.code:'handoff_failed',message:'交接请求未完成。'}})+'\n');
+          return;
+        }
         const validation=error instanceof z.ZodError,detail=modelError(error);
         if(!(error instanceof BridgeError)&&!validation)process.stderr.write(JSON.stringify({type:'rpc.error',method:request.method,error:error instanceof Error?error.stack:String(error)})+'\n');
         if(!socket.destroyed)socket.write(JSON.stringify({jsonrpc:'2.0',id:request.id,error:{code:validation?'invalid_arguments':detail.code==='storage_busy'?detail.code:error instanceof BridgeError?error.code:'internal',message:validation?detail.message:describeError(error),data:{...(validation?{issues:error.issues}:{}),...(detail.enable_command?{enable_command:detail.enable_command}:{}),...(typeof detail.uncertain==='boolean'?{uncertain:detail.uncertain}:{}),...(detail.phase?{phase:detail.phase}:{}),...(detail.operation?{operation:detail.operation}:{}),...(detail.sqliteCode===undefined?{}:{sqliteCode:detail.sqliteCode})}}})+'\n');
       });
     },MAX_LINE);
   });
-  const listen=()=>new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(address,()=>{server.off('error',reject);resolve();});});
+  const listen=(address:string)=>new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(address,()=>{server.off('error',reject);resolve();});});
+  let closing:Promise<void>|undefined;
+  const close=()=>closing??=new Promise<void>(resolve=>{for(const s of sockets)s.destroy();server.close(()=>resolve());});
+  return{listen,close};
+}
+
+export async function listenBroker(home:string,handler:(method:string,params:unknown)=>Promise<unknown>,address=ipcAddress(home)):Promise<{close:()=>Promise<void>}>{
+  const server=localRpcServer(ipcToken(home),handler),listen=()=>server.listen(address);
   try{await listen();}catch(error){
     if((error as NodeJS.ErrnoException).code!=='EADDRINUSE')throw error;
                                              
@@ -243,5 +265,5 @@ export async function listenBroker(home:string,handler:(method:string,params:unk
     if(!statSync(address).isSocket())throw new BridgeError('invalid_socket','协调器地址不是 Unix socket。');
     unlinkSync(address);await listen();
   }
-  return {close:async()=>{for(const s of sockets)s.destroy();await new Promise<void>(resolve=>server.close(()=>resolve()));}};
+  return {close:server.close};
 }

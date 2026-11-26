@@ -2,7 +2,7 @@ import {BridgeError} from '../shared/errors.js';
 import {VERSION} from '../version.js';
 import type {Host} from '../types.js';
 import type {WrapperShell} from '../hosts/shell.js';
-import {HELP_BODY} from './help.js';
+import {HELP_BODY,RECOVERY_HELP} from './help.js';
 const print=(value:unknown)=>process.stdout.write(JSON.stringify(value,null,2)+'\n');
 const pick=(args:string[],name:string):string|undefined=>{const i=args.indexOf(name);return i<0?undefined:args[i+1];};
 async function getHost(value:unknown):Promise<Host>{const {z}=await import('zod');return z.enum(['claude','codex']).parse(value);}
@@ -12,6 +12,8 @@ export async function dispatchCommand(command:string|undefined,args:string[]):Pr
   switch(command){
     case 'service':{
       const {runService}=await import('../broker/service.js');
+      const {CUSTODY_ENV}=await import('../broker/custody-protocol.js');
+      if(process.env[CUSTODY_ENV]){await runService();break;}
       const {installedEntry}=await import('../install/runtime-install.js');
       const {bridgeHome}=await import('../shared/local-paths.js');
       const {CLI_PATH}=await import('../shared/package-location.js');
@@ -172,10 +174,13 @@ export async function dispatchCommand(command:string|undefined,args:string[]):Pr
       const {recoverCommand}=await import('./commands/restart-command.js');
       const {administrativeTarget}=await import('../broker/pairing/admin-target.js');
       if(args[0]!=='codex')throw new BridgeError('invalid_arguments','用法：nxbridge recover codex [目标] --dry-run，或 nxbridge recover codex [目标] --turn <turn ID>（卡住的这一轮，或最近一轮已失败停下）。');
-      const turn=pick(args,'--turn');
-      if(!args.includes('--dry-run')&&!turn)throw new BridgeError('turn_required','恢复需要明确指定 --turn；请先执行 recover codex --dry-run 查看当前目标。');
-      const selector=args.slice(1).filter((arg,index,rest)=>arg!=='--dry-run'&&arg!=='--turn'&&rest[index-1]!=='--turn');
-      print(await recoverCommand({...await administrativeTarget(selector),turn_id:turn,preview:args.includes('--dry-run')}));
+      const turn=pick(args,'--turn'),recycle=args.includes('--recycle'),preview=args.includes('--dry-run');
+      const pairedFlags=['--turn','--incident','--revision','--reason'];
+      const selector=args.slice(1).filter((arg,index,rest)=>!['--dry-run','--recycle',...pairedFlags].includes(arg)&&!pairedFlags.includes(rest[index-1]??''));
+      if(!recycle&&!preview&&!turn)throw new BridgeError('turn_required','恢复需要明确指定 --turn；请先执行 recover codex --dry-run 查看当前目标。');
+      if(recycle&&turn)throw new BridgeError('invalid_arguments','用 --recycle 或 --turn 指定一种恢复方式。');
+      print(await recoverCommand({...await administrativeTarget(selector),turn_id:turn,preview,...(recycle?{recycle:true as const,
+        incident_id:pick(args,'--incident'),evidence_revision:pick(args,'--revision'),reason:pick(args,'--reason')}:{})}));
       break;
     }
     case 'retry':{
@@ -209,6 +214,6 @@ export async function dispatchCommand(command:string|undefined,args:string[]):Pr
       print(removeWrapper({file}));
       break;
     }
-    default:process.stdout.write(HELP_BODY);
+    default:process.stdout.write(HELP_BODY+'\n'+RECOVERY_HELP+'\n');
   }
 }

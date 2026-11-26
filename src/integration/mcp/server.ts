@@ -139,7 +139,7 @@ export async function serveMcp(host:Host,options:{connection?:BrokerSession;tran
         case'set_enabled':{const args=z.object({target:z.enum(['self','partner']),enabled:z.boolean(),user_requested:z.literal(true)}).strict().parse(request.params.arguments);value=await brokerCall('member.switch',{actor,...args},{mutation:true});if(args.target==='self'&&args.enabled)locallyDisabled=false;break;}
         case'read_messages':value=await brokerCall('messages.read',{actor,...readMessagesSchema.parse(request.params.arguments)});break;
         case'checkpoint':value=await brokerCall('checkpoint',{actor,input:request.params.arguments},{mutation:true});break;
-        case'recover_partner':{const input=recoverPartnerSchema.parse(request.params.arguments??{});value=await brokerCall('partner.recover',{actor,...input},{mutation:input.action==='retry',timeout:45000});break;}
+        case'recover_partner':{const input=recoverPartnerSchema.parse(request.params.arguments??{});value=await brokerCall('partner.recover',{actor,...input},{mutation:input.action==='retry'||input.action==='recycle',timeout:input.action==='recycle'?75000:45000});break;}
         case'config':value=await brokerCall('config.model',{actor,input:request.params.arguments},{mutation:true});break;
         case'ask':{if(host!=='codex')throw new BridgeError('unknown_tool','Claude 通过 Mod 路由原生提问。');const args=codexAskSchema.parse(request.params.arguments);value=await brokerCall('question.create',{actor,...args},{mutation:true});break;}
         case'answer_question':{if(host!=='codex')throw new BridgeError('unknown_tool','Claude 使用 Mod 注册的答题工具。');value=await brokerCall('question.answer',{actor,input:request.params.arguments},{mutation:true});break;}

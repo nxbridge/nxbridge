@@ -41,10 +41,10 @@ test('MCP 初始化按宿主提供唯一提醒，Codex 分工与子代理指令�
       assert.doesNotMatch(skill,/\p{Script=Han}|zh\.md|<!--/u);assert.match(skill,/model strengths\/costs\/effort prefs: read references\/collaboration\.md\s*$/);
       assert.ok(!existsSync(new URL(`../../plugins/${host}/skills/partner/references/zh.md`,import.meta.url)));
       if(host==='codex'){
-        assert.match(instructions,/^scope \(defaults; user intent overrides\): root rules below\. subagent: claude\.\* is refused by nxbridge/);
+        assert.match(instructions,/^scope \(defaults; user intent overrides: msgs, AGENTS\.md\/task requirements, user wishes relayed by claude\): root rules below\. subagent: claude\.\* is refused by nxbridge/);
         assert.match(instructions,/task\/feedback any source/);assert.match(instructions,/if owner=claude, hand off ALL/);
-        assert.match(instructions,/schedule \(defaults; user intent overrides: msgs, AGENTS\.md\/task requirements, user wishes relayed by claude\)/);
-        assert.match(instructions,/read partner skill before yours/);assert.match(instructions,/pair: one heavy test\/build group at a time/);
+        assert.match(instructions,/\nschedule \([^)]*\): small task -> skip upfront split talk/);assert.doesNotMatch(instructions,/schedule \(defaults/);
+        assert.match(instructions,/read partner skill before yours/);assert.match(instructions,/pair: heavy tests\/builds \(both sides \+ subagents\) may overlap unless together they'd saturate a machine resource/);
         assert.match(instructions,/keep session model \(switch = cache loss\); work fitting other gpt model -> spawn_agent w\/ model \+ reasoning_effort/);
         assert.match(skill,/read before task routing, spawning subagents or choosing model\/reasoning_effort/);
         assert.match(skill,/subagent policy \(nxbridge enabled; user intent overrides\): delegate reasonably independent work/);

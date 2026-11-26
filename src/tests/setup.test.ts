@@ -8,11 +8,12 @@ import { preparePlugins, setup, uninstall, type SetupServices } from '../install
 import { installedCacheDirectories } from '../install/installation.js';
 import {atomicJson,readJson} from '../shared/files.js';
 import {CLI_PATH} from '../shared/package-location.js';
-import { fileHashes } from '../install/runtime-install.js';
+import { activeRuntime,fileHashes } from '../install/runtime-install.js';
 import { withBrokerStartup } from '../broker/broker-startup.js';
 import { processIdentity } from '../process/process.js';
 import { listenBroker } from '../ipc/ipc.js';
 import { ownedSocketDirectory } from '../shared/local-paths.js';
+import { Store } from '../storage/store.js';
 
 import { fixture, autonomousNext } from './setup-fixture.js';
 
@@ -29,7 +30,7 @@ test('升级保留有效的 IPC 令牌，旧令牌为空且没有监听时重新
   let starts=0;
   f.services.broker=async(method,_params,options)=>{
     if(method==='ping'&&options?.start!==false){
-      starts++;assert.match(readFileSync(file,'utf8'),/^[a-f0-9]{64}$/);return {pid:process.pid} as any;
+      starts++;assert.match(readFileSync(file,'utf8'),/^[a-f0-9]{64}$/);return {pid:process.pid,runtime:{generation:'new',buildId:activeRuntime(f.home)?.buildId,windowsIndependent:true}} as any;
     }
     throw Object.assign(Error('隔离 broker 不存在'),{code:'ENOENT'});
   };
@@ -176,18 +177,21 @@ for(const enabled of [true,false,undefined])test(`跨版本更新：Codex 启用
 
 test('Windows 更新在旧协调器停止前预约，直到新协调器就绪才释放',{skip:process.platform!=='win32'},async t=>{
   const f=fixture(t),owner=await processIdentity(process.pid),steps:string[]=[];
+  mkdirSync(f.home);new Store(path.join(f.home,'nxbridge.db')).close();
   f.services.broker=(async(method,_params,options)=>{
     steps.push(method+(options?.start===false?':existing':':start'));
     if(steps.length<=3){
       assert.equal(await withBrokerStartup(f.home,[],async()=>true),undefined,'交接期间其他宿主不能绑定端点');
       assert.equal(await withBrokerStartup(f.home,[owner],async()=>true),true,'更新调用方仍可启动');
     }else assert.equal(await withBrokerStartup(f.home,[],async()=>true),true,'就绪检查前已释放交接预约');
-    if(options?.start!==false)assert.equal(options?.reserved,true);
-    return{pid:2147483647,runtime:{windowsIndependent:true}};
+    if(method==='status')return{questions:[]};
+    if(options?.start!==false){assert.equal(options?.reserved,true);return{pid:process.pid,runtime:{generation:owner.startedAt,buildId:activeRuntime(f.home)?.buildId,windowsIndependent:true}};}
+    return{pid:2147483647,runtime:{generation:'old',buildId:'0.1.1-2441d4ab28d8',windowsIndependent:true}};
   }) as SetupServices['broker'];
   const result:any=await setup({home:f.home},f.services);
   assert.equal(result.brokerRestarted,true);
-  assert.deepEqual(steps.slice(0,3),['ping:existing','shutdown:existing','ping:start']);
+  assert.deepEqual(steps,['ping:existing','shutdown:existing','ping:start','status:existing']);
+  assert.deepEqual(result.handoff,{supported:false,used:false,transferred:0,held:0});
   assert.equal(await withBrokerStartup(f.home,[],async()=>true),true);
 });
 

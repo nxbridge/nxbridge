@@ -63,6 +63,7 @@ export class CodexOwnedRoutes {
   }
 
   selected(id:string):OwnedCodexRoute|undefined{return this.source?.(id);}
+  get pendingWork():boolean{return this.pending.size!==0;}
   sessionId(id:string):string|undefined{return this.identity?.(id);}
 
   subscribed(route:OwnedCodexRoute,rpc:RpcClient):void{

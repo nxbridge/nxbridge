@@ -40,7 +40,8 @@ export class HealthNoticePolicy {
     const last=state?.kinds[notice.kind??notice.source??'runtime'];
     if(!retry&&notice.factKey!==undefined&&last?.factKey===notice.factKey)return false;
                                           
-    if(notice.kind==='explicit_recovery')return true;
+    if(notice.kind==='explicit_recovery'||notice.source==='managed_recovery'&&notice.factKey
+      &&/^codex_recycle_(?:decision|result|held):/.test(notice.kind??''))return true;
     if(state&&now-state.lastAt<HEALTH_NOTICE_INTERVAL_MS)return false;
     if(retry)return true;
                                    
@@ -50,6 +51,8 @@ export class HealthNoticePolicy {
     return !last||now-last.at>=HEALTH_NOTICE_REPEAT_MS||(notice.severity??1)>last.severity;
   }
   admit(recipient:string,notices:RuntimeNotice[],now=Date.now()):void{
+    notices=notices.filter(notice=>notice.consumesNoticeCredit!==false);
+    if(!notices.length)return;
     const state=this.state(recipient)??{lastAt:now,kinds:{}};state.lastAt=now;
     for(const notice of notices)if(notice.phase!=='recovery')state.kinds[notice.kind??notice.source??'runtime']={at:now,severity:notice.severity??1,...(notice.factKey!==undefined?{factKey:notice.factKey}:{})};
     this.storage.setSetting(this.key(recipient),state);

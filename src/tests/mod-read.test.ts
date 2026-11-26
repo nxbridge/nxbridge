@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHmac,randomBytes,randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { temporaryDirectory } from './support/temporary.js';
@@ -32,6 +32,30 @@ function request(transport:ModReadTransport,operation:'status'|'monitor',change:
   return{body:JSON.stringify({operation,...change}),headers:{'Content-Type':'application/json','X-Nxbridge-Id':transport.id,Authorization:'Bearer '+transport.secret}};
 }
 const send=(transport:ModReadTransport,input:ReturnType<typeof request>)=>fetch(transport.url,{method:'POST',...input});
+
+test('交接排空禁止 Mod 新读取及已取票的提交，回滚保留原连接能力',async t=>{
+  const temp=temporaryDirectory(),home=path.join(temp.directory,'bridge');await ensureHome(home);
+  let paused=false,reads=0,writes=0;
+  const server=new ModReadServer(home,async()=>({reads:++reads}),async(_input,_actor,_receipt,_epoch,admit)=>{admit();return{writes:++writes};},()=>paused);
+  t.after(async()=>{await server.close();await temp.cleanup();});
+  const current=await window(home,path.join(temp.directory,'claude'),101),transport=await server.open(current.receipt,current.actor,'native');
+  const post=async(input:unknown)=>{
+    const channel=transport.write!,body=JSON.stringify(input),mac=createHmac('sha256',Buffer.from(channel.secret,'hex')).update(body).digest('hex');
+    const reply=await fetch(channel.url,{method:'POST',body,headers:{'Content-Type':'application/json','X-Nxbridge-Id':channel.id,Authorization:'HMAC '+mac}});
+    return{status:reply.status,...JSON.parse((await reply.json() as {body:string}).body)};
+  };
+  const nonce=randomBytes(32).toString('hex');
+  const first=await post({phase:'prepare',nonce,operation:'state',bytes:50});assert.equal(first.ready,true);
+  paused=true;
+  const read=await send(transport,request(transport,'status'));assert.equal(read.status,401);await read.text();
+  const commit=await post({phase:'commit',nonce,ticket:first.ticket,input:{operation:'state'}});assert.equal(commit.admitted,false);
+  assert.equal((await post({phase:'prepare',nonce,operation:'state',bytes:50})).admitted,false);
+  assert.equal(reads,0);assert.equal(writes,0);
+  paused=false;
+  assert.deepEqual(await (await send(transport,request(transport,'status'))).json(),{reads:1});
+  const second=await post({phase:'prepare',nonce,operation:'state',bytes:50});
+  assert.deepEqual((await post({phase:'commit',nonce,ticket:second.ticket,input:{operation:'state'}})).value,{writes:1});
+});
 
 test('Mod 等待读取凭据时切换对话会取消旧发送，长正文证据通过现有发送进程的标准输入传递',async()=>{
   const native=await import(pathToFileURL(path.join(PACKAGE_ROOT,'plugins/claude/hooks/mod-control.js')).href);native.setModVersion(undefined);

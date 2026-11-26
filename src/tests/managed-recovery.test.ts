@@ -4,26 +4,121 @@ import { ManagedRecovery, managedRecoveryKey, recoveryUserStep, type ManagedInci
 import {BridgeError,RuntimeRecoveryHold} from '../shared/errors.js';
 import {fixture, lifecycle} from './support/broker-fixture.js';
 import { Takeovers, recordManagedAdoption, foregroundMatchesTakeover } from '../broker/recovery/takeover.js';
+import { writeHosting } from '../broker/recovery/session-hosting.js';
 import {deliveryHealthKey,type RuntimeNotice} from '../broker/health/contracts.js';
+import { RECYCLE_CLEANUP_USER_STEP, RECYCLE_OLD_UNKNOWN_USER_STEP } from '../broker/stuck-session-text.js';
 
-test('订阅等待在原生卸载后自动复核并投递原消息，不需要人工解锁或切换模型',async t=>{
+test('普通托管接续取得新订阅后按原回收尝试结算未知消息一次',async t=>{
   let now=Date.now();t.mock.method(Date,'now',()=>now);
-  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),endpoint=f.store.endpoint(f.x.id)!;
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),recovery=f.broker.managedRecovery;
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'offline'});
+  const peer=f.store.peer(f.x.id),existing=f.store.endpoint(peer.id)!;
+  const fresh={runtimeId:'replacement',endpoint:existing.address,pid:process.pid,procStart:existing.procStart!};
+  f.store.saveEndpoint({...existing,runtimeId:fresh.runtimeId});
+  const message=f.store.accept(pair,f.c,'无法确认已收到的消息','handback-unknown');f.store.claim(message.id);f.store.transition(message.id,'unknown');
+  const incident=recovery.observe(peer,pair,existing),old={...fresh,runtimeId:'old',procStart:'previous-generation'};
+  recovery.updateRecycle(incident,undefined,{phase:'handback',step:'handback-step',trigger:'native_thread_wedged',fresh,attempt:{
+    id:'attempt',at:now,stopDeadline:now+15000,old,profile:{sourceId:old.runtimeId,sessionId:peer.sessionId!,file:'original',settingsKey:'profile'},
+    decision:{revision:'revision',facts:'facts',work:{activeTurnIds:[],progress:'idle',roles:[],unresolved:[]},since:now,noticeId:'notice',autoEligible:true},
+    ledger:{held:[],uncertain:[{id:message.id,senderId:f.c.id}]},
+  }},()=>recovery.recordRecycle(peer.id,now));
+  let attached=false;
+  const attach=f.codex.attach.bind(f.codex);
+  f.codex.attach=async(...args)=>{const rpc=await attach(...args);attached=true;return rpc;};
+  f.codex.hasSubscription=()=>attached;
+  Object.assign(f.codex,{recycleHost:()=>({})});
+  const members=lifecycle(f.broker);
+  assert.equal(recovery.due(recovery.get(peer.id)!),true);
+  assert.equal(await members.recover(peer),true);
+  assert.equal(attached,true);
+  now+=6000;await Promise.all(members.schedulePairedRecoveries().values());
+  now+=6000;await Promise.all(members.schedulePairedRecoveries().values());
+  assert.equal(recovery.get(peer.id)?.recycle?.phase,'ready');
+  const state=f.store.setting<{notices:RuntimeNotice[]}>(deliveryHealthKey(pair.id,f.c.id));
+  const results=state?.notices.filter(notice=>notice.kind?.startsWith('codex_recycle_result:'))??[];
+  assert.equal(results.length,1);assert.deepEqual(results[0]?.affectedMessageIds,[message.id]);
+  assert.equal(f.store.message(message.id).state,'unknown');
+});
+
+test('后台订阅等待保留托管身份，原生卸载后自动投递原消息',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const f=fixture(t),endpoint=f.store.endpoint(f.x.id)!;
+  f.store.pair(f.c.id,f.x.id);
   f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'offline',model:'gpt-6.1-sol',effort:'max'});
+  writeHosting(f.store,f.store.peer(f.x.id),{verified:true});
   f.codex.attachFailure=new RuntimeRecoveryHold('owned_subscription_waiting','等待原线程按原设置接回');
-  const pending=f.store.accept(pair,f.c,'保持原会话和模型处理这条消息','held-through-unload');
+  const actor={host:'claude' as const,sessionId:f.c.sessionId!,callId:'held-through-unload'};
+  const sent=await f.broker.dispatch('send',{actor,message:'保持原会话和模型处理这条消息'}) as any;
+  assert.equal(sent.delivery_state,'accepted');
+  assert.equal(sent.read_confirmed,false);
+  assert.equal(sent.hosting.phase,'background');
+  assert.equal(sent.selection_id,undefined);
   await f.broker.pump();await f.broker.pump();
-  assert.equal(f.store.message(pending.id).state,'accepted');assert.equal(f.codex.delivered.length,0);
+  assert.equal(f.store.message(sent.message_id).state,'accepted');assert.equal(f.codex.delivered.length,0);
   assert.equal(f.broker.managedRecovery.get(f.x.id)?.preconditionCode,'owned_subscription_waiting');
   f.codex.attachFailure=undefined;
   f.codex.emit('state',f.x.sessionId,'offline',endpoint.address);
   now+=31000;
   await f.broker.pump();await f.broker.pump();
-  assert.equal(f.store.message(pending.id).state,'contextObserved');
-  assert.equal(f.codex.delivered.filter(message=>message.id===pending.id).length,1);
+  assert.equal(f.store.message(sent.message_id).state,'contextObserved');
+  assert.equal(f.codex.delivered.filter(message=>message.id===sent.message_id).length,1);
   assert.equal(f.store.peer(f.x.id).sessionId,f.x.sessionId);assert.equal(f.store.peer(f.x.id).model,'gpt-6.1-sol');assert.equal(f.store.peer(f.x.id).effort,'max');
   assert.equal(f.codex.created.length,0);assert.equal(f.codex.ensured,0);
   assert.equal(f.broker.managedRecovery.get(f.x.id)?.attempts.length,0,'重连原线程不消耗新进程启动额度');
+});
+
+test('后台原权限仍待核验时保留门禁，旧托管偏好不会触发用户关窗选择',async t=>{
+  const f=fixture(t);f.store.pair(f.c.id,f.x.id);
+  const peer=f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'offline'});
+  writeHosting(f.store,peer,{background:false,verifying:true,verified:false});
+  const sent=await f.broker.dispatch('send',{actor:{host:'claude',sessionId:f.c.sessionId!,callId:'verify-owned'},message:'核验后再处理'}) as any;
+  assert.equal(sent.delivery_state,'accepted');
+  assert.equal(sent.read_confirmed,false);
+  assert.equal(sent.hosting.verifying,true);
+  assert.equal(sent.hosting.phase,'verifying');
+  assert.equal(sent.selection_id,undefined);
+  assert.equal(f.store.message(sent.message_id).state,'accepted');
+  assert.equal(f.codex.delivered.length,0);
+});
+
+for(const gate of ['人工审批','会话冲突','解除配对'] as const)test(`${gate}按权限保留或结束已提交的停止尝试`,async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),recovery=f.broker.managedRecovery;
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:gate==='人工审批'?'needsHuman':'ready'});
+  const peer=f.store.peer(f.x.id),endpoint=f.store.endpoint(peer.id)!;
+  const incident=recovery.observe(peer,pair,endpoint),old={runtimeId:'isolated-old',endpoint:endpoint.address,pid:1729,procStart:'isolated-start'};
+  recovery.updateRecycle(incident,undefined,{phase:'stop_requested',signal:'possibly_submitted',step:'original-step',trigger:'native_thread_wedged',attempt:{
+    id:'original-attempt',old,at:now,stopDeadline:now+15000,ledger:{held:[],uncertain:[]},
+    profile:{sourceId:old.runtimeId,sessionId:peer.sessionId!,file:'original-rollout',settingsKey:'original-settings'},
+    decision:{revision:'original-revision',facts:'original-facts',work:{activeTurnIds:[],progress:'idle',roles:[],unresolved:[]},since:now,noticeId:'original-notice',autoEligible:true},
+  }},()=>recovery.recordRecycle(peer.id,now));
+  let inspected=0;
+  Object.assign(f.codex,{inspectRecycleOld:async(proof:typeof old)=>{assert.deepEqual(proof,old);inspected++;return 'alive';}});
+  const members=lifecycle(f.broker);
+  if(gate==='会话冲突')f.store.setSetting('managedSessionConflict:'+peer.id,true);
+  if(gate==='解除配对')f.store.unpair(pair.id);
+  else if(gate==='人工审批')await assert.rejects(f.broker.dispatch('open',{host:'codex'}),{code:'restart_in_progress'});
+  now+=15000;
+  await Promise.all(members.schedulePairedRecoveries().values());
+  const current=recovery.get(peer.id);
+  assert.equal(current?.state,gate==='人工审批'?'recovering':'closed');
+  assert.equal(current?.recycle?.phase,'stop_requested');
+  assert.equal(inspected,0);
+  assert.equal(recovery.lastRecycle(peer.id),now-15000);
+  if(gate==='人工审批'){
+    await assert.rejects(f.broker.dispatch('open',{host:'codex'}),{code:'restart_in_progress'});
+  }
+  assert.equal(f.codex.ensured,0);
+});
+
+test('回收阻塞的恢复状态与通知使用同一处理步骤',t=>{
+  const {store,broker,c,x}=fixture(t),pair=store.pair(c.id,x.id),recovery=broker.managedRecovery;
+  const incident=recovery.observe(x,pair,store.endpoint(x.id));
+  for(const [code,step] of [['codex_recycle_old_holder',RECYCLE_CLEANUP_USER_STEP],['codex_recycle_old_unknown',RECYCLE_OLD_UNKNOWN_USER_STEP]] as const){
+    const current=recovery.get(x.id)!;
+    recovery.updateRecycle(incident,current.recycle,{phase:'held',step:code,trigger:'native_thread_wedged',code,reason:'等待核验证据。'});
+    assert.equal(lifecycle(broker).recoveryStatus(x)?.user_step,step);
+  }
 });
 
 test('恢复步骤直接对用户说当前这一步，只写用到的目录、入口和会话',t=>{

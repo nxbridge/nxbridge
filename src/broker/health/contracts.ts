@@ -5,6 +5,7 @@ export interface DeliveryCounts {accepted:number;sending:number;runtimeQueued:nu
 export const emptyDeliveryCounts=():DeliveryCounts=>({accepted:0,sending:0,runtimeQueued:0,held:0,unknown:0});
 export const unsettledCount=(counts:DeliveryCounts)=>Object.values(counts).reduce((a,b)=>a+b,0);
 export interface RuntimeNotice {id:string;message:string;tier?:0|1|2|3|4;layer?:IncidentLayer;causeClass?:CauseClass;affectedMessageIds?:string[];action?:IncidentAction;state:'pending'|'sending'|'submitted'|'denied'|'unknown';claimedAt?:number;error?:string;source?:'context_rotation'|'idle_unanswered'|'pair_anomaly'|'turn_health'|'pair_lost'|'pair_changed'|'managed_recovery'|'claude_auto_mode'|'broker_outage'|'broker_degraded'|'background_completed';epoch?:string;since?:number;claimedBy?:(import('../broker-outage.js').OutageClaimant&{at?:number});wake?:boolean;readyOnly?:boolean;scope?:string;incidentId?:string;phase?:'alert'|'recovery';admitted?:boolean;revision?:number;kind?:string;severity?:number;batchId?:string;componentIds?:string[];interventionId?:string;interventionIds?:string[];retryBeforeSubmit?:true;completionRetry?:{edge:string;offers:number;at:number};issueKey?:string;factKey?:string;asOf?:number;recovery?:import('../recovery/managed-recovery.js').RecoveryNotice}
+export interface RuntimeNotice {wakeWhenIdle?:true;consumesNoticeCredit?:false}
 export interface HealthStorage {
   setting<T>(key:string):T|undefined;
   setSetting(key:string,value:unknown):void;

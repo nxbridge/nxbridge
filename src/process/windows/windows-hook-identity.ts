@@ -93,9 +93,13 @@ export async function readWindowsProcessGenerations(pids:number[],timeout:number
 }
 
                                      
-export async function stopWindowsProcess(identity:Pick<ProcessIdentity,'pid'|'startedAt'>,timeout:number):Promise<void>{
+export async function stopWindowsProcess(identity:Pick<ProcessIdentity,'pid'|'startedAt'>,timeout:number,options:{deadline?:number;beforeSignal?:()=>void}={}):Promise<void>{
   const helper=await windowsHookIdentityHelper(identityHome());
-  const {stdout}=await execute(helper,['stop',String(identity.pid),identity.startedAt,String(timeout)],{windowsHide:true,timeout:timeout+2000});
+  options.beforeSignal?.();
+  const remaining=options.deadline===undefined?timeout:options.deadline-Date.now();
+  if(remaining<=0)throw new BridgeError('process_stop_pending','停止期限已到，保留自有进程和归属记录。');
+  const absolute=options.deadline===undefined?[]:[String(BigInt(options.deadline)*10000n+116444736000000000n)];
+  const {stdout}=await execute(helper,['stop',String(identity.pid),identity.startedAt,String(remaining),...absolute],{windowsHide:true,timeout:remaining+2000});
   if(JSON.parse(stdout)==='pending')throw new BridgeError('process_stop_pending','自有进程尚未退出，保留归属记录，稍后可重试。');
 }
 

@@ -54,7 +54,7 @@ export async function multiRuntimeFixture(t:TestContext,installed=false){
     const threads=await Promise.all(inspectors.map((rpc,i)=>rpc.request('thread/read',{threadId:targets[i].sessionId,includeTurns:true})));
     return targets.every(target=>current.peers.find((peer:any)=>peer.id===target.id)?.state==='ready')&&threads.every(value=>value.thread.status.type==='idle'&&value.thread.turns?.at(-1)?.status==='completed');
   },'初始输入尚未确认消费并完成原生轮次');}finally{await Promise.all(inspectors.map(rpc=>rpc.close()));}
-  const busy=async(i:number)=>{holding.add(i);await call('send',{actor:actor(sources[i],'busy-'+i),message:'MULTI_BUSY_'+i});await wait(()=>held.has(i),'真实模型请求未进入挂起状态');};
+  const busy=async(i:number,suffix='')=>{holding.add(i);await call('send',{actor:actor(sources[i],'busy-'+i+suffix),message:'MULTI_BUSY_'+i+suffix});await wait(()=>held.has(i),'真实模型请求未进入挂起状态');};
   const question=(i:number)=>call('question.create',{actor:actor(targets[i],'q-'+i),questions:[{id:'q',header:'独立',question:'选择第 '+i+' 组？',options:[{label:'甲',description:'甲'},{label:'乙',description:'乙'}]}]});
   return{root,home,call,status,wait,actor,sources,pairs,targets,endpoints,requests,errors,busy,question,release:(i:number)=>{holding.delete(i);held.get(i)?.();held.delete(i);}};
 }

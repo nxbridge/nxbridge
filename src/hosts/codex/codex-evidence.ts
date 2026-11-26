@@ -15,7 +15,7 @@ function rememberUnsupported(rpc:RpcClient,method:string,threadId:string,error:u
 }
 
                                      
-export async function catalogCodexThreads(rpc:RpcClient,ids:ReadonlySet<string>):Promise<Map<string,CodexThread>>{
+export async function catalogCodexThreads(rpc:RpcClient,ids:ReadonlySet<string>,options:{independent?:boolean;onComplete?:()=>void}={}):Promise<Map<string,CodexThread>>{
   const threads=new Map<string,CodexThread>(),deadline=performance.now()+5000;
   if(!ids.size)return threads;
   let cursor:string|undefined;
@@ -25,12 +25,13 @@ export async function catalogCodexThreads(rpc:RpcClient,ids:ReadonlySet<string>)
     const page=await rpc.request('thread/list',{limit:100,modelProviders:[],sourceKinds:['cli','vscode','exec','appServer','subAgent','subAgentReview','subAgentCompact','subAgentThreadSpawn','subAgentOther','unknown'],...(cursor?{cursor}:{})},{timeout});
     if(!Array.isArray(page.data))break;
     for(const thread of page.data)if(typeof thread?.id==='string'&&ids.has(thread.id)&&typeof thread.cwd==='string')threads.set(thread.id,thread);
-    if(threads.size===ids.size||page.nextCursor==null)break;
+    if(page.nextCursor==null){options.onComplete?.();break;}
+    if(threads.size===ids.size)break;
     if(typeof page.nextCursor!=='string'||!page.nextCursor||cursors.has(page.nextCursor))break;
     cursor=page.nextCursor;cursors.add(cursor!);
   }
                                                         
-  for(const id of ids)if(!threads.has(id)){
+  for(const id of ids)if(!options.independent&&!threads.has(id)){
     const observed=observedThreads.get(rpc)?.get(id);
     if(observed)threads.set(id,{...observed,status:undefined});
   }

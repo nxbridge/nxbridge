@@ -228,8 +228,9 @@ public static class NxHookIdentity {
   Console.Write("["+String.Join(",",rows.ToArray())+"]");return 0;
  }
  static int Stop(string[] args) {
-  uint pid,timeout;long generation;
-  if(args.Length!=4||!UInt32.TryParse(args[1],out pid)||pid==0||!Int64.TryParse(args[2],out generation)||!UInt32.TryParse(args[3],out timeout))throw new ArgumentException("invalid stop request");
+  uint pid,timeout;long generation,deadline=0;
+  if((args.Length!=4&&args.Length!=5)||!UInt32.TryParse(args[1],out pid)||pid==0||!Int64.TryParse(args[2],out generation)||!UInt32.TryParse(args[3],out timeout)
+    ||(args.Length==5&&!Int64.TryParse(args[4],out deadline)))throw new ArgumentException("invalid stop request");
   IntPtr handle=OpenProcess(0x101000,false,pid),termination=IntPtr.Zero;
   if(handle==IntPtr.Zero){if(Marshal.GetLastWin32Error()==87){Console.Write("\\"dead\\"");return 0;}throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());}
   try {
@@ -238,6 +239,7 @@ public static class NxHookIdentity {
    if(created!=generation||WaitForSingleObject(handle,0)==0){Console.Write("\\"dead\\"");return 0;}
                                               
    if(!DuplicateHandle(GetCurrentProcess(),handle,GetCurrentProcess(),out termination,1,false,0))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+   if(deadline!=0&&DateTime.UtcNow.ToFileTimeUtc()>=deadline){Console.Write("\\"pending\\"");return 0;}
    if(!TerminateProcess(termination,1)){int error=Marshal.GetLastWin32Error();if(error!=5)throw new System.ComponentModel.Win32Exception(error);}
    uint state=WaitForSingleObject(handle,timeout);
    if(state!=0&&state!=258)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());

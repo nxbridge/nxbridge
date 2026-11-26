@@ -31,6 +31,29 @@ export class DeliveryHealth {
       if(changed)this.storage.setSetting(key,value);
     });
   }
+  cancelKind(pairId:string,recipientId:string,kind:string,keep?:string):void{
+    this.storage.transaction(()=>{
+      const key=deliveryHealthKey(pairId,recipientId),value=this.storage.setting<DeliveryIncident>(key);
+      if(!value)return;
+      let changed=false;
+      for(const notice of value.notices)if(notice.kind===kind&&notice.id!==keep&&!notice.admitted&&(notice.state==='pending'||notice.state==='sending')){
+        notice.state='denied';notice.error='condition resolved before delivery';changed=true;
+      }
+      if(changed)this.storage.setSetting(key,value);
+    });
+  }
+                                       
+  promoteIdleNotices(pairId:string,recipientId:string):void{
+    this.storage.transaction(()=>{
+      const key=deliveryHealthKey(pairId,recipientId),value=this.storage.setting<DeliveryIncident>(key);
+      if(!value)return;
+      let changed=false;
+      for(const notice of value.notices)if(notice.wakeWhenIdle&&!notice.admitted&&notice.state==='pending'){
+        delete notice.wakeWhenIdle;notice.wake=true;notice.tier=4;changed=true;
+      }
+      if(changed)this.storage.setSetting(key,value);
+    });
+  }
   updatePending(pairId:string,recipientId:string,id:string,message:string,scope?:string,factKey?:string,fields?:Partial<RuntimeNotice>):void{
     this.storage.transaction(()=>{
       const key=deliveryHealthKey(pairId,recipientId),value=this.storage.setting<DeliveryIncident>(key),notice=value?.notices.find(n=>n.id===id&&!n.admitted&&(n.state==='pending'||n.state==='sending'||waitingIdle(n)));

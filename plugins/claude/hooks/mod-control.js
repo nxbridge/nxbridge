@@ -174,7 +174,7 @@ export function unpackContext(value,context){
   return value;
 }
                                                                                                  
-const LONG_OPERATIONS=new Set(['send','selection-resolve','selection-commit','partner-profile']);
+const LONG_OPERATIONS=new Set(['send','selection-resolve','selection-commit','partner-profile','partner-recover']);
 async function processCall($,operation,context,input,deadline){
   const data=JSON.stringify({operation,...context,...(modVersion?{mod_version:modVersion}:{}),...(modRevision?{mod_revision:modRevision}:{}),...input});
   const timeoutMs=deadline!==undefined?deadline-Date.now():LONG_OPERATIONS.has(operation)?135_000:operation==='turn-stop-check'||operation==='turn-completed'?6_000:undefined;

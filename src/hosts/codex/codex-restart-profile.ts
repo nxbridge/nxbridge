@@ -8,10 +8,10 @@ import { BridgeError } from '../../shared/errors.js';
 import { atomicJson, readJson, sameDirectory } from '../../shared/files.js';
 import { stateDirectory } from '../../storage/state-directory.js';
 import type { ManagedRuntime } from '../managed-runtimes.js';
-import { requireExactRestartProfile, verifyRestartProfileCurrent, type SessionProfile } from './codex-session-profile.js';
+import { planCodexResume, requireExactRestartProfile, verifyRestartProfileCurrent, type SessionProfile } from './codex-session-profile.js';
 
 interface RestartProfile {
-  version:1;owner:string;peerId:string;configHome:string;sourceId:string;pid:number;procStart:string;bootId?:string;profile:SessionProfile;
+  version:1;owner:string;peerId:string;configHome:string;sourceId:string;pid:number;procStart:string;bootId?:string;profile:SessionProfile;recycle?:true;
 }
 const file=(home:string,peerId:string)=>path.join(home,'run','codex-restart-'+createHash('sha256').update(peerId).digest('hex')+'.json');
 
@@ -19,7 +19,7 @@ function readRestartProfile(home:string,peerId:string):RestartProfile|undefined{
   try{
     const value=readJson<RestartProfile>(file(home,peerId));
     if(value.version!==1||value.owner!==managedMarker(home)||value.peerId!==peerId||!value.configHome||!value.sourceId
-      ||!Number.isSafeInteger(value.pid)||value.pid<=0||!value.procStart||!value.profile?.verified||!value.profile.complete||!value.profile.live)
+      ||!Number.isSafeInteger(value.pid)||value.pid<=0||!value.procStart||!value.profile?.verified||!value.profile.complete||(!value.profile.live&&!value.recycle))
       throw new BridgeError('restart_profile_unverified','自动重启的原会话配置记录无法核验，消息继续保留。');
     return value;
   }catch(error){
@@ -29,13 +29,14 @@ function readRestartProfile(home:string,peerId:string):RestartProfile|undefined{
 }
 
                                 
-export function prepareRestartProfile(home:string,runtime:ManagedRuntime,profile:SessionProfile):()=>void{
-  requireExactRestartProfile(profile);
+export function prepareRestartProfile(home:string,runtime:ManagedRuntime,profile:SessionProfile,options:{recycle?:true}={}):()=>void{
+  if(options.recycle)planCodexResume(profile.sessionId,profile,profile.settings.cwd??'',{exact:true});
+  else requireExactRestartProfile(profile);
   if(runtime.kind!=='owned'||!runtime.peerId||!runtime.configHome||!runtime.pid||!runtime.procStart
     ||runtime.sessionId&&runtime.sessionId!==profile.sessionId)
     throw new BridgeError('restart_profile_unverified','无法精确保存原会话的实时权限及运行设置，未自动停止原进程。');
   const value:RestartProfile={version:1,owner:managedMarker(home),peerId:runtime.peerId,configHome:runtime.configHome,
-    sourceId:runtime.id,pid:runtime.pid,procStart:runtime.procStart,bootId:runtime.bootId,profile};
+    sourceId:runtime.id,pid:runtime.pid,procStart:runtime.procStart,bootId:runtime.bootId,profile,...options};
   return()=>{
     const previous=readRestartProfile(home,value.peerId);
     if(previous?.profile.sessionId===profile.sessionId&&previous.sourceId!==value.sourceId)
@@ -52,7 +53,7 @@ export async function pendingRestartVerification(home:string,peerId:string,sessi
   const boot=currentLinuxBootId();
   if((!previous.bootId||!boot||previous.bootId===boot)&&await ownedProcessState({pid:previous.pid,startedAt:previous.procStart})!=='dead')
     throw new BridgeError('runtime_launch_unconfirmed','自动重启的原 Codex 进程尚未核验退出，未启动替代进程。');
-  await verifyRestartProfileCurrent(previous.profile);
+  await verifyRestartProfileCurrent(previous.profile,{exact:previous.recycle});
   return{sessionId,profile:previous.profile,restartSourceId:previous.sourceId};
 }
 

@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { modelError } from './model-error.js';
 import { modContextSchema } from '../mod/mod-protocol.js';
 import { claudeObservedPermission } from '../../hosts/claude/claude-inbound.js';
+import { waitForPartnerQuestion } from './question-wait.js';
 
                                                    
 async function main():Promise<void>{
@@ -23,8 +24,9 @@ async function main():Promise<void>{
   const actor:Actor={host:'claude',sessionId:identity.record.sessionId,callId:p.callId??randomUUID(),...(registered.binding?{binding:registered.binding}:{})};
   const methods={create:'question.create',get:'question.get',answer:'question.answer',answer_user:'question.answer_user',cancel:'question.cancel',cancel_turn:'question.cancel_turn',origin:'question.origin',wait:'question.wait'};
   const params={actor,...(p.form_lease?{form_lease:p.form_lease}:{}),...(p.operation==='create'?{questions:p.questions,turn_id:p.turn_id,tool_use_id:p.tool_use_id,task_message_id:p.task_message_id}:p.operation==='origin'?{message_id:p.message_id}:p.operation==='cancel_turn'?{turn_id:p.turn_id}:p.operation==='answer'||p.operation==='answer_user'?{input:p.input}:{request_id:p.request_id})};
-  let value=await brokerCall<any>(methods[p.operation],params,{mutation:['create','answer','answer_user','cancel','cancel_turn'].includes(p.operation)});
-  if(p.operation==='wait')while(value.status==='pending'||value.status==='awaiting_user')value=await brokerCall(methods.wait,params,{start:false});
+  const value= p.operation==='wait'
+    ?await waitForPartnerQuestion(params)
+    :await brokerCall(methods[p.operation],params,{mutation:['create','answer','answer_user','cancel','cancel_turn'].includes(p.operation)});
   process.stdout.write(JSON.stringify({value,context:{sessionId:identity.record.sessionId,binding:registered.binding}})+'\n');
 }
 main().catch(error=>{const detail=modelError(error);process.stderr.write(JSON.stringify({...detail,model_message:detail.message})+'\n');process.exitCode=1;});

@@ -15,7 +15,7 @@ import {MOD_REVISION} from '../mod-revision.js';
 import {NativeTerminal} from './terminal-fixture.js';
 import {stripVTControlCharacters} from 'node:util';
 
-test('实际 Claude 新进程提供搭档模型参数，空闲时自动重载且继续原会话',{skip:process.platform!=='win32',timeout:170000},async t=>{
+for(const recoveryOnly of [false,true])test(recoveryOnly?'实际 Claude 通过 ToolSearch 延迟加载并调用 recover_partner':'实际 Claude 新进程提供搭档模型参数，空闲时自动重载且继续原会话',{skip:process.platform!=='win32',timeout:170000},async t=>{
   const temp=temporaryDirectory(),root=temp.directory,home=path.join(root,'bridge'),claudehome=path.join(root,'claude'),codexhome=path.join(root,'codex');
   for(const directory of [home,claudehome,codexhome])mkdirSync(directory,{recursive:true});
   const requests:any[]=[],errors:string[]=[],discovery:Record<string,string>={};let phase='init',terminal:NativeTerminal|undefined,passed=false;
@@ -24,10 +24,16 @@ test('实际 Claude 新进程提供搭档模型参数，空闲时自动重载且
     if(!req.url?.includes('/v1/messages')||req.url.includes('count_tokens')){res.writeHead(200,{'content-type':'application/json'});res.end('{"input_tokens":1,"data":[]}');return;}
     const body=JSON.parse(raw);requests.push({phase,body});
     const tools=body.tools??[];
-    for(const name of ['reload_plugins','config','checkpoint','read_messages','choose_partner','set_enabled','answer_question','select_partner']){const tool=tools.find((item:any)=>item.name==='mcp__nxbridge__'+name);discovery[name]=tool?(tool.defer_loading===true?'deferred':'loaded'):(discovery[name]??'absent');}
+    for(const name of ['reload_plugins','config','checkpoint','read_messages','recover_partner','choose_partner','set_enabled','answer_question','select_partner']){const tool=tools.find((item:any)=>item.name==='mcp__nxbridge__'+name);discovery[name]=tool?(tool.defer_loading===true?'deferred':'loaded'):(discovery[name]??'absent');}
     const text='SELF_RELOAD_DONE_'+phase,id='reload-'+requests.length;
+    const content=(body.messages??[]).flatMap((message:any)=>Array.isArray(message.content)?message.content:[]);
+    const searchId='recover-search',previewId='recover-preview',hasResult=(tool_use_id:string)=>content.some((entry:any)=>entry.type==='tool_result'&&entry.tool_use_id===tool_use_id);
+    const searchReady=content.some((entry:any)=>entry.type==='tool_result'&&entry.tool_use_id===searchId&&!entry.is_error
+      &&entry.content?.some((reference:any)=>reference.type==='tool_reference'&&reference.tool_name==='mcp__nxbridge__recover_partner'));
+    const control=recoveryOnly&&phase==='after'&&!hasResult(searchId)?{id:searchId,name:'ToolSearch',input:{query:'select:mcp__nxbridge__recover_partner'}}:
+      recoveryOnly&&phase==='after'&&searchReady&&!hasResult(previewId)?{id:previewId,name:'mcp__nxbridge__recover_partner',input:{action:'preview'}}:undefined;
     res.writeHead(200,{'content-type':'text/event-stream'});
-    const events=[{type:'message_start',message:{id,type:'message',role:'assistant',model:body.model,content:[],stop_reason:null,stop_sequence:null,usage:{input_tokens:10,output_tokens:1}}},{type:'content_block_start',index:0,content_block:{type:'text',text:''}},{type:'content_block_delta',index:0,delta:{type:'text_delta',text}},{type:'content_block_stop',index:0},{type:'message_delta',delta:{stop_reason:'end_turn',stop_sequence:null},usage:{output_tokens:5}},{type:'message_stop'}];
+    const events=[{type:'message_start',message:{id,type:'message',role:'assistant',model:body.model,content:[],stop_reason:null,stop_sequence:null,usage:{input_tokens:10,output_tokens:1}}},{type:'content_block_start',index:0,content_block:control?{type:'tool_use',...control,input:{}}:{type:'text',text:''}},{type:'content_block_delta',index:0,delta:control?{type:'input_json_delta',partial_json:JSON.stringify(control.input)}:{type:'text_delta',text}},{type:'content_block_stop',index:0},{type:'message_delta',delta:{stop_reason:control?'tool_use':'end_turn',stop_sequence:null},usage:{output_tokens:5}},{type:'message_stop'}];
     for(const event of events)res.write('event: '+event.type+'\ndata: '+JSON.stringify(event)+'\n\n');res.end();
   }catch(error){errors.push(String(error));res.writeHead(500);res.end(String(error));}});
   await new Promise<void>(resolve=>model.listen(0,'127.0.0.1',resolve));
@@ -40,12 +46,14 @@ test('实际 Claude 新进程提供搭档模型参数，空闲时自动重载且
   writeFileSync(path.join(claudehome,'.claude.json'),JSON.stringify({hasCompletedOnboarding:true,customApiKeyResponses:{approved:[env.ANTHROPIC_API_KEY.slice(-20)],rejected:[]},projects:{[root.replaceAll('\\','/')]:{hasTrustDialogAccepted:true}}}),'utf8');
   writeFileSync(path.join(claudehome,'settings.json'),JSON.stringify({crossSessionInbound:'accept',env:{ANTHROPIC_API_KEY:env.ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL:env.ANTHROPIC_BASE_URL,CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1'}}),'utf8');
   const marketplace=await preparePlugins(home,{packageRoot:path.join(PACKAGE_ROOT,'publish')}),plugin=path.join(marketplace,'plugins/claude'),registerFile=path.join(plugin,'hooks/register.js'),original=readFileSync(registerFile,'utf8');
-  assert.ok(original.includes(MOD_REVISION),'发布 Mod 与测试修订号不一致');writeFileSync(registerFile,original.replaceAll(MOD_REVISION,'0000000000000000'),'utf8');
+  const initialRevision=recoveryOnly?MOD_REVISION:'0000000000000000';
+  assert.ok(original.includes(MOD_REVISION),'发布 Mod 与测试修订号不一致');
+  if(!recoveryOnly)writeFileSync(registerFile,original.replaceAll(MOD_REVISION,initialRevision),'utf8');
   await runCli('claude',['plugin','validate',plugin],{cwd:root,home,timeout:15000});(await ensureBroker(home)).close();const cli=resolveCli('claude');
   terminal=await NativeTerminal.start(root,home,cli.command,[...cli.prefix,'--plugin-dir',plugin,'--model','claude-sonnet-4-6'],root,{...process.env,TERM:'xterm-256color',COLORTERM:'truecolor'});
   const status=()=>brokerCall<any>('status',{}, {home}),wait=(predicate:()=>boolean|Promise<boolean>,reason:string)=>terminal!.wait(predicate,reason,35000);
                                                                      
-  await wait(async()=>stripVTControlCharacters(terminal!.output).includes('for shortcuts')&&(await status()).endpoints.some((endpoint:any)=>endpoint.modRevision==='0000000000000000'&&endpoint.nativeDecision),'原生 Claude 启动未就绪');
+  await wait(async()=>stripVTControlCharacters(terminal!.output).includes('for shortcuts')&&(await status()).endpoints.some((endpoint:any)=>endpoint.modRevision===initialRevision&&endpoint.nativeDecision),'原生 Claude 启动未就绪');
   await terminal.prompt('初始化原生自行重载验收');await wait(()=>terminal!.output.includes('SELF_RELOAD_DONE_init'),'初始化轮次未结束');
                                                     
   const select=requests.find(request=>request.phase==='init'&&request.body.tools?.some((tool:any)=>tool.name==='mcp__nxbridge__select_partner'))?.body.tools.find((tool:any)=>tool.name==='mcp__nxbridge__select_partner');
@@ -55,18 +63,28 @@ test('实际 Claude 新进程提供搭档模型参数，空闲时自动重载且
   assert.deepEqual(select.input_schema.properties.service_tier,{type:'string',enum:['standard','fast']});
   assert.equal(select.input_schema.additionalProperties,false);
   t.diagnostic(JSON.stringify({freshSelectPartnerProfile:true,model:select.input_schema.properties.model,effort:select.input_schema.properties.effort,serviceTier:select.input_schema.properties.service_tier}));
-  const initial=await status(),c=initial.peers.find((peer:any)=>peer.host==='claude'&&peer.context);assert.ok(c);assert.ok(initial.endpoints.some((endpoint:any)=>endpoint.peerId===c.id&&endpoint.modRevision==='0000000000000000'));
+  const initial=await status(),c=initial.peers.find((peer:any)=>peer.host==='claude'&&peer.context);assert.ok(c);assert.ok(initial.endpoints.some((endpoint:any)=>endpoint.peerId===c.id&&endpoint.modRevision===initialRevision));
                                                                         
   await wait(async()=>(await status()).endpoints.some((endpoint:any)=>endpoint.peerId===c.id&&endpoint.nativeDecision?.bash==='ask'&&!endpoint.nativeDecision.rule),'普通模式的引擎判定没有登记为 ask');
   const native=await processIdentity(process.pid),x=await brokerCall<any>('register',{host:'codex',sessionId:'self-reload-counterpart',cwd:root,kind:'root',permission:'prompting',endpoint:{mode:'embedded',address:'',epoch:'counterpart',pid:native.pid,procStart:native.startedAt}},{home});await brokerCall('pair',{claude:c.id,codex:x.id},{home});
                                                 
-  const beforeReload=requests.length;phase='reload';writeFileSync(registerFile,original,'utf8');
-  await wait(async()=>{const current=await status();return current.endpoints.some((endpoint:any)=>endpoint.peerId===c.id&&endpoint.active&&endpoint.modRevision===MOD_REVISION)&&!current.capabilities.integrationIssues.some((issue:any)=>issue.peerId===c.id&&issue.code==='mod_stale');},'实际插件没有重载为当前修订号');
-  assert.equal(requests.length,beforeReload,'自动重载不应额外调用模型');
+  if(!recoveryOnly){
+    const beforeReload=requests.length;phase='reload';writeFileSync(registerFile,original,'utf8');
+    await wait(async()=>{const current=await status();return current.endpoints.some((endpoint:any)=>endpoint.peerId===c.id&&endpoint.active&&endpoint.modRevision===MOD_REVISION)&&!current.capabilities.integrationIssues.some((issue:any)=>issue.peerId===c.id&&issue.code==='mod_stale');},'实际插件没有重载为当前修订号');
+    assert.equal(requests.length,beforeReload,'自动重载不应额外调用模型');
+  }
                                            
   t.diagnostic(JSON.stringify({discovery}));
   for(const name of ['answer_question','select_partner'])assert.equal(discovery[name],'loaded',name+' 应常驻');
+  assert.equal(discovery.recover_partner,'absent','回收工具不能在首次请求时预加载');
   phase='after';const offset=terminal.output.length;await terminal.prompt('重载后继续原任务');await wait(()=>terminal!.output.slice(offset).includes('SELF_RELOAD_DONE_after'),'重载后原生模型无法继续');
+  if(recoveryOnly){
+    const learned=requests.filter(request=>request.phase==='after').flatMap(request=>request.body.messages??[])
+      .flatMap((message:any)=>Array.isArray(message.content)?message.content:[]);
+    assert.ok(learned.some((entry:any)=>entry.type==='tool_result'&&entry.tool_use_id==='recover-search'&&!entry.is_error
+      &&entry.content?.some((reference:any)=>reference.type==='tool_reference'&&reference.tool_name==='mcp__nxbridge__recover_partner')));
+    assert.ok(learned.some((entry:any)=>entry.type==='tool_result'&&entry.tool_use_id==='recover-preview'&&!entry.is_error&&/incident/.test(JSON.stringify(entry.content))));
+  }
   const after=await status();assert.equal(after.peers.find((peer:any)=>peer.id===c.id)?.sessionId,c.sessionId);assert.ok(after.endpoints.some((endpoint:any)=>endpoint.peerId===c.id&&endpoint.active&&endpoint.pid===terminal!.identity.pid));assert.equal(after.messages.length,0);assert.equal(errors.length,0);passed=true;
-  t.diagnostic(JSON.stringify({nativePid:terminal.identity.pid,automaticReload:true,extraModelRequests:0,newRevision:MOD_REVISION,sameSession:true,nextTurn:true,ordinaryMessages:0,realModelCalls:0}));
+  t.diagnostic(JSON.stringify({nativePid:terminal.identity.pid,automaticReload:!recoveryOnly,deferredRecovery:recoveryOnly,newRevision:MOD_REVISION,sameSession:true,nextTurn:true,ordinaryMessages:0,realModelCalls:0}));
 });
