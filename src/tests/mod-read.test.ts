@@ -12,13 +12,14 @@ import {ensureHome} from '../ipc/home.js';
 import {PACKAGE_ROOT} from '../shared/package-location.js';
 import { windowKey } from '../integration/hooks/session-bindings.js';
 import { openModReadReceipt, bindModReadReceipt } from '../integration/mod/mod-read-receipt.js';
-import { ModReadServer, type ModReadTransport } from '../integration/mod/mod-read-server.js';
+import { FETCH_BLOCKED_PORTS, ModReadServer, type ModReadTransport } from '../integration/mod/mod-read-server.js';
 import { acknowledgeRuntimeNotice } from '../broker/health/runtime-monitor.js';
 import { Store } from '../storage/store.js';
 import { Broker, type Adapters } from '../broker/coordinator.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
 import {type Actor} from '../types.js';
 import { ForegroundHealth } from '../broker/health/foreground-health.js';
+import type http from 'node:http';
 
 async function window(home:string,configHome:string,pid:number){
   mkdirSync(path.join(configHome,'sessions'),{recursive:true});
@@ -32,6 +33,51 @@ function request(transport:ModReadTransport,operation:'status'|'monitor',change:
   return{body:JSON.stringify({operation,...change}),headers:{'Content-Type':'application/json','X-Nxbridge-Id':transport.id,Authorization:'Bearer '+transport.secret}};
 }
 const send=(transport:ModReadTransport,input:ReturnType<typeof request>)=>fetch(transport.url,{method:'POST',...input});
+
+test('HTTP 禁用端口表与当前 Node Fetch 一致，核验不发出网络请求',async()=>{
+  const noNetwork=new Error('只核对端口，不建立连接'),blocked:number[]=[];
+  const options:RequestInit&{dispatcher:{dispatch(options:unknown,handler:{onError(error:Error):void}):boolean}}={
+    dispatcher:{dispatch(_options,handler){handler.onError(noNetwork);return true;}}
+  };
+  for(let port=1;port<=65535;port++){
+    try{await fetch('http://127.0.0.1:'+port+'/',options);assert.fail('核验请求不能建立连接');}
+    catch(error){
+      const cause=(error as Error).cause;
+      if(cause===noNetwork)continue;
+      assert.equal((cause as Error)?.message,'bad port','端口 '+port);
+      blocked.push(port);
+    }
+  }
+  assert.deepEqual([...FETCH_BLOCKED_PORTS].sort((a,b)=>a-b),blocked);
+});
+
+test('监听建立后出现接收错误会留下诊断，后续能力读取仍可继续',async t=>{
+  const temp=temporaryDirectory(),server=new ModReadServer(temp.directory,async()=>({ok:true}));
+  t.after(async()=>{await server.close();await temp.cleanup();});
+  const transport=await server.open({} as any,{host:'claude',sessionId:'session',callId:'call',binding:{key:'window',epoch:'epoch'}},'native');
+  const stderr=t.mock.method(process.stderr,'write',()=>true);
+  (server as any).server.emit('error',Object.assign(new Error('接收句柄不足'),{code:'EMFILE'}));
+  assert.ok(stderr.mock.calls.some(call=>String(call.arguments[0]).includes('接收句柄不足')));
+  assert.deepEqual(await(await send(transport,request(transport,'status'))).json(),{ok:true});
+});
+
+test('系统分配 Fetch 禁用端口时先关闭监听，再签发可读取的本机能力',async t=>{
+  const temp=temporaryDirectory(),server=new ModReadServer(temp.directory,async()=>({ok:true}));
+  t.after(async()=>{await server.close();await temp.cleanup();});
+  const opening=server.open({} as any,{host:'claude',sessionId:'session',callId:'call',binding:{key:'window',epoch:'epoch'}},'native');
+  const listener=(server as any).server as http.Server,address=listener.address.bind(listener);
+  let firstBinding=true,bindings=0,closedBeforeCapability=false;
+  t.mock.method(listener,'address',()=>{
+    const actual=address();
+    return firstBinding&&actual&&typeof actual==='object'?{...actual,port:6000}:actual;
+  });
+  listener.on('listening',()=>bindings++);
+  listener.once('close',()=>{firstBinding=false;closedBeforeCapability=true;});
+  const transport=await opening;
+  assert.ok(bindings>=2);assert.equal(closedBeforeCapability,true);
+  assert.notEqual(new URL(transport.url).port,'6000');
+  assert.deepEqual(await(await send(transport,request(transport,'status'))).json(),{ok:true});
+});
 
 test('交接排空禁止 Mod 新读取及已取票的提交，回滚保留原连接能力',async t=>{
   const temp=temporaryDirectory(),home=path.join(temp.directory,'bridge');await ensureHome(home);

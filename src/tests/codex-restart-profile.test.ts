@@ -1,10 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, writeFileSync } from 'node:fs';
+import fs, { appendFileSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { completeRestartProfile, pendingRestartVerification, prepareRestartProfile } from '../hosts/codex/codex-restart-profile.js';
-import { readSessionProfile, resumeSession, snapshotLiveSession, verifyResumedSession, requireExactRestartProfile, readLiveServiceTier, type SessionProfile } from '../hosts/codex/codex-session-profile.js';
+import { CodexAdapter } from '../hosts/codex/adapter.js';
+import { DEFAULT_CONFIG } from '../config/defaults.js';
+import { readSessionProfile, resumeSession, snapshotLiveSession, verifyResumedSession, requireExactRestartProfile, readLiveServiceTier, verifyRestartProfileCurrent, type SessionProfile } from '../hosts/codex/codex-session-profile.js';
 import { removeManagedRuntime, runtimeFor, saveManagedRuntime, type ManagedRuntime } from '../hosts/managed-runtimes.js';
 import { managedMarker } from '../install/installation.js';
 import type { RpcClient } from '../ipc/rpc.js';
@@ -18,6 +21,64 @@ const snapshot=(sessionId:string):SessionProfile=>({sessionId,offset:0,settingsO
 const row=(type:string,payload:object)=>JSON.stringify({type,payload})+'\n';
 const persisted={permission_profile:permission,model:settings.model,reasoning_effort:settings.reasoningEffort,service_tier:'priority',approval_policy:settings.approvalPolicy,approvals_reviewer:settings.approvalsReviewer,cwd:settings.cwd};
 const update=(sessionId:string,threadSettings:object)=>row('event_msg',{type:'thread_settings_applied',thread_id:sessionId,thread_settings:threadSettings});
+
+test('并发读取只推进完整记录，跨写入的多字节尾行等待补完，损坏完整行仍拒绝',async t=>{
+  const file=path.join(temporary(t),'live.jsonl'),id='tail',prefix=row('session_meta',{id})+update(id,persisted);
+  writeFileSync(file,prefix);
+  const baseline=await readSessionProfile(file,id,{trackWork:true});
+  const stable=row('event_msg',{type:'agent_message',message:'记录完成'}),next=Buffer.from(update(id,{...persisted,model:'新模型'}));
+  const split=next.indexOf(Buffer.from('新'))+1;
+  appendFileSync(file,Buffer.concat([Buffer.from(stable),next.subarray(0,split)]));
+  const reads=await Promise.all(Array.from({length:12},()=>readSessionProfile(file,id,{trackWork:true})));
+  for(const partial of reads){
+    assert.equal(partial.offset,Buffer.byteLength(prefix+stable));assert.equal(partial.pendingTail,true);
+    assert.equal(partial.settings.model,persisted.model);
+  }
+  await assert.rejects(verifyRestartProfileCurrent(baseline,{current:reads[0]}),{code:'restart_profile_pending_tail'});
+  appendFileSync(file,next.subarray(split));const complete=await readSessionProfile(file,id,{trackWork:true});
+  assert.equal(complete.offset,Buffer.byteLength(prefix+stable)+next.length);assert.equal(complete.pendingTail,undefined);
+  assert.equal(complete.settings.model,'新模型');
+  appendFileSync(file,'{"type":"turn_context","payload":\n{"type":');const corrupted=await readSessionProfile(file,id,{trackWork:true});
+  assert.equal(corrupted.pendingTail,undefined);
+  await assert.rejects(verifyRestartProfileCurrent(complete,{current:corrupted}),{code:'restart_profile_changed'});
+});
+
+test('轮换后大小和修改时间相同，精确文件编号仍使旧权限快照失效',async t=>{
+  const dir=temporary(t),file=path.join(dir,'current.jsonl'),replacement=path.join(dir,'next.jsonl'),id='rotated';
+  const time=new Date('2026-11-26T00:00:00.000Z');
+  for(const [name,model] of [[file,'first'],[replacement,'other']] as const){
+    writeFileSync(name,row('session_meta',{id})+update(id,{...persisted,model}));
+    fs.utimesSync(name,time,time);
+  }
+  const {statSync,fstatSync}=fs;
+  const old=statSync(file,{bigint:true}),fresh=statSync(replacement,{bigint:true});
+  assert.notEqual(old.ino,fresh.ino);assert.equal(old.size,fresh.size);assert.equal(old.mtimeNs,fresh.mtimeNs);
+                                                    
+  const aliases=[[old.ino,2n**63n],[fresh.ino,2n**63n+1n]] as const;
+  const aliased=(stat:fs.Stats|fs.BigIntStats)=>{
+    const alias=aliases.find(([inode])=>typeof stat.ino==='bigint'?inode===stat.ino:Number(inode)===stat.ino)?.[1];
+    if(alias!==undefined)Object.assign(stat,{ino:typeof stat.ino==='bigint'?alias:Number(alias)});
+    return stat;
+  };
+  const mockStat=t.mock.method(fs,'statSync',((name:fs.PathLike,options?:fs.StatOptions)=>{
+    const stat=statSync(name,options);return stat&&aliased(stat);
+  }) as typeof fs.statSync);
+  const mockFstat=t.mock.method(fs,'fstatSync',((fd:number,options?:fs.StatOptions)=>aliased(fstatSync(fd,options))) as typeof fs.fstatSync);
+  syncBuiltinESMExports();
+  try{
+    assert.equal(fs.statSync(file).ino,fs.statSync(replacement).ino);
+    const baseline=await readSessionProfile(file,id);
+    assert.equal(baseline.settings.model,'first');
+    const pending=readSessionProfile(file,id);
+    fs.renameSync(file,path.join(dir,'previous.jsonl'));fs.renameSync(replacement,file);
+    const actual=await readSessionProfile(file,id);
+    assert.equal((await pending).settings.model,'first');assert.equal(actual.settings.model,'other');
+    const persistedProfile:SessionProfile=JSON.parse(JSON.stringify(actual));
+    assert.deepEqual(persistedProfile.settings,actual.settings);
+    assert.equal(persistedProfile.meta.id,id);
+    await assert.rejects(verifyRestartProfileCurrent(baseline,{exact:true,current:actual}),{code:'restart_profile_changed'});
+  }finally{mockStat.mock.restore();mockFstat.mock.restore();syncBuiltinESMExports();}
+});
 
 test('旧 Codex 账本移除后仍核验原代次、恢复原权限并在替代代次核验后结清',async t=>{
   const home=temporary(t),peerId=randomUUID(),sessionId=randomUUID(),current=await processIdentity(process.pid);
@@ -62,6 +123,20 @@ test('旧 Codex 账本移除后仍核验原代次、恢复原权限并在替代�
   completeRestartProfile(home,ready);
   assert.equal(await pendingRestartVerification(home,peerId,sessionId,home),undefined);
   assert.deepEqual(runtimeFor(home,{id:replacement.id})!.value.sessionVerification,expected,'清除替代记录中的核验字段前仍可接续');
+
+  prepareRestartProfile(home,source,original)();
+  saveManagedRuntime(home,{...replacement,state:'failed'});
+  const adapter=new CodexAdapter(DEFAULT_CONFIG,home);
+  const generation={runtimeId:replacement.id,endpoint:replacement.endpoint,pid:replacement.pid!,procStart:replacement.procStart!,bootId:replacement.bootId};
+  try{
+    adapter.finalizeRecycle(peerId,sessionId,{...generation,procStart:'另一代次'},source.id);
+    adapter.finalizeRecycle(peerId,sessionId,generation,'另一轮回收');
+    assert.deepEqual(await pendingRestartVerification(home,peerId,sessionId,home),expected);
+    adapter.finalizeRecycle(peerId,sessionId,generation,source.id);
+    assert.equal(await pendingRestartVerification(home,peerId,sessionId,home),undefined);
+    const finalized=runtimeFor(home,{id:replacement.id})!.value;
+    assert.equal(finalized.sessionVerification,undefined);assert.equal(finalized.state,'failed');
+  }finally{adapter.close();}
 });
 
 test('停止预约中断后原代继续使用不同配置，保留会话并拒绝覆盖',async t=>{

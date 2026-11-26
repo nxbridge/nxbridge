@@ -77,6 +77,57 @@ test('封存等待公开请求和 Mod 的实际内层工作，丢弃迟到生产
   const read=new Store(f.file);try{assert.equal(read.setting('admitted-internal'),'settled');assert.equal(read.setting('late'),undefined);}finally{read.close();}
 });
 
+test('排空等待进行中的完成结算，新协调器接续后不能重复返还提醒次数',async t=>{
+  const f=fixture(t),entered=barrier(),complete=barrier(),authority=f.c.id,scope='custody-scope',id='completion-during-drain';
+  const budget=f.broker.turnEnds.budget;
+  assert.ok(budget.admit(authority,id,scope));assert.ok(budget.started(authority,id,scope,'foreground-turn'));
+  const broker=f.broker as unknown as {dispatchRequest(method:string,raw:unknown):Promise<unknown>};
+  const original=broker.dispatchRequest.bind(broker);
+  broker.dispatchRequest=async(method,raw)=>{
+    if(method!=='fixture.completion')return original(method,raw);
+    entered.open();await complete.wait;
+    assert.ok(budget.completed(authority,id,scope,'foreground-turn',true));return{};
+  };
+  const completion=f.broker.dispatch('fixture.completion',{});await entered.wait;
+  let committed=false;
+  const handoff=f.broker.sealForHandoff({updateId:'budget-drain',signal:new AbortController().signal,commit:()=>{committed=true;}});
+  try{
+    await assert.rejects(f.broker.dispatch('ping',{}),{code:'handoff_retry'});
+    assert.equal(committed,false);assert.equal(budget.status(authority).used,1);
+  }finally{complete.open();}
+  await completion;(await handoff).close();assert.equal(committed,true);
+  const store=new Store(f.file),next=new Broker(store,DEFAULT_CONFIG,{codex:new HandoffAdapter(),claude:new FakeAdapter()} as unknown as Adapters,path.dirname(f.file));
+  try{
+    const resumed=next.turnEnds.budget;
+    assert.deepEqual(resumed.status(authority),{used:0,limit:4,remaining:4,awaitingProof:0});
+    assert.equal(resumed.completed(authority,id,scope,'foreground-turn',true),false);
+    assert.equal(resumed.admit(authority,id,scope),undefined,'已经进入过宿主的提醒不能因返还次数再提交');
+    assert.equal(store.setting<{version:number}>('completionWakeBudget:'+authority)?.version,2);
+  }finally{await next.stop();store.close();}
+});
+
+for(const phase of ['reserved','retryable','started'] as const)test(`旧版 ${phase} 预约经过封存交接后由新版继续结算`,async t=>{
+  const f=fixture(t),authority=f.c.id,scope='legacy-custody',id='legacy-completion',key='completionWakeBudget:'+authority;
+  const legacy={version:1,epoch:'human-before-update',human:{id:'human-before-update',at:10},limit:4,used:1,
+    reservations:[{id,scope,at:20,...(phase==='retryable'?{retryable:true as const}:{}),...(phase==='started'?{turnId:'bound-turn'}:{})}]};
+  f.store.setSetting(key,legacy);
+  (await f.broker.sealForHandoff({updateId:'legacy-budget-'+phase,signal:new AbortController().signal,commit:()=>{}})).close();
+  const store=new Store(f.file),next=new Broker(store,DEFAULT_CONFIG,{codex:new HandoffAdapter(),claude:new FakeAdapter()} as unknown as Adapters,path.dirname(f.file));
+  try{
+    const budget=next.turnEnds.budget;
+    assert.equal(budget.status(authority).used,1);assert.deepEqual(store.setting(key),legacy,'新版先读取，不提前改写旧记录');
+    if(phase==='retryable')assert.deepEqual(budget.admit(authority,id,scope),{epoch:legacy.epoch});
+    else assert.equal(budget.admit(authority,id,scope),undefined,'没有明确写入前失败证明时不重投');
+    assert.ok(budget.started(authority,id,scope,'bound-turn'));
+    assert.equal(budget.completed(authority,id,scope,'bound-turn',true),true);
+    assert.equal(budget.status(authority).used,0);
+    const saved=store.setting<{version:number;epoch:string;reservations:{state:string;turnId?:string}[]}>(key)!;
+    assert.equal(saved.version,2);assert.equal(saved.epoch,legacy.epoch);assert.equal(saved.reservations[0]?.state,'refunded');
+    assert.equal(saved.reservations[0]?.turnId,'bound-turn');
+    assert.equal(budget.completed(authority,id,scope,'bound-turn',true),false);
+  }finally{await next.stop();store.close();}
+});
+
 test('可回滚排空只唤醒支持重连的等待，恢复原接入和问题',async t=>{
   const f=fixture(t),created=await f.question(),abort=new AbortController();
   const q={actor:f.cx,request_id:created.request_id,handoff:1};

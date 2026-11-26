@@ -1,14 +1,14 @@
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import path from 'node:path';
-import type { CodexRecycleEvidence, CodexRecycleGeneration, CodexRecycleLaunch, CodexRecycleTrigger, CodexRecycleWork } from '../../broker/recovery/codex-recycle.js';
+import { isCodexRecycleTransientObservation, recycleEvidenceReadFailure, type CodexRecycleEvidence, type CodexRecycleGeneration, type CodexRecycleLaunch, type CodexRecycleTrigger, type CodexRecycleWork } from '../../broker/recovery/codex-recycle.js';
 import { removeOwnedSocket } from '../../ipc/home.js';
 import type { RpcClient } from '../../ipc/rpc.js';
 import { currentLinuxBootId, ownedProcesses, ownedRecordState, retireDeadOwnedProcess } from '../../process/owned-processes.js';
 import { ownedProcessState, stopOwnedProcess } from '../../process/process-stop.js';
 import { liveProcess, nativeConfigHome, processIdentity } from '../../process/process.js';
 import { assertRuntimeWorkloadIdle, configuredMcpInfrastructure, mcpCommands, nxbridgeMcpCommands, nxbridgeRuntimeInfrastructure, ownedWindowsConsoleInfrastructure } from '../../process/runtime-workload.js';
-import { BridgeError, describeError } from '../../shared/errors.js';
+import { BridgeError } from '../../shared/errors.js';
 import { sameDirectory } from '../../shared/files.js';
 import type { Endpoint, Peer } from '../../types.js';
 import { managedRuntimeNativeState, managedRuntimeState, removeManagedRuntime, runtimeFor, type ManagedRuntime } from '../managed-runtimes.js';
@@ -160,6 +160,7 @@ export function planExactCodexRecycle(profile:SessionProfile,cwd:string):Record<
 export async function collectCodexRecycleEvidence(options:CollectOptions):Promise<CodexRecycleObservation> {
   const {home,peer,endpoint,trigger}=options,id=peer.sessionId;
   let eligible=trigger!=='loaded_unleased',rpc:RpcClient|undefined,loaded: Set<string>|undefined;
+  let evidenceSource='catalog';
   let recentTurns:Map<string,{latest:TurnSummary|null|undefined}>|undefined;
   try{
     if(!eligible){
@@ -172,6 +173,7 @@ export async function collectCodexRecycleEvidence(options:CollectOptions):Promis
       eligible=summaries.some(turn=>turn?.status==='inProgress'&&typeof turn.id==='string'&&!!turn.id)&&(options.hasHeldInput?.()??true);
       if(!eligible)return {evidence:{kind:'natural',...(summaries.every(turn=>turn?.status&&terminal.has(turn.status))?{idleLoaded:true}:{})}};
     }
+    evidenceSource='托管运行时归属记录';
     const runtime=endpoint.runtimeId?runtimeFor(home,{id:endpoint.runtimeId})?.value:undefined,nativeEndpoint=endpoint.native??endpoint;
     if(!id||peer.host!=='codex'||peer.owner!=='nxbridge'||!['root','fork'].includes(peer.kind)||endpoint.peerId!==peer.id||endpoint.mode!=='app-server'||endpoint.daemon
       ||endpoint.processKind==='foreground'||endpoint.nativeSession?.interactive
@@ -183,10 +185,12 @@ export async function collectCodexRecycleEvidence(options:CollectOptions):Promis
     if(!records.some(record=>record.role==='codex-runtime'&&record.peerId===peer.id&&record.configHome&&sameDirectory(record.configHome,runtime.configHome!)
       &&(record.native?.pid===old.pid&&record.native.startedAt===old.procStart||record.identity.pid===old.pid&&record.identity.startedAt===old.procStart)))
       throw authorityError();
+    evidenceSource='process';
     const native=await verifyCodexNativeGeneration(runtime);
     await verifyDedicatedCodex(runtime.endpoint,native);
     const observedHome=await nativeConfigHome(native,'codex');
     if(observedHome&&!sameDirectory(observedHome,runtime.configHome))throw new BridgeError('original_home_changed','当前原生后台与记录的原配置目录不一致。');
+    evidenceSource='catalog';
     rpc??=await options.connect(runtime.endpoint);
     const connection=rpc;
     const version=codexServerVersion(rpc);
@@ -195,17 +199,24 @@ export async function collectCodexRecycleEvidence(options:CollectOptions):Promis
     loaded??=await loadedCodexThreads(rpc);
     const registry=loaded;
     if(!loaded.has(id)&&trigger!=='cold_exhausted')return {evidence:{kind:'natural'}};
+    evidenceSource='rollout';
     const savedFile=originalRollout(runtime,endpoint.nativeSession?.transcriptPath),savedRollout=savedFile?await readSessionProfile(savedFile,id,{trackWork:true}):undefined;
+                                   
+    if(savedRollout?.pendingTail)await verifyRestartProfileCurrent(savedRollout,{current:savedRollout});
+    evidenceSource='catalog';
     const {threads,originalRootOmitted}=await readCodexRecycleScope(rpc,id,{registry:loaded,ownedRootRollout:savedRollout});
+    evidenceSource='rollout';
     const root=threads.get(id)!,file=originalRollout(runtime,root.path)??savedFile;
     if(!file||savedFile&&!sameDirectory(savedFile,file)||!sameDirectory(root.cwd,peer.cwd))throw profileError();
     const persisted=savedRollout??await readSessionProfile(file,id,{trackWork:true});
+    evidenceSource='profile';
     const profile=withPersistedCodexPermission(persisted);
     if(!profile.file||!sameDirectory(profile.file,file)||profile.sessionId!==id)throw profileError();
     await verifyRestartProfileCurrent(profile,{exact:true,current:persisted});
     const args=planExactCodexRecycle(profile,peer.cwd);
     await options.preflight(runtime,profile,args,rpc);
 
+    evidenceSource='history';
     const work:CodexRecycleWork={activeTurnIds:[],progress:'idle',roles:[],unresolved:[]};
     let lastProgressAt:number|undefined;
     const roots=[...threads.values()];
@@ -234,6 +245,7 @@ export async function collectCodexRecycleEvidence(options:CollectOptions):Promis
         return true;
       }});
     }catch{work.unresolved.push('process_scope_unavailable');}
+    evidenceSource='catalog';
     const refreshed=await loadedCodexThreads(rpc);
     if(refreshed.size!==registry.size||[...refreshed].some(threadId=>!registry.has(threadId)))throw lineageError();
     work.lastProgressAt=lastProgressAt;
@@ -241,8 +253,8 @@ export async function collectCodexRecycleEvidence(options:CollectOptions):Promis
     return {runtime,profile,evidence:{kind:'available',old,profile:{sourceId:runtime.id,sessionId:id,file,settingsKey:settingsKey(args,profile,runtime),lineage:originalRootOmitted?'saved_rollout':'native_catalog',
       launch:{executable:runtime.executable,version,configHome:runtime.configHome,method:runtime.launchMethod,profileId:runtime.profileId,commandKey:runtime.launchCommandKey}},work}};
   }catch(error){
-    if(!eligible)return {evidence:{kind:'natural'}};
-    return {evidence:{kind:'held',code:error instanceof BridgeError?error.code:'codex_recycle_evidence_unverified',reason:describeError(error).slice(0,1200)}};
+    if(!eligible&&!(error instanceof BridgeError&&isCodexRecycleTransientObservation(error.code)))return {evidence:{kind:'natural'}};
+    return {evidence:recycleEvidenceReadFailure(evidenceSource,error)};
   }finally{rpc?.close();}
 }
 
@@ -255,10 +267,10 @@ export async function inspectCodexRecycleOld(home:string,old:CodexRecycleGenerat
   const boot=currentLinuxBootId();
   if(old.bootId&&boot&&old.bootId!==boot||!liveProcess(old.pid))return 'dead';
   if(record&&await managedRuntimeNativeState(home,record.value)==='alive')return 'alive';
-                                        
+                                           
   try{
     const current=await processIdentity(old.pid);
-    if(current.startedAt!==old.procStart)return 'unknown';
+    if(current.startedAt!==old.procStart)return 'dead';
   }catch(error){if(!(error instanceof BridgeError)||error.code!=='process_missing')return 'unknown';}
   return ownedProcessState({pid:old.pid,startedAt:old.procStart});
 }

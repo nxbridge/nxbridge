@@ -1,4 +1,5 @@
-import { open } from 'node:fs/promises';
+import { statSync, type BigIntStats } from 'node:fs';
+import { open, type FileHandle } from 'node:fs/promises';
 import { codexChildResult, codexQueuedAgentMetadata } from './codex-subagent-read.js';
 
 interface Final {itemId:string;text:string;at:number}
@@ -23,14 +24,16 @@ interface ActiveTurn extends Omit<CodexCompletedTurn,'completedAt'> {
 }
 
 interface Cursor {
-  dev:number;ino:number;size:number;mtime:number;offset:number;tail:Buffer;skipping:boolean;
+  stat:BigIntStats;offset:number;tail:Buffer;skipping:boolean;
   idleBoundary:boolean;queuedAgentMetadata:boolean;lastCompletedAt?:number;latestTurnId?:string;
   active?:ActiveTurn;turns:CodexCompletedTurn[];
   offeredCall?:{id:string;sequence:number};offeredInjection?:Injection;
 }
 
 const HEADER_BYTES=64*1024,SCAN_BYTES=8*1024*1024,MAX_LINE=4*1024*1024,CHUNK=128*1024,SCAN_MS=60;
-const cursors=new Map<string,Cursor>(),pending=new Map<string,Promise<CodexTurnEvidence>>();
+const cursors=new Map<string,Cursor>(),pending=new Map<string,{stat:BigIntStats;work:Promise<CodexTurnEvidence>}>();
+const sameFile=(a:BigIntStats,b:BigIntStats)=>a.dev===b.dev&&a.ino===b.ino;
+const sameVersion=(a:BigIntStats,b:BigIntStats)=>sameFile(a,b)&&a.size===b.size&&a.mtimeNs===b.mtimeNs;
 const startEvents=new Set(['task_started','turn_started']);
 const completeEvents=new Set(['task_complete','turn_complete']);
 const workItems=new Set(['CommandExecution','FileChange','WebSearch','ImageGeneration','ImageView','CollabAgentToolCall']);
@@ -216,23 +219,32 @@ function accept(cursor:Cursor,line:Buffer,sessionId:string):void{
 const empty=(status:CodexTurnEvidence['status']):CodexTurnEvidence=>({status,caughtUp:false,turns:[],bytesRead:0});
 
                                            
-export function readCodexTurnEvidence(file:unknown,sessionId:string):Promise<CodexTurnEvidence>{
-  if(!id(file)||!id(sessionId))return Promise.resolve(empty('unavailable'));
-  const key=JSON.stringify([file,sessionId]),running=pending.get(key);if(running)return running;
-  const work=read(file,sessionId,key).finally(()=>pending.delete(key));pending.set(key,work);return work;
+export async function readCodexTurnEvidence(file:unknown,sessionId:string):Promise<CodexTurnEvidence>{
+  if(!id(file)||!id(sessionId))return empty('unavailable');
+  const fd=await open(file,'r').catch(()=>undefined);if(!fd)return empty('unavailable');
+  const stat=await fd.stat({bigint:true}).catch(()=>undefined);
+  if(!stat){await fd.close();return empty('unavailable');}
+  const key=JSON.stringify([file,sessionId]),running=pending.get(key);
+  if(running){
+    await fd.close();
+    if(sameVersion(running.stat,stat))return running.work;
+    await running.work;
+    return readCodexTurnEvidence(file,sessionId);
+  }
+  const work=read(file,sessionId,key,fd,stat).finally(()=>pending.delete(key));pending.set(key,{stat,work});return work;
 }
 
-async function read(file:string,sessionId:string,key:string):Promise<CodexTurnEvidence>{
-  const fd=await open(file,'r').catch(()=>undefined);if(!fd)return empty('unavailable');
+async function read(file:string,sessionId:string,key:string,fd:FileHandle,stat:BigIntStats):Promise<CodexTurnEvidence>{
   try{
-    const {dev,ino,size,mtimeMs}=await fd.stat();let cursor=cursors.get(key);
-    if(!cursor||cursor.dev!==dev||cursor.ino!==ino||cursor.size>size||cursor.size===size&&cursor.mtime!==mtimeMs){
+    const size=Number(stat.size);let cursor=cursors.get(key);
+    if(!Number.isSafeInteger(size))return empty('unavailable');
+    if(!cursor||!sameFile(cursor.stat,stat)||cursor.stat.size>stat.size||cursor.stat.size===stat.size&&!sameVersion(cursor.stat,stat)){
       const head=Buffer.alloc(Math.min(size,HEADER_BYTES)),{bytesRead}=await fd.read(head,0,head.length,0),end=head.subarray(0,bytesRead).indexOf(10);
       if(end<0)return empty(bytesRead===HEADER_BYTES?'unsupported':'unavailable');
       let meta:any;try{meta=JSON.parse(head.subarray(0,end).toString('utf8'));}catch{return empty('unsupported');}
       if(meta?.type!=='session_meta'||meta.payload?.id!==sessionId)return empty('unsupported');
       const offset=Math.max(end+1,size-SCAN_BYTES);
-      cursor={dev,ino,size,mtime:mtimeMs,offset,tail:Buffer.alloc(0),skipping:offset>end+1,idleBoundary:offset===end+1,queuedAgentMetadata:false,turns:[]};
+      cursor={stat,offset,tail:Buffer.alloc(0),skipping:offset>end+1,idleBoundary:offset===end+1,queuedAgentMetadata:false,turns:[]};
     }
     cursors.delete(key);cursors.set(key,cursor);
     if(cursors.size>16)cursors.delete(cursors.keys().next().value!);
@@ -255,9 +267,14 @@ async function read(file:string,sessionId:string,key:string):Promise<CodexTurnEv
       cursor.tail=cursor.skipping?Buffer.alloc(0):Buffer.from(tail);
       if(performance.now()-started>=SCAN_MS)break;
     }
-    cursor.size=size;cursor.mtime=mtimeMs;
-    const caughtUp=cursor.offset===size&&!cursor.tail.length&&!cursor.skipping&&(cursor.offset===from||(await fd.stat()).size===size);
+    await fd.close();
+    const current=statSync(file,{bigint:true});
+    if(!sameFile(stat,current)||current.size<stat.size||current.size===stat.size&&!sameVersion(stat,current)){
+      cursors.delete(key);return empty('unavailable');
+    }
+    cursor.stat=stat;
+    const caughtUp=cursor.offset===size&&!cursor.tail.length&&!cursor.skipping&&current.size===stat.size;
     return{status:'supported',caughtUp,latestTurnId:cursor.latestTurnId,openTurnId:cursor.active?.turnId,turns:[...cursor.turns],bytesRead:cursor.offset-from};
   }catch{cursors.delete(key);return empty('unavailable');}
-  finally{await fd.close();}
+  finally{if(fd.fd!==-1)await fd.close();}
 }

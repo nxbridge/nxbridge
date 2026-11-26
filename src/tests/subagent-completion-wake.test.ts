@@ -2,11 +2,14 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { fixture } from './support/broker-fixture.js';
+import { fixture, lifecycle } from './support/broker-fixture.js';
 import { temporary } from './support/temporary.js';
 import { registration } from './support/registration.js';
 import { SubagentCompletions } from '../broker/subagent-completions.js';
 import { CODEX_WAKE_RETRY_MS } from '../hosts/codex/codex-wake.js';
+import { HEALTH_UNVERIFIED_MS } from '../broker/health/notice-policy.js';
+import { SUBAGENT_PROGRESS_STALE_MS } from '../broker/subagent-completions.js';
+import type { DeliveryHealth } from '../broker/health/delivery.js';
 import { BridgeError, DeliveryError } from '../shared/errors.js';
 import { HEALTH_WAKE_NOTICE, WAKE_NOTICE } from '../types.js';
 import { hook as nativeHook } from '../integration/hooks/hook-control.js';
@@ -27,6 +30,22 @@ function setup(t:TestContext){
   const signal=()=>broker.signalCodexWake(peer(),endpoint());
   const prompt=(text=HEALTH_WAKE_NOTICE)=>hook('UserPromptSubmit',{prompt:text,turn_id:'parent-next'});
   return{...f,broker,pair,peer,endpoint,ledger,hook,child,signal,prompt,counts:()=>({native,queued})};
+}
+
+async function observedChild(t:TestContext){
+  const f=setup(t),file=path.join(temporary(t),'observed-child.jsonl'),row=(value:unknown)=>JSON.stringify({timestamp:new Date().toISOString(),...(value as object)})+'\n';
+  const append=(value:unknown)=>appendFileSync(file,row(value),'utf8');
+  writeFileSync(file,row({type:'session_meta',payload:{id:'x'}})+row({type:'event_msg',payload:{type:'task_started',turn_id:'parent'}}),'utf8');
+  await f.child('child','run',file);
+  append({type:'event_msg',payload:{type:'item_completed',thread_id:'x',turn_id:'parent',item:{type:'SubAgentActivity',kind:'completed',id:'subagent-completed-run',agent_thread_id:'child',agent_path:'/root/child'}}});
+  const result=()=>{
+    append({type:'inter_agent_communication_metadata',payload:{trigger_turn:false}});
+    append({type:'response_item',metadata:{history_sequence:10},payload:{type:'agent_message',author:'/root/child',recipient:'/root',content:[{type:'input_text',text:'Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/child\nPayload:\n完成'}],internal_chat_message_metadata_passthrough:{turn_id:'parent',content_item_metadata:[{provenance:{type:'tool',namespace:'collaboration'}}]}}});
+  };
+  const tool=()=>append({type:'event_msg',payload:{type:'mcp_tool_call_begin',turn_id:'parent'}});
+  const end=()=>append({type:'event_msg',payload:{type:'task_complete',turn_id:'parent'}});
+  const observe=()=>f.ledger.observe(f.peer(),file);
+  return{...f,file,append,result,tool,end,observe};
 }
 
 test('多个直属子结果跨实例和并发只提交一轮，带上已有搭档消息，重复输入静默丢弃',async t=>{
@@ -78,6 +97,167 @@ test('结果在父模型最后一步后到达仍唤醒，已有后续模型输�
   });
 });
 
+test('连接失去订阅时独立核验继续工作，继续与精确已读分别结算且保留迟到的新完成项',async t=>{
+  const f=setup(t),file=path.join(temporary(t),'continued.jsonl'),row=(value:unknown)=>JSON.stringify({timestamp:new Date().toISOString(),...(value as object)})+'\n';
+  const append=(value:unknown)=>appendFileSync(file,row(value),'utf8');
+  const model=()=>append({type:'response_item',metadata:{sampled_through_sequence:10},payload:{type:'message',role:'assistant',content:[{type:'output_text',text:'继续工作'}],internal_chat_message_metadata_passthrough:{turn_id:'parent'}}});
+  writeFileSync(file,row({type:'session_meta',payload:{id:'x'}})+row({type:'event_msg',payload:{type:'task_started',turn_id:'parent'}}),'utf8');
+  await f.child('child','run',file);
+  const batchId=f.ledger.batch(f.peer());
+  append({type:'event_msg',payload:{type:'item_completed',thread_id:'x',turn_id:'parent',item:{type:'SubAgentActivity',kind:'completed',id:'subagent-completed-run',agent_thread_id:'child',agent_path:'/root/child'}}});
+  model();
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'offline'});(f.codex as any).hasSubscription=()=>false;
+  await f.ledger.observe(f.peer(),file);
+  assert.equal(f.ledger.running(f.peer()),true);
+  assert.deepEqual(f.ledger.status(f.peer()),{unconfirmed:1,needsWake:1,awaitingContext:1,batchId});
+  assert.equal(f.ledger.available(f.peer()),true,'父轮次活动不能冒充完成结果已进入上下文');
+  assert.equal((f.broker.status({host:'claude',sessionId:'c',callId:'continued-status'}) as any).partner.childCompletions.hold.observing,true);
+  append({type:'inter_agent_communication_metadata',payload:{trigger_turn:false}});
+  append({type:'response_item',metadata:{history_sequence:10},payload:{type:'agent_message',author:'/root/child',recipient:'/root',content:[{type:'input_text',text:'Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/child\nPayload:\n完成'}],internal_chat_message_metadata_passthrough:{turn_id:'parent',content_item_metadata:[{provenance:{type:'tool',namespace:'collaboration'}}]}}});
+  await f.ledger.observe(f.peer(),file);assert.equal(f.ledger.status(f.peer())?.unconfirmed,1,'后落盘的结果仍需后续采样证明');
+  model();
+  const observing=f.ledger.observe(f.peer(),file);
+  await f.child('late','late-run',file);
+  await observing;
+  assert.equal(f.ledger.status(f.peer())?.unconfirmed,1);
+  assert.deepEqual(f.ledger.forwardChildren(f.peer()).pending,['late-run'],'异步取证不能覆盖期间新到的完成项');
+  append({type:'event_msg',payload:{type:'item_completed',thread_id:'x',turn_id:'parent',item:{type:'SubAgentActivity',kind:'completed',id:'subagent-completed-late-run',agent_thread_id:'late',agent_path:'/root/late'}}});
+  append({type:'inter_agent_communication_metadata',payload:{trigger_turn:false}});
+  append({type:'response_item',metadata:{history_sequence:10},payload:{type:'agent_message',author:'/root/late',recipient:'/root',content:[{type:'input_text',text:'Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/late\nPayload:\n迟到的任务完成'}],internal_chat_message_metadata_passthrough:{turn_id:'parent',content_item_metadata:[{provenance:{type:'tool',namespace:'collaboration'}}]}}});
+  model();await f.ledger.observe(f.peer(),file);
+  assert.equal(f.ledger.status(f.peer()),undefined);
+  assert.equal(f.ledger.running(f.peer()),false,'账本结清后不留下影响后续普通消息的活动占用');
+});
+
+test('没有可用字节下界时只压住工作中父轮次的警告和唤醒，结束后仍可提醒未确认的完成项',async t=>{
+  const f=setup(t),file=path.join(temporary(t),'open-without-floor.jsonl'),row=(value:unknown)=>JSON.stringify({timestamp:new Date().toISOString(),...(value as object)})+'\n';
+  await f.child();
+  writeFileSync(file,row({type:'session_meta',payload:{id:'x'}})+row({type:'event_msg',payload:{type:'task_started',turn_id:'parent'}})+row({type:'event_msg',payload:{type:'mcp_tool_call_begin',turn_id:'parent'}}),'utf8');
+  await f.ledger.observe(f.peer(),file);
+  assert.equal(f.ledger.running(f.peer()),true);assert.equal(f.ledger.pending(f.peer()),true);
+  await f.signal();assert.equal(f.counts().native,0);
+  assert.equal((f.broker.status({host:'claude',sessionId:'c',callId:'open-status'}) as any).partner.childCompletions.hold.observing,true);
+  appendFileSync(file,row({type:'event_msg',payload:{type:'task_complete',turn_id:'parent'}}),'utf8');
+  await f.ledger.observe(f.peer(),file);
+  assert.equal(f.ledger.running(f.peer()),false);assert.equal(f.ledger.pending(f.peer()),true);
+  await f.signal();assert.equal(f.counts().native,1);
+});
+
+test('异步父历史取证不结算切换原生上下文后新记下的完成项',async t=>{
+  const f=setup(t),file=path.join(temporary(t),'old-context.jsonl'),row=(value:unknown)=>JSON.stringify(value)+'\n';
+  writeFileSync(file,row({type:'session_meta',payload:{id:'x'}})+row({type:'event_msg',payload:{type:'task_started',turn_id:'old-parent'}}),'utf8');
+  await f.child('old','old-run',file);
+  const observing=f.ledger.observe(f.peer(),file);
+  const endpoint=f.endpoint();f.store.deactivate(f.x.id);
+  f.store.saveEndpoint({...endpoint,epoch:'new-context'});
+  f.ledger.record(f.peer(),'new','new-run',undefined,undefined);
+  await observing;
+  assert.equal(f.ledger.running(f.peer()),false);
+  assert.deepEqual(f.ledger.forwardChildren(f.peer()).pending,['new-run']);
+});
+
+test('已看到结果后的工具活动只临时抑制提醒，父轮次结束未确认已读时按原批次首次唤醒',async t=>{
+  const f=await observedChild(t),batch=f.ledger.batch(f.peer());
+  f.result();f.tool();await f.observe();
+  assert.equal(f.ledger.running(f.peer()),true);assert.equal(f.ledger.status(f.peer())?.needsWake,0);
+  const saved=f.store.setting<any>('subagentCompletions:'+f.x.id);
+  assert.equal(saved.batchId,batch);assert.equal(saved.pending[0].notified,undefined);
+  await f.signal();assert.equal(f.counts().native,0);
+  f.end();await f.observe();
+  assert.equal(f.ledger.running(f.peer()),false);assert.equal(f.ledger.status(f.peer())?.needsWake,1);assert.equal(f.ledger.batch(f.peer()),batch);
+  await f.signal();assert.equal(f.counts().native,1);
+  await f.observe();await f.signal();assert.equal(f.counts().native,1,'已经提交的首次唤醒不能因终态重放');
+});
+
+test('临时尾行不撤销新鲜观察，十五分钟没有新进展后会恢复提醒和唤醒资格',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:Date.UTC(2026,10,26,20)});
+  const f=await observedChild(t);f.result();f.tool();await f.observe();
+  appendFileSync(f.file,'{"type":','utf8');await f.observe();
+  assert.equal(f.ledger.running(f.peer()),true);assert.equal(f.ledger.pending(f.peer()),false);
+  const actor={host:'claude' as const,sessionId:'c',callId:'partial-status'};
+  assert.equal((f.broker.status(actor) as any).partner.childCompletions.hold.observing,true);
+  t.mock.timers.tick(SUBAGENT_PROGRESS_STALE_MS+1);
+  assert.equal(f.ledger.running(f.peer()),false);assert.equal(f.ledger.pending(f.peer()),true);
+  const status=f.broker.status(actor) as any;
+  assert.equal(status.partner.childCompletions.hold.observing,undefined);
+  assert.ok(status.integrationIssues.some((issue:any)=>issue.code==='subagent_completion_held'));
+  await f.signal();assert.equal(f.counts().native,1);
+});
+
+test('时钟回拨后的未来进展不能延长继续工作状态或压住原批次首次唤醒',async t=>{
+  const now=Date.UTC(2026,10,26,20);
+  t.mock.timers.enable({apis:['Date'],now:now+6*60*60_000});
+  const f=await observedChild(t);f.result();f.tool();await f.observe();
+  assert.equal(f.ledger.running(f.peer()),true);assert.equal(f.ledger.pending(f.peer()),false);
+  t.mock.timers.setTime(now);
+  assert.equal(f.ledger.running(f.peer()),false);assert.equal(f.ledger.pending(f.peer()),true);
+  assert.equal(f.ledger.observation(f.peer()).state,'stale');
+  t.mock.timers.tick(SUBAGENT_PROGRESS_STALE_MS+1);await f.observe();
+  assert.equal(f.ledger.running(f.peer()),false);assert.equal(f.ledger.pending(f.peer()),true);
+  await f.signal();assert.equal(f.counts().native,1);
+});
+
+test('原生状态未核验只在重启观察窗口内静默，超过窗口仍不能确认时给出真实提醒',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:Date.UTC(2026,10,26,20)});
+  const f=setup(t);await f.child();f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'offline'});(f.codex as any).hasSubscription=()=>false;
+  const actor={host:'claude' as const,sessionId:'c',callId:'grace-status'};
+  assert.equal((f.broker.status(actor) as any).partner.childCompletions.hold.observing,true);
+  t.mock.timers.tick(HEALTH_UNVERIFIED_MS+1);
+  const status=f.broker.status(actor) as any;
+  assert.equal(status.partner.childCompletions.hold.observing,undefined);
+  assert.ok(status.integrationIssues.some((issue:any)=>issue.code==='subagent_completion_held'));
+});
+
+test('同一批子结果在活跃和停滞之间变化，状态照常反映但被动完成通知只送达一次',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:Date.UTC(2026,10,26,20)});
+  const f=await observedChild(t),batch=f.ledger.batch(f.peer()),actor={host:'claude' as const,sessionId:'c',callId:'cycle-status'};
+  const health=f.broker.deliveryHealth as DeliveryHealth;
+  const pending=()=>health.peek(f.pair.id,f.c.id)
+    .flatMap(notice=>notice.componentIds??[notice.id])
+    .map(id=>health.get(f.pair.id,f.c.id,id))
+    .find(notice=>notice?.kind?.endsWith(':subagent_completion_held'));
+  f.result();f.tool();await f.observe();
+  assert.equal((f.broker.status(actor) as any).partner.childCompletions.hold.observing,true);
+  assert.equal(pending(),undefined);
+  t.mock.timers.tick(SUBAGENT_PROGRESS_STALE_MS+1);
+  const stale=f.broker.status(actor) as any;assert.equal(stale.partner.childCompletions.hold.batchId,batch);
+  const notice=pending();assert.ok(notice);
+  const delivered=health.prepare(f.pair.id,f.c.id,notice.id,notice.scope);assert.ok(delivered);
+  assert.equal(notice.factKey,batch);health.outcome(f.pair.id,f.c.id,notice.id,'submitted');
+  f.tool();await f.observe();
+  assert.equal((f.broker.status(actor) as any).partner.childCompletions.hold.observing,true);
+  t.mock.timers.tick(SUBAGENT_PROGRESS_STALE_MS+1);
+  const again=f.broker.status(actor) as any;
+  assert.equal(again.partner.childCompletions.hold.batchId,batch);
+  assert.equal(again.partner.childCompletions.hold.observing,undefined);
+  assert.ok(again.integrationIssues.some((issue:any)=>issue.code==='subagent_completion_held'));
+  assert.equal(pending(),undefined,'同一事实再次停滞可以显示状态，但不能再投递一条被动通知');
+  assert.deepEqual(f.counts(),{native:0,queued:0});
+});
+
+test('实际提交结果不明的唤醒不受派生继续状态和父轮次终态重新开放',async t=>{
+  const f=await observedChild(t);let submitted=0;
+  (f.codex as any).wakeSubagents=async(_p:any,_e:any,_s:any,authorize:()=>Promise<boolean>)=>{if(await authorize()){submitted++;throw new DeliveryError('timeout','原生提交后回执丢失',true);}};
+  await f.signal();assert.equal(submitted,1);assert.equal(f.ledger.status(f.peer())?.wake?.state,'unknown');
+  f.result();f.tool();await f.observe();f.end();await f.observe();
+  assert.equal(f.ledger.pending(f.peer()),false);
+  await f.signal();assert.equal(submitted,1);
+  const hold=(f.broker.status({host:'claude',sessionId:'c',callId:'unknown-after-end'}) as any).partner.childCompletions.hold;
+  assert.equal(hold.observing,undefined);assert.match(hold.reason,/结果不明.*未重复提交/);
+});
+
+test('历史已结束而忙闲广播持续没有跟上时仍会提醒，短暂收尾间隙不抢先告警',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:Date.UTC(2026,10,26,20)});
+  const f=await observedChild(t);f.result();f.tool();await f.observe();f.store.updatePeer(f.x.id,{state:'busy'});
+  f.end();await f.observe();
+  const actor={host:'claude' as const,sessionId:'c',callId:'busy-ended-status'};
+  assert.equal((f.broker.status(actor) as any).partner.childCompletions.hold,null);
+  t.mock.timers.tick(CODEX_WAKE_RETRY_MS+1);
+  const hold=(f.broker.status(actor) as any).partner.childCompletions.hold;
+  assert.equal(hold.observing,undefined);assert.match(hold.reason,/已经结束.*还没能确认/);
+  await f.signal();assert.equal(f.counts().native,0,'独立终态不能绕过原生忙碌闸门');
+});
+
 test('运行时闸门同时抑制自动提交和系统输入消费，用户正常恢复可领取事实',async t=>{
   const gates=['pair_pause','interrupt','human','self_disabled','partner_disabled','pending_context','profile','conflict'] as const;
   for(const gate of gates)await t.test(gate,async sub=>{
@@ -98,6 +278,19 @@ test('运行时闸门同时抑制自动提交和系统输入消费，用户正�
   });
   const f=setup(t);await f.child();await f.hook('Interrupt',{turn_id:'parent'});
   const user=await f.prompt('继续刚才的任务');assert.match(user.hookSpecificOutput.additionalContext,/own_subagents_completed/);
+});
+
+test('重启、回收和退役分别暂缓唤醒及子结果上下文准入',async t=>{
+  const f=setup(t),life=lifecycle(f.broker);
+  const allowed=()=>[f.broker.codexWakeAllowed(f.peer(),f.endpoint(),f.pair.id),f.broker.subagentContextAllowed(f.peer(),true)];
+  assert.deepEqual(allowed(),[true,true]);
+  const release=life.beginRestart(f.x.id);
+  try{assert.deepEqual(allowed(),[false,false]);}finally{release();}
+  const recycle=t.mock.method(life.codexRecycle,'fenced',(id:string)=>id===f.x.id);
+  assert.deepEqual(allowed(),[false,false]);recycle.mock.restore();
+  const retire=t.mock.method(life,'isRetiring',(id:string)=>id===f.x.id);
+  assert.deepEqual(allowed(),[false,false]);retire.mock.restore();
+  assert.deepEqual(allowed(),[true,true]);
 });
 
 test('异步最后核验期间暂停或原生跳过不消耗提醒预算，也不留下假提交',async t=>{

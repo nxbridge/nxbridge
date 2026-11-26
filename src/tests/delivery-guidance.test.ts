@@ -60,6 +60,9 @@ test('status 文本：子代理已做完但没法确认主线程接着处理时�
   const text=formatStatus({paired:true,self:{id:'c',host:'claude',name:'Claude',state:'ready'},partner:partner({unconfirmed:1,needsWake:1,awaitingContext:1,batchId:'b',hold:{batchId:'b',reason:'唤醒次数已用完，自动尝试已停止'}}),pending:0,questions:0});
   assert.match(text,/子代理已做完，尚未确认主线程接着处理：唤醒次数已用完，自动尝试已停止/);assert.doesNotMatch(text,/未读|没人/);
   assert.doesNotMatch(formatStatus({paired:true,self:{id:'c',host:'claude',name:'Claude',state:'ready'},partner:partner({unconfirmed:1,needsWake:0,awaitingContext:1,hold:null}),pending:0,questions:0}),/子代理/);
+                                       
+  const observing=formatStatus({paired:true,self:{id:'c',host:'claude',name:'Claude',state:'ready'},partner:partner({unconfirmed:2,needsWake:1,awaitingContext:1,batchId:'b',hold:{batchId:'b',reason:'当前原生会话不可达或尚未核验',observing:true}}),pending:0,questions:0});
+  assert.match(observing,/子代理已做完，正在核对主线程有没有接着处理（当前原生会话不可达或尚未核验），不用操作/);assert.doesNotMatch(observing,/说一句继续|尚未确认主线程/);
 });
 
 test('status 文本：后台做完一轮的状态按对去重，正常汇报和工作中不显示，用完次数写明怎么恢复',()=>{
@@ -90,4 +93,12 @@ test('读不到最新一步时状态只说进度暂时无法观测，不说没�
   assert.match(status(silent),/分钟未见进展，原因未知/);
   const unverified=status({...silent,progressEvidence:false});
   assert.match(unverified,/进度暂时无法观测/);assert.doesNotMatch(unverified,/没有进展|未见进展/);
+});
+
+test('子代理完成在核对中（observing）时不产生配对异常提醒；真正卡住时照常提醒',async()=>{
+  const {pairIssues}=await import('../broker/pairing/pair-anomalies.js');
+  const base:any={pair:{id:'p',claude:'c',codex:'x',paused:false,archived:false,createdAt:1},peer:{id:'x',host:'codex',name:'Codex',state:'busy',enabled:true},now:2000000,version:'v',messages:[],transitioning:false,questionPending:false,integration:{scope:'s',since:1999999}};
+  const hold={batchId:'b',reason:'当前原生会话不可达或尚未核验'};
+  assert.ok(pairIssues({...base,integration:{...base.integration,subagentHold:hold}}).some((issue:any)=>issue.kind==='subagent_completion_held'));
+  assert.equal(pairIssues({...base,integration:{...base.integration,subagentHold:{...hold,observing:true}}}).some((issue:any)=>issue.kind==='subagent_completion_held'),false);
 });

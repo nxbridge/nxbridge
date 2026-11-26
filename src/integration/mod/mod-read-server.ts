@@ -18,6 +18,8 @@ const token=z.string().regex(/^[a-f0-9]{64}$/);
 const writeEnvelope=z.discriminatedUnion('phase',[z.object({phase:z.literal('prepare'),nonce:token,operation:z.enum(MOD_WRITE_OPERATIONS),bytes:z.number().int().nonnegative().max(2*1024*1024-256)}).strict(),z.object({phase:z.literal('commit'),nonce:token,ticket:token,input:writeSchema}).strict()]);
 const sign=(secret:string,body:string)=>createHmac('sha256',Buffer.from(secret,'hex')).update(body).digest('hex');
 const denied=()=>Object.assign(new Error('Mod 只读通道不可用。'),{code:'mod_read_unavailable'});
+                                                   
+export const FETCH_BLOCKED_PORTS:ReadonlySet<number>=new Set([1,7,9,11,13,15,17,19,20,21,22,23,25,37,42,43,53,69,77,79,87,95,101,102,103,104,109,110,111,113,115,117,119,123,135,137,139,143,161,179,389,427,465,512,513,514,515,526,530,531,532,540,548,554,556,563,587,601,636,989,990,993,995,1719,1720,1723,2049,3659,4045,4190,5060,5061,6000,6566,6665,6666,6667,6668,6669,6679,6697,10080]);
 
                                         
 export class ModReadServer {
@@ -35,8 +37,9 @@ export class ModReadServer {
     if(this.closed)throw denied();
     if(!this.listening){
       this.server=http.createServer({maxHeaderSize:8192},(request,response)=>{void this.handle(request,response);});
+      this.server.on('error',error=>process.stderr.write('nxbridge Mod HTTP 监听：'+describeError(error)+'\n'));
       this.server.maxHeadersCount=16;this.server.requestTimeout=2000;this.server.headersTimeout=2000;this.server.keepAliveTimeout=20000;this.server.maxConnections=128;
-      this.listening=new Promise((resolve,reject)=>{this.server!.once('error',reject);this.server!.listen(0,'127.0.0.1',resolve);});
+      this.listening=this.listen();
     }
     await this.listening;if(this.closed)throw denied();
     for(const[id,capability]of this.capabilities)if(capability.actor.binding?.key===actor.binding?.key)this.remove(id);
@@ -46,6 +49,19 @@ export class ModReadServer {
     const capability:Capability={transport,receipt,actor,endpointEpoch,inflight:new Set(),prepared:new Map()};
     if(this.write){transport.write={...transport,url:transport.url.replace('/mod-read','/mod-write'),id:randomBytes(32).toString('hex'),secret:randomBytes(32).toString('hex')};this.writes.set(transport.write.id,capability);}
     this.capabilities.set(transport.id,capability);return transport;
+  }
+  private async listen():Promise<void>{
+    const server=this.server!;
+    for(let attempt=0;attempt<8;attempt++){
+      await new Promise<void>((resolve,reject)=>{
+        const failed=(error:Error)=>{server.off('listening',ready);reject(error);};
+        const ready=()=>{server.off('error',failed);resolve();};
+        server.once('error',failed);server.once('listening',ready);server.listen(0,'127.0.0.1');
+      });
+      if(!FETCH_BLOCKED_PORTS.has((server.address() as {port:number}).port))return;
+      await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
+    }
+    throw new Error('本机连续分配了 HTTP 禁用端口，Mod 通道未建立。');
   }
   private remove(id:string):void{const capability=this.capabilities.get(id);if(capability?.transport.write)this.writes.delete(capability.transport.write.id);this.capabilities.delete(id);}
   revoke(binding:Actor['binding']):void{

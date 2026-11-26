@@ -186,8 +186,9 @@ export async function detachService():Promise<void> {
 
                                                
 function brokerRequestTimeout(method:string,timeout?:number):number|undefined{return timeout??(method==='question.wait'?QUESTION_POLL_RPC_MS:['send','pair.selection.resolve','pair.selection.commit'].includes(method)?120000:undefined);}
-export async function brokerCall<T=any>(method:string,params:unknown={},options:{home?:string;start?:boolean;timeout?:number;mutation?:boolean;reserved?:boolean;deadline?:number;custody?:CustodyDescriptor}={}):Promise<T>{
-  const c=options.start===false?await connectBroker(options.home,remainingTime(options.deadline,Math.min(options.timeout??2000,2000))):await ensureBroker(options.home,{reserved:options.reserved,deadline:options.deadline,custody:options.custody});
+export async function brokerCall<T=any>(method:string,params:unknown={},options:{home?:string;start?:boolean;timeout?:number;mutation?:boolean;reserved?:boolean;deadline?:number;connectionDeadline?:number;custody?:CustodyDescriptor}={}):Promise<T>{
+  const connectionDeadline=options.connectionDeadline===undefined?options.deadline:Math.min(options.connectionDeadline,options.deadline??Infinity);
+  const c=options.start===false?await connectBroker(options.home,remainingTime(connectionDeadline,Math.min(options.timeout??2000,2000))):await ensureBroker(options.home,{reserved:options.reserved,deadline:connectionDeadline,custody:options.custody});
   const timeout=brokerRequestTimeout(method,options.timeout);
   try{return await c.request<T>(method,params,{timeout:options.deadline===undefined?timeout:remainingTime(options.deadline,timeout??2000),mutation:options.mutation});}finally{c.close();}
 }

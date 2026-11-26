@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import type { DeliveryResult, Endpoint, Message, Peer, PermissionClass, RegisterInput } from '../../types.js';
-import type { CodexContextReceipt } from '../../hosts/codex/adapter.js';
+import { CodexAdapter, type CodexContextReceipt } from '../../hosts/codex/adapter.js';
 import type { OwnedCodexLaunchProof } from '../../hosts/codex/codex-owned-routes.js';
 import type {RuntimeAvailability} from '../../broker/health/contracts.js';
 import { registration } from './registration.js';
@@ -13,6 +13,8 @@ export class FakeAdapter extends EventEmitter{
   runtimeReleased=false;
   attached:{peer:Peer;endpoint:Endpoint}[]=[];
   attachFailure?:Error;
+  restoreRegisteredRoute=CodexAdapter.prototype.restoreRegisteredRoute;
+  bootstrapProbeKey?:CodexAdapter['bootstrapProbeKey'];
   ensured=0;
   woken:Peer[]=[];
   connected:string[]=[];

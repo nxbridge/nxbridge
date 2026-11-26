@@ -118,7 +118,9 @@ test('认领后的预约者退出不打断交接，接班进程退出才释放�
   assert.ok(acquisition);t.after(()=>acquisition.close());
   f.updaterRun!.child.kill();await f.updaterRun!.ended;
   assert.equal(await acquisition.verify('a'),true);
-  next.child.kill();await next.ended;
-  await eventually(()=>closed&&f.endings.length===1);
+                         
+  const disconnected=once(acquisition.signal,'abort',{signal:AbortSignal.timeout(3500)});
+  next.child.kill();
+  await Promise.all([next.ended,eventually(()=>closed&&f.endings.length===1),disconnected]);
   assert.equal(acquisition.signal.aborted,true);
 });

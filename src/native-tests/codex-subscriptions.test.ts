@@ -116,7 +116,8 @@ test('用户观察租约自动释放后仍可唤醒；关闭窗口后原 ID 可�
   await wait(async()=>!(await retained.request('thread/loaded/list',{limit:100})).data.includes(first.thread.id),'窗口关闭后线程仍被服务观察订阅占用');
   assert.ok((await retained.request('thread/loaded/list',{limit:100})).data.includes(second.thread.id));assert.equal(liveProcess(runtime.pid!),true);
                                             
-  const freshEndpoint=await adapter.ensureEndpoint(root,'subscription-reopen'),fresh=await adapter.connect(freshEndpoint),resumed=await fresh.request('thread/resume',{threadId:first.thread.id});
+  const freshEndpoint=await adapter.ensureEndpoint(root,'subscription-reopen'),fresh=await connectAppServer(freshEndpoint,config,undefined,home);windows.push(fresh);
+  const resumed=await fresh.request('thread/resume',{threadId:first.thread.id});
   assert.equal(resumed.thread.id,first.thread.id);assert.match(JSON.stringify(resumed.thread.turns),/线程释放验收持久历史/);
   assert.equal(readFileSync(path.join(codexHome,'config.toml'),'utf8'),configText,'启动覆盖不得改写用户配置');
   t.diagnostic(JSON.stringify({unloaded:first.thread.id,retained:second.thread.id,sharedRuntimeAlive:liveProcess(runtime.pid!),reopenedOnAnotherRuntime:true,requests}));

@@ -9,6 +9,7 @@ import path from 'node:path';
 import { spawn, execFile } from 'node:child_process';
 import { once } from 'node:events';
 import { promisify } from 'node:util';
+import ts from 'typescript';
 import { temporaryDirectory } from '../tests/support/temporary.js';
 import { setupPublish } from './publish-fixture.js';
 import { brokerCall } from '../ipc/ipc.js';
@@ -24,6 +25,74 @@ import {windowsPowerShell} from '../shared/windows-tools.js';
 import { pairLegacyClaude } from './legacy-claude-fixture.js';
 
 const execute=promisify(execFile);
+
+                                             
+function probeNativeNotices(original:string,eventsFile:string):string{
+  const source=ts.createSourceFile('register.js',original,ts.ScriptTarget.Latest,true,ts.ScriptKind.JS);
+  const edits:{at:number;text:string}[]=[],calls:ts.CallExpression[]=[];
+  const visit=(node:ts.Node)=>{if(ts.isCallExpression(node))calls.push(node);ts.forEachChild(node,visit);};
+  visit(source);
+  const one=<T>(matches:T[],label:string):T=>{
+    assert.equal(matches.length,1,'发布插件应有一个 '+label+' 观察点');
+    return matches[0]!;
+  };
+  const literal=(node:ts.Node|undefined,text:string)=>!!node&&ts.isStringLiteralLike(node)&&node.text===text;
+  const name=(node:ts.Node|undefined)=>{assert.ok(node&&ts.isIdentifier(node),'观察点缺少绑定标识');return node.text;};
+  const parentWhere=<T extends ts.Node>(node:ts.Node,match:(candidate:ts.Node)=>candidate is T):T=>{
+    for(let parent=node.parent;parent;parent=parent.parent)if(match(parent))return parent;
+    return assert.fail('发布插件的观察点不在预期的语法结构内');
+  };
+  const record=(api:string,fields:string)=>`__nativeEvents.push({at:Date.now(),${fields}});await ${api}.fs.write(${JSON.stringify(eventsFile)},JSON.stringify(__nativeEvents));`;
+  const insert=(at:number,text:string)=>edits.push({at,text});
+  const observeCallback=(node:ts.Node|undefined)=>{
+    assert.ok(node&&(ts.isArrowFunction(node)||ts.isFunctionExpression(node))&&ts.isBlock(node.body),'观察点缺少原生回调');
+    return {node,at:node.body.getStart(source)+1};
+  };
+
+  for(const event of ['prompt.submit','turn.complete']){
+    const call=one(calls.filter(node=>literal(node.arguments[0],event)),event);
+    const callback=observeCallback(call.arguments.at(-1));
+    const api=name(callback.node.parameters[0]?.name),input=name(callback.node.parameters[1]?.name);
+    insert(callback.at,record(api,`event:${JSON.stringify(event)},origin:${input}.origin,isMeta:${input}.isMeta,agentId:${input}.agentId,text:${input}.text?.slice(0,250),fields:Object.keys(${input})`));
+  }
+  const clocks=calls.filter(node=>{
+    const method=node.expression,interval=node.arguments[0];
+    return ts.isPropertyAccessExpression(method)&&method.name.text==='every'&&ts.isPropertyAccessExpression(method.expression)&&method.expression.name.text==='clock'
+      &&!!interval&&ts.isNumericLiteral(interval)&&Number(interval.text)===15000;
+  });
+  assert.equal(clocks.length,2,'发布插件应保留原生通知和状态时钟');
+  clocks.forEach((clock,index)=>{
+    const callback=observeCallback(clock.arguments[1]),api=name((clock.expression as ts.PropertyAccessExpression).expression.getChildAt(0,source));
+    insert(callback.at,record(api,`event:'clock-tick',clock:${index}`));
+  });
+
+  const monitor=one(calls.filter(node=>literal(node.arguments[1],'monitor')&&ts.isAwaitExpression(node.parent)&&ts.isVariableDeclaration(node.parent.parent)),'monitor 读取');
+  const health=parentWhere(monitor,ts.isVariableDeclaration),healthStatement=parentWhere(health,ts.isVariableStatement);
+  const statements=healthStatement.parent;assert.ok(ts.isBlock(statements));
+  const next=statements.statements[statements.statements.indexOf(healthStatement)+1],index=healthStatement.declarationList.declarations.indexOf(health);
+  const sameStatement=healthStatement.declarationList.declarations[index+1];
+  const context=sameStatement??(next&&ts.isVariableStatement(next)?next.declarationList.declarations[0]:undefined),api=name(monitor.arguments[0]);
+  const capture=context?.initializer;
+  assert.ok(context&&capture&&ts.isAwaitExpression(capture)&&ts.isCallExpression(capture.expression)
+    &&capture.expression.arguments.length===1&&name(capture.expression.arguments[0])===api,'monitor 读取后应捕获同一个原生窗口上下文');
+  const contextName=name(context.name),contextStatement=parentWhere(context,ts.isVariableStatement);
+  insert(contextStatement.end,';'+record(api,`event:'monitor',health:${name(health.name)},permission:${contextName}.nativePermission,binding:${contextName}.binding`));
+
+  const control=one(calls.filter(node=>{
+    const method=node.expression,argv=node.arguments[0];
+    return ts.isPropertyAccessExpression(method)&&method.name.text==='run'&&ts.isPropertyAccessExpression(method.expression)&&method.expression.name.text==='process'
+      &&!!argv&&ts.isArrayLiteralExpression(argv)&&literal(argv.elements[0],'node')&&literal(argv.elements[3],'mod');
+  }),'mod 控制子进程');
+  const handler=parentWhere(control,ts.isFunctionDeclaration);assert.ok(handler.body);
+  const controlApi=name(handler.parameters[0]?.name),operation=name(handler.parameters[1]?.name),controlContext=name(handler.parameters[2]?.name);
+  const result=parentWhere(control,ts.isVariableDeclaration);
+                                             
+  insert(handler.body.getStart(source)+1,`if(${operation}==='monitor-enqueue')delete ${controlContext}.nativePermission;const __permissionAtCall=${controlContext}.nativePermission;`);
+  const resultName=name(result.name);
+  insert(parentWhere(result,ts.isVariableStatement).end,`;if(['monitor','monitor-enqueue','monitor-prepare','monitor-ack'].includes(${operation})){${record(controlApi,`event:'control-result',operation:${operation},permission:__permissionAtCall,exitCode:${resultName}.exitCode,error:${resultName}.stderr,result:${resultName}.stdout`)}}`);
+  return 'const __nativeEvents=[];'+edits.sort((a,b)=>b.at-a.at).reduce((code,{at,text})=>code.slice(0,at)+text+code.slice(at),original);
+}
+
 test('官方 Claude：被动事实不启动空闲轮次、正常下一轮可见；搭档这一轮失败经原生队列真实叫醒一次；broker 离线及重启保持被动', {skip:!['win32','linux'].includes(process.platform),timeout:170000},async t=>{
   const temp=temporaryDirectory(),directory=temp.directory,home=path.join(directory,'bridge'),claudehome=path.join(directory,'claude'),codexhome=path.join(directory,'codex');
   for(const d of [home,claudehome,codexhome])mkdirSync(d,{recursive:true});
@@ -61,20 +130,8 @@ test('官方 Claude：被动事实不启动空闲轮次、正常下一轮可见�
   await setupPublish();
                                  
   for(const plugin of [path.join(home,'marketplace','plugins','claude'),...installedCacheDirectories(claudehome,'claude')]){
-    const file=path.join(plugin,'hooks','register.js'),original=readFileSync(file,'utf8'),events=/(\w+)\("(prompt\.submit|turn\.complete)",async\((\w+),(\w+),(\w+)\)=>\{/g,clocks=/(\w+)\.clock\.every\(15e3,async\(\)=>\{/g;
-    const monitors=/let ([\w$]+)=await [\w$]+\(([\w$]+),"monitor"\),([\w$]+)=await [\w$]+\(\2\)([;,])/g,controls=/async function [\w$]+\(([\w$]+),([\w$]+),([\w$]+),[\w$]+\)\{(?:let|const|var) [^;]*?([\w$]+)=await \1\.process\.run\(\["node","--no-warnings",\1\.plugin\.root\+"\/bridge\.cjs","mod",[^;]+?\);/g;
-    assert.equal([...original.matchAll(events)].length,2,'原生提示与完成处理器必须各有一个');assert.equal([...original.matchAll(clocks)].length,2,'原生通知与状态时钟必须各有一个');
-                                                       
-    const snippet=(pattern:RegExp)=>original.match(pattern)?.[0]?.slice(0,600)??'(not found)';
-    assert.equal([...original.matchAll(monitors)].length,1,snippet(/.{0,120}await [\w$]+\([\w$]+,"monitor"\).{0,200}/));assert.equal([...original.matchAll(controls)].length,1,snippet(/.{0,200}process\.run\(\["node","--no-warnings".{0,400}/));
-    let clockIndex=0;
-                                                               
-    const probe=original.replace(events,(match,_on,event,api,input)=>match+`__nativeEvents.push({event:${JSON.stringify(event)},at:Date.now(),origin:${input}.origin,isMeta:${input}.isMeta,agentId:${input}.agentId,text:${input}.text?.slice(0,250),fields:Object.keys(${input})});await ${api}.fs.write(${JSON.stringify(nativeEvents)},JSON.stringify(__nativeEvents));`).replace(clocks,(match,api)=>match+`__nativeEvents.push({event:'clock-tick',clock:${clockIndex++},at:Date.now()});await ${api}.fs.write(${JSON.stringify(nativeEvents)},JSON.stringify(__nativeEvents));`).replace(monitors,(match,health,api,context,end)=>{
-                                                         
-      const record=`__nativeEvents.push({event:'monitor',at:Date.now(),health:${health},permission:${context}.nativePermission,binding:${context}.binding})`,write=`await ${api}.fs.write(${JSON.stringify(nativeEvents)},JSON.stringify(__nativeEvents))`;
-      return end===';'?match+`${record};${write};`:match+`__monitorProbe=(${record},${write}),`;
-    }).replace(controls,(match,api,operation,context,result)=>match.replace('{',`{if(${operation}==='monitor-enqueue')delete ${context}.nativePermission;const __permissionAtCall=${context}.nativePermission;`)+`if(['monitor','monitor-enqueue','monitor-prepare','monitor-ack'].includes(${operation})){__nativeEvents.push({event:'control-result',operation:${operation},at:Date.now(),permission:__permissionAtCall,exitCode:${result}.exitCode,error:${result}.stderr,result:${result}.stdout});await ${api}.fs.write(${JSON.stringify(nativeEvents)},JSON.stringify(__nativeEvents));}`);
-    writeFileSync(file,'const __nativeEvents=[];'+probe,'utf8');
+    const file=path.join(plugin,'hooks','register.js');
+    writeFileSync(file,probeNativeNotices(readFileSync(file,'utf8'),nativeEvents),'utf8');
   }
   const nativeCli=resolveCli('claude');await execute(nativeCli.command,[...nativeCli.prefix,'plugin','validate',path.join(home,'marketplace','plugins','claude')],{windowsHide:true,timeout:15000});
   const newTarget=async()=>{

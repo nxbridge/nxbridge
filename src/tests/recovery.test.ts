@@ -19,6 +19,7 @@ import {atomicJson} from '../shared/files.js';
 import { claudeChildFile } from '../hosts/claude/claude-child.js';
 import { managedMarker } from '../install/installation.js';
 import { runtimeFor, saveManagedRuntime } from '../hosts/managed-runtimes.js';
+import { recordManagedSessionLaunch } from '../hosts/launch-profiles.js';
 import { processIdentity } from '../process/process.js';
 import { HEALTH_WAKE_NOTICE } from '../types.js';
 
@@ -59,17 +60,19 @@ test('独立恢复预算仍阻止尚未到期的后台启动',async t=>{
   t.mock.method(lifecycle(f.broker),'prepare',async()=>{assert.fail('恢复预算尚未到期');});await f.broker.pump();assert.equal(f.store.peer(f.c.id).state,'offline');
 });
 
-for(const stage of ['failed','removed','before-register','unproven','alive'] as const)test('同会话恢复只跳过已确认退出的历史运行时：'+stage,async t=>{
+for(const stage of ['failed','removed','before-register','legacy','legacy-live','legacy-active','legacy-foreign','unproven','alive'] as const)test('同会话恢复只跳过已确认退出的历史运行时：'+stage,async t=>{
   const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),peer=f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'offline'});
   t.mock.method(f.codex,'routeExited',(...[target,address,launch]:Parameters<FakeAdapter['routeExited']>)=>exitedOwnedCodexRoute(f.broker.home,{peer:target,endpoint:address},launch));
-  const identity=await processIdentity(process.pid),runtimeId=randomUUID(),native={pid:identity.pid,procStart:stage==='alive'?identity.startedAt:identity.startedAt+'-retired'};
-  const old={...f.store.endpoint(peer.id)!,...native,runtimeId,configHome:f.broker.home};
+  const legacy=stage.startsWith('legacy'),alive=stage==='alive'||stage==='legacy-live';
+  const identity=await processIdentity(process.pid),runtimeId=randomUUID(),native={pid:identity.pid,procStart:alive?identity.startedAt:identity.startedAt+'-retired'};
+  const old={...f.store.endpoint(peer.id)!,...native,runtimeId,configHome:f.broker.home,active:!legacy||stage==='legacy-active'};
   f.store.saveEndpoint(old);
   const runtime={id:runtimeId,peerId:peer.id,sessionId:peer.sessionId!,owner:managedMarker(f.broker.home),kind:'owned' as const,state:'failed' as const,endpoint:old.address,configHome:old.configHome,...native,createdAt:1};
   const proof={sessionId:peer.sessionId,runtimeId,endpoint:old.address,configHome:old.configHome,...native};
   const key='managedLaunchProof:'+peer.id;
   if(stage==='failed'||stage==='alive')saveManagedRuntime(f.broker.home,runtime);
-  if(stage!=='unproven')f.store.setSetting(key,proof);
+  if(legacy)recordManagedSessionLaunch(f.broker.home,stage==='legacy-foreign'?'another-session':peer.sessionId!,peer.cwd,{...runtime,state:'ready',dedicated:true,executable:process.execPath});
+  else if(stage!=='unproven')f.store.setSetting(key,proof);
   const replacement={...runtime,id:randomUUID(),endpoint:'unix://replacement',state:'starting' as const,createdAt:2};
   if(stage==='before-register')saveManagedRuntime(f.broker.home,replacement);
   const queued=f.store.accept(pair,f.c,'等待恢复后的原投递','unused'),oldUnknown=f.store.accept(pair,f.c,'提交状态不明','uncertain');f.store.claim(oldUnknown.id);f.store.transition(oldUnknown.id,'unknown');
@@ -87,9 +90,9 @@ for(const stage of ['failed','removed','before-register','unproven','alive'] as 
     return replacement.endpoint;
   });
   const manager=lifecycle(f.broker);
-  if(stage==='unproven'||stage==='alive'){
+  if(stage==='unproven'||alive||stage==='legacy-active'||stage==='legacy-foreign'){
     await assert.rejects(manager.prepare(peer),{code:'owned_route_unverified'});
-    assert.equal(ensure.mock.callCount(),0);assert.equal(attach.mock.callCount(),1);assert.equal(f.store.endpoint(peer.id)?.runtimeId,runtimeId);
+    assert.equal(ensure.mock.callCount(),0);assert.equal(attach.mock.callCount(),1);assert.equal(f.store.endpoint(peer.id)?.runtimeId,old.active?runtimeId:undefined);
   }else{
     if(stage==='before-register'){
       await assert.rejects(manager.prepare(peer),{code:'owned_subscription_waiting'});
@@ -264,7 +267,8 @@ test('notLoaded 清除订阅缓存，恢复合并并发，断线重连沿用原�
   assert.equal(store.endpoint(x.id)?.active,true);
   await restoreMember();
   const held=(await broker.dispatch('status',{}) as any).peers.find((p:any)=>p.id===x.id);
-  assert.match(held.childCompletions.hold.reason,/后台 Codex 还没重新接上.*完成提醒先保留/);
+  assert.match(held.childCompletions.hold.reason,/刚重启.*核对主线程的进展/);
+  assert.equal(held.childCompletions.hold.observing,true);
   assert.equal(held.childCompletions.wake,undefined);
   assert.equal(store.setting('codexWake:'+x.id),undefined);
   assert.equal(store.message(ordinary.id).attempts,0);

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { BridgeError, describeError } from '../../shared/errors.js';
 import type { ManagedIncident, ManagedRecovery } from './managed-recovery.js';
-import type { AuthorityLoss, SuspendReason } from '../stuck-session-text.js';
+import { evidenceUnverifiedReason, type AuthorityLoss, type SuspendReason } from '../stuck-session-text.js';
 
 export type CodexRecycleTrigger = 'native_thread_wedged' | 'cold_exhausted' | 'loaded_unleased' | 'loaded_unleased_expired';
 export interface CodexRecycleGeneration { runtimeId:string; endpoint:string; pid:number; procStart:string; bootId?:string }
@@ -28,11 +28,13 @@ export interface CodexRecycleDecision {
   revision:string; facts:string; work:CodexRecycleWork; since:number; noticeId:string; autoEligible:boolean; noticePosted?:true;
 }
 export interface CodexRecycleAcceptance { incidentId:string; evidenceRevision:string; reason:string; by?:'partner'|'user' }
-interface Stage { step:string; trigger:CodexRecycleTrigger }
+interface ObservationGap { since:number; attempts:number; reason:string; exhausted?:true; lapsedRevision?:string }
+interface Stage { step:string; trigger:CodexRecycleTrigger; observationGap?:ObservationGap }
 export interface CodexRecycleBasis { old:CodexRecycleGeneration; profile:CodexRecycleProfileRef; decision:CodexRecycleDecision; acceptance?:CodexRecycleAcceptance }
 type Basis=CodexRecycleBasis;
 interface Attempt extends Basis { id:string; at:number; stopDeadline:number; ledger:CodexRecycleLedger }
-type StopRequested = { phase:'stop_requested'; attempt:Attempt; signal?:'unsubmitted'|'possibly_submitted' };
+interface StopRetry { reason:string; basis?:Basis }
+type StopRequested = { phase:'stop_requested'; attempt:Attempt; signal?:'unsubmitted'|'possibly_submitted'; stopRetry?:StopRetry };
 type Stopped = { phase:'stopped'; attempt:Attempt };
 type LaunchRequested = { phase:'launch_requested'; attempt:Attempt; launch:CodexRecycleLaunch };
 type Verifying = { phase:'verifying'; attempt:Attempt; launch:CodexRecycleLaunch; fresh:CodexRecycleGeneration; resumeSubmitted:boolean };
@@ -41,12 +43,12 @@ type Retiring = { phase:'retiring'; verification:Verifying; failure:{code:string
 const deadlineReason={alive:'停止期限已过，原进程仍在运行。',dead:'停止期限已过，已确认原进程退出，替代后台尚未启动。',
   unknown:'停止期限已过，原进程的退出结果仍未确认。'};
 export type CodexRecycleOperation = Stage & (
-  | { phase:'observing'; basis?:Basis }
-  | { phase:'awaiting_partner'; basis:Basis }
-  | { phase:'preflight'; basis:Basis }
+  | { phase:'observing'; basis?:Basis; retrySample?:string }
+  | { phase:'awaiting_partner'; basis:Basis; retrySample?:string }
+  | { phase:'preflight'; basis:Basis; stopRetry?:StopRetry }
   | Consumed
  | { phase:'handback'; attempt:Attempt; fresh?:CodexRecycleGeneration }
-  | { phase:'held'; code:string; reason:string; basis?:Basis; paused?:Consumed|Retiring; suspend?:SuspendReason; leftover?:number }
+  | { phase:'held'; code:string; reason:string; basis?:Basis; paused?:Consumed|Retiring; suspend?:SuspendReason; leftover?:number; retrySample?:string; retryPending?:true }
   | { phase:'ready'; attempt:Attempt; fresh:CodexRecycleGeneration; finalized:boolean }
 );
 type NextOperation = CodexRecycleOperation extends infer T ? T extends Stage ? Omit<T,keyof Stage> : never : never;
@@ -60,6 +62,7 @@ export interface CodexRecyclePorts {
   ledger():CodexRecycleLedger;
                                         
   notify(incident:ManagedIncident,basis:Basis,ledger:CodexRecycleLedger):void;
+  acceptanceLapsed?(incident:ManagedIncident,revision:string):void;
   persistProfile(evidence:Available):void;
   inspectOld(old:CodexRecycleGeneration):Promise<'alive'|'dead'|'unknown'>;
   stop(old:CodexRecycleGeneration,deadline:number,guard:()=>void,markSignal:()=>void,force:boolean):Promise<void>;
@@ -75,12 +78,13 @@ export interface CodexRecyclePorts {
   admit?(incident:ManagedIncident,fresh:CodexRecycleGeneration):void;
   prepareUnsubscribed?(fresh:CodexRecycleGeneration,profile:CodexRecycleProfileRef):Promise<void>;
   admitUnsubscribed?():void;
-  recoveredSubscription?(expected?:CodexRecycleGeneration):CodexRecycleGeneration|undefined;
+  recoveredSubscription?():CodexRecycleGeneration|undefined;
+  foldHandbackReceipts?(profile:CodexRecycleProfileRef,ledger:CodexRecycleLedger):Promise<()=>void>;
   authorityLost?(incident:ManagedIncident,loss:AuthorityLoss):void;
                                            
   finish(incident:ManagedIncident,ready:Extract<CodexRecycleOperation,{phase:'ready'}>):void;
 }
-export interface CodexRecycleResult { kind:'natural'|'current'|'stale'; incident:ManagedIncident }
+export interface CodexRecycleResult { kind:'natural'|'current'|'stale'; incident:ManagedIncident; retryObservation?:true }
 
 export function sameCodexRecycleGeneration(a:CodexRecycleGeneration,b:CodexRecycleGeneration):boolean {
   return a.runtimeId===b.runtimeId&&a.endpoint===b.endpoint&&a.pid===b.pid&&a.procStart===b.procStart&&a.bootId===b.bootId;
@@ -104,6 +108,8 @@ export function codexRecycleWorkKind(work:CodexRecycleWork):'active_turn'|'unkno
 const busy=(work:CodexRecycleWork)=>codexRecycleWorkKind(work)!=='idle';
 const uniqueSorted=(values:string[])=>[...new Set(values)].sort();
 const stalledAfter=15*60*1000;
+const observationGapAttempts=6,observationGapMs=5*60*1000;
+const recycleEvidenceHeldCode='codex_recycle_evidence_unverified';
 function withProgress(evidence:Available,previous:Basis|undefined,now:number):Available {
   const {work}=evidence;
   if(!work.activeTurnIds.length||work.progress!=='unknown')return evidence;
@@ -125,6 +131,11 @@ function decisionFacts(evidence:Available,progressGate:boolean):string {
 function heldError(error:unknown):{code:string;reason:string} {
   return {code:error instanceof BridgeError?error.code:'codex_recycle_failed',reason:describeError(error).slice(0,1200)};
 }
+export function recycleEvidenceReadFailure(source:string,error:unknown):Extract<CodexRecycleEvidence,{kind:'held'}> {
+  return {kind:'held',code:error instanceof BridgeError?error.code:recycleEvidenceHeldCode,
+    reason:(error instanceof BridgeError?describeError(error):evidenceUnverifiedReason(source,describeError(error))).slice(0,1200)};
+}
+export const isCodexRecycleTransientObservation=(code:string)=>['timeout','rpc_backpressure','disconnected','restart_profile_pending_tail'].includes(code);
 
 export class CodexRecycle {
   private operations=new Map<string,{id:string; work:Promise<CodexRecycleResult>}>();
@@ -146,10 +157,15 @@ export class CodexRecycle {
 
   private async run(original:ManagedIncident,trigger:CodexRecycleTrigger,ports:CodexRecyclePorts,acceptance?:CodexRecycleAcceptance):Promise<CodexRecycleResult> {
     let incident=this.recovery.get(original.peerId)??original,operation=incident.recycle;
-    const result=(kind:CodexRecycleResult['kind']='current'):CodexRecycleResult=>({kind,incident});
+    const stopRetry=operation?.phase==='preflight'||operation?.phase==='stop_requested'&&operation.signal==='unsubmitted'?operation.stopRetry:undefined;
+    const stopFailed:Extract<CodexRecycleOperation,{phase:'held'}>|undefined=operation?.phase==='held'&&operation.code==='codex_recycle_stop_deadline'?operation:
+      operation&&stopRetry?{phase:'held',code:'codex_recycle_stop_deadline',step:operation.step,trigger:operation.trigger,...stopRetry}:undefined;
+    const retrySource=stopFailed&&{reason:stopFailed.reason,basis:stopFailed.basis&&{...stopFailed.basis,acceptance:undefined}};
+    let retryObservation: true|undefined, gap=operation?.observationGap;
+    const result=(kind:CodexRecycleResult['kind']='current'):CodexRecycleResult=>({kind,incident,retryObservation});
     if(incident.id!==original.id||incident.pairId!==original.pairId||incident.sessionId!==original.sessionId||incident.state==='closed')return result('stale');
-    const commit=(next:NextOperation|undefined,sideEffect?:(current:ManagedIncident)=>void)=>{
-      incident=this.recovery.updateRecycle(incident,operation,next?{...next,trigger,step:randomUUID()}:undefined,sideEffect);
+    const commit=(next:NextOperation|undefined,sideEffect?:(current:ManagedIncident)=>void,observationGap?:ObservationGap)=>{
+      incident=this.recovery.updateRecycle(incident,operation,next?{...next,trigger,step:randomUUID(),observationGap}:undefined,sideEffect);
       operation=incident.recycle;
     };
     const guard=()=>{
@@ -183,16 +199,59 @@ export class CodexRecycle {
       guard();commit({...ready,finalized:true},current=>ports.finish(current,ready));
     };
     const reobserve=async()=>{
-      guard();const evidence=await ports.observe(trigger);guard();return evidence;
+      guard();
+      const evidence=await ports.observe(trigger).catch(error=>{
+        const detail=heldError(error);if(!isCodexRecycleTransientObservation(detail.code))throw error;
+        return {kind:'held' as const,...detail};
+      });
+      guard();return evidence;
     };
-    const observeAgain=()=>commit({phase:'observing'});
+    const observeAgain=(basis?:Basis,retrySample?:string,observationGap=basis?.acceptance?gap:undefined)=>commit(stopFailed?
+      {...stopFailed,basis:basis??(stopFailed.basis&&{...stopFailed.basis,acceptance:undefined}),retrySample}:{phase:'observing',basis,retrySample},undefined,observationGap);
+    const lapseObservation=({since,attempts,reason,lapsedRevision}:ObservationGap,basis?:Basis)=>{
+      const exhausted:ObservationGap={since,attempts,reason,exhausted:true,lapsedRevision:lapsedRevision??basis?.acceptance?.evidenceRevision};
+      const revision=exhausted.lapsedRevision;
+      const notify=revision&&!lapsedRevision?(current:ManagedIncident)=>ports.acceptanceLapsed?.(current,revision):undefined;
+      if(stopFailed){
+        if(!stopFailed.observationGap?.exhausted||operation!==stopFailed||stopFailed.retrySample){
+          const basis=stopFailed.basis&&{...stopFailed.basis,acceptance:undefined};
+          commit({...stopFailed,basis,retryPending:true,retrySample:undefined},notify,exhausted);
+        }
+      }else if(operation?.phase!=='held'||!operation.observationGap?.exhausted||operation.basis){
+        const elapsed=this.now()-since;
+        const detail=elapsed>=observationGapMs?`已持续约 ${Math.floor(elapsed/60000)} 分钟`:`连续 ${attempts} 次取证失败`;
+        const heldReason=operation?.phase==='held'&&operation.observationGap?.exhausted?operation.reason:evidenceUnverifiedReason('回收证据',`${detail}：${reason}`);
+        commit({phase:'held',code:recycleEvidenceHeldCode,reason:heldReason},notify,exhausted);
+      }
+      retryObservation=true;
+    };
+    const lapseIfOverdue=(basis?:Basis)=>{
+      if(!basis?.acceptance||!gap||gap.exhausted||this.now()-gap.since<observationGapMs)return false;
+      lapseObservation(gap,basis);return true;
+    };
+    const postponeObservation=(reason:string,basis?:Basis)=>{
+      if(!gap?.exhausted)gap={since:gap?.since??this.now(),attempts:(gap?.attempts??0)+1,reason};
+      if(gap.exhausted||gap.attempts>=observationGapAttempts||this.now()-gap.since>=observationGapMs){lapseObservation(gap,basis);return;}
+                                 
+      if(!stopFailed&&basis?.decision.noticePosted&&(operation?.phase==='awaiting_partner'||operation?.phase==='preflight'||
+        operation?.phase==='stop_requested'&&operation.signal==='unsubmitted')){
+        commit({phase:'awaiting_partner',basis},undefined,gap);
+      }else observeAgain(basis,undefined,gap);
+      retryObservation=true;
+    };
     try{
       if(operation?.phase==='ready'){finish();return result();}
       if(operation?.phase==='handback'){
-        const fresh=ports.recoveredSubscription?.(operation.fresh);
+        const handback=operation,fresh=ports.recoveredSubscription?.();
         if(!fresh||fresh.runtimeId===operation.attempt.old.runtimeId||fresh.pid===operation.attempt.old.pid&&fresh.procStart===operation.attempt.old.procStart)
           return result('natural');
-        guard();commit({...operation,fresh,phase:'ready',finalized:false});finish();return result();
+        if(handback.fresh&&!sameCodexRecycleGeneration(handback.fresh,fresh)&&await ports.inspectOld(handback.fresh).catch(()=>'unknown')!=='dead')
+          return result('natural');
+        const fold=await ports.foldHandbackReceipts?.(handback.attempt.profile,handback.attempt.ledger);
+        const current=ports.recoveredSubscription?.();
+        if(!current||!sameCodexRecycleGeneration(current,fresh))return result('natural');
+        guard();
+        commit({...handback,fresh,phase:'ready',finalized:false},fold);finish();return result();
       }
       const paused=operation?.phase==='held'?operation.paused:undefined;
       let stage:Consumed|undefined=operation?.phase==='held'?(paused?.phase==='retiring'?paused.verification:paused):
@@ -202,54 +261,94 @@ export class CodexRecycle {
       }else{
         const awaiting=operation?.phase==='awaiting_partner'||operation?.phase==='preflight'||operation?.phase==='observing'?operation.basis:
           operation?.phase==='held'?operation.basis:undefined;
-        const acceptedHere=acceptance&&awaiting&&(operation?.phase==='awaiting_partner'||operation?.phase==='held'&&operation.code==='codex_recycle_stop_deadline'||
+        const acceptedHere=acceptance&&awaiting&&(operation?.phase==='awaiting_partner'||operation?.phase==='held'&&operation.code==='codex_recycle_stop_deadline'&&!operation.retryPending||
           operation?.phase==='held'&&operation.code==='codex_recycle_partner_unreachable'&&acceptance.by==='user')&&
           acceptance.incidentId===incident.id&&acceptance.evidenceRevision===awaiting.decision.revision;
+        if(acceptance&&awaiting?.acceptance&&!acceptedHere&&(acceptance.incidentId!==incident.id||acceptance.evidenceRevision!==awaiting.acceptance.evidenceRevision))
+          return result('stale');
+        const approved=acceptedHere?acceptance:awaiting?.acceptance;
+        const queued=approved&&awaiting?{...awaiting,acceptance:approved}:undefined;
         if(!operation)commit({phase:'observing'});
         const observed=await reobserve();
         const evidence=observed.kind==='available'?withProgress(observed,awaiting,this.now()):observed;
-        if(evidence.kind==='held'){hold(evidence.code,evidence.reason);return result(acceptance?'stale':'current');}
+        if(evidence.kind==='held'){
+          if(isCodexRecycleTransientObservation(evidence.code)){
+            postponeObservation(evidence.reason,queued??(operation?.phase==='awaiting_partner'?awaiting:undefined));
+          }else if(operation?.phase==='held'&&operation.code==='codex_recycle_stop_deadline'){
+            if(operation.retrySample||operation.basis?.acceptance)observeAgain(operation.basis&&{...operation.basis,acceptance:undefined});
+          }else hold(evidence.code,evidence.reason);
+          return result(acceptance?'stale':'current');
+        }
         if(evidence.kind==='natural'||trigger==='loaded_unleased'&&(!evidence.work.activeTurnIds.length||!ports.ledger().held.length)){
           commit(undefined);return result(acceptance?'stale':'natural');
         }
-        const gate=!(operation?.phase==='held'&&operation.code==='codex_recycle_stop_deadline')&&progressGate(),facts=decisionFacts(evidence,gate);
+        if(lapseIfOverdue(queued))return result(acceptance?'stale':'current');
+        const gate=!stopFailed&&progressGate(),facts=decisionFacts(evidence,gate);
         const previous=awaiting?.decision;
         const decision:CodexRecycleDecision=previous?.facts===facts?
           {...previous,work:evidence.work}:{facts,revision:randomUUID(),noticeId:randomUUID(),since:previous?.since??this.now(),work:evidence.work,autoEligible:gate};
         const basis:Basis={old:evidence.old,profile:evidence.profile,decision};
-        const valid=acceptedHere&&acceptance&&decision.revision===acceptance.evidenceRevision?acceptance:
-          !acceptance&&previous?.facts===facts?awaiting?.acceptance:undefined;
+                                                      
+        if(queued&&(awaiting?.acceptance||previous?.facts!==facts)){
+          const sample=operation?.phase==='observing'||operation?.phase==='awaiting_partner'?operation.retrySample:stopFailed?.retrySample;
+          if(sample!==facts){
+            if(operation?.phase==='awaiting_partner'&&previous?.facts===facts)commit({phase:'awaiting_partner',basis:queued,retrySample:facts},undefined,gap);
+            else observeAgain(queued,facts);
+            return result(acceptance?'stale':'current');
+          }
+          if(previous?.facts!==facts&&!stopFailed&&(busy(evidence.work)||!gate)){
+            if(ports.partnerReachable())awaitPartner(basis);
+            else hold('codex_recycle_partner_unreachable','后台 Codex 可能还有工作，当前搭档无法确认是否回收。',undefined,basis);
+            return result(acceptance?'stale':'current');
+          }
+        }
+        const valid=approved&&decision.revision===approved.evidenceRevision?approved:undefined;
         if((busy(evidence.work)||!gate)&&!valid){
-          if(operation?.phase==='held'&&operation.code==='codex_recycle_stop_deadline'){
-            hold(operation.code,operation.reason,undefined,basis);return result(acceptance?'stale':'current');
+          if(stopFailed){
+            if(!stopFailed.retryPending&&previous?.facts===facts){
+              if(operation!==stopFailed||stopFailed.retrySample||gap)commit({...stopFailed,retrySample:undefined});
+            }else if(stopFailed.retrySample===facts){
+              const retryDecision=stopFailed.retryPending&&previous?.facts===facts?
+                {...decision,revision:randomUUID(),noticeId:randomUUID(),noticePosted:undefined}:decision;
+              commit({...stopFailed,basis:{...basis,decision:retryDecision},retryPending:undefined,retrySample:undefined});
+            }else commit({...stopFailed,retrySample:facts},undefined,gap?.exhausted?gap:undefined);
+            return result(acceptance?'stale':'current');
           }
           if(!ports.partnerReachable())hold('codex_recycle_partner_unreachable','后台 Codex 可能还有工作，当前搭档无法确认是否回收。',undefined,basis);
           else if(operation?.phase!=='awaiting_partner'||operation.basis.decision.revision!==decision.revision){
-            if(operation?.phase==='observing'&&previous?.facts===facts)awaitPartner(basis);
+            const unverified=operation?.phase==='held'&&gap?.exhausted?operation:undefined;
+            if((operation?.phase==='observing'||unverified)&&previous?.facts===facts)awaitPartner(basis);
+            else if(unverified)commit({...unverified,basis},undefined,gap);
             else commit({phase:'observing',basis});
           }
-          else if(previous?.work.lastProgressAt!==decision.work.lastProgressAt||previous?.work.progress!==decision.work.progress)
+          else if(gap||previous?.work.lastProgressAt!==decision.work.lastProgressAt||previous?.work.progress!==decision.work.progress)
             commit({phase:'awaiting_partner',basis});
           return result(acceptance?'stale':'current');
         }
         if(acceptance&&!valid)return result('stale');
         if(valid)basis.acceptance=valid;
-        commit({phase:'preflight',basis});
+        commit({phase:'preflight',basis,stopRetry:retrySource},undefined,gap);
         const sampled=await reobserve();
         const fresh=sampled.kind==='available'?withProgress(sampled,basis,this.now()):sampled;
-        if(fresh.kind==='held'){observeAgain();return result(acceptance?'stale':'current');}
+        if(fresh.kind==='held'){
+          if(isCodexRecycleTransientObservation(fresh.code))postponeObservation(fresh.reason,valid?basis:undefined);
+          else observeAgain();
+          return result(acceptance?'stale':'current');
+        }
         const ledger=ports.ledger();
         if(fresh.kind==='natural'||trigger==='loaded_unleased'&&(!fresh.work.activeTurnIds.length||!ledger.held.length)){
           commit(undefined);return result(acceptance?'stale':'natural');
         }
-        if(decisionFacts(fresh,gate&&progressGate())!==facts){
-          observeAgain();
+        if(lapseIfOverdue(basis))return result(acceptance?'stale':'current');
+        const currentFacts=decisionFacts(fresh,gate&&progressGate());
+        if(currentFacts!==facts){
+          observeAgain(valid?basis:undefined,valid?currentFacts:undefined);
           return result(acceptance?'stale':'current');
         }
         ports.persistProfile(fresh);
         const at=this.now(),attempt:Attempt={...basis,decision:{...decision,work:fresh.work},id:randomUUID(),at,stopDeadline:at+15000,ledger};
-        stage={phase:'stop_requested',attempt,signal:'unsubmitted'};
-        commit(stage);
+        stage={phase:'stop_requested',attempt,signal:'unsubmitted',stopRetry:retrySource};
+        commit(stage,undefined,gap);
       }
       if(stage.phase==='stop_requested'){
         const {attempt}=stage,state=await ports.inspectOld(attempt.old).catch(()=>'unknown' as const);
@@ -258,9 +357,9 @@ export class CodexRecycle {
           observeAgain();return result('stale');
         }
         if(state==='alive'&&this.now()>=attempt.stopDeadline){
-          const decision={...attempt.decision,revision:randomUUID(),noticeId:randomUUID(),noticePosted:undefined,autoEligible:false,
+          const decision={...attempt.decision,autoEligible:false,
             facts:decisionFacts({kind:'available',old:attempt.old,profile:attempt.profile,work:attempt.decision.work},false)};
-          hold('codex_recycle_stop_deadline',deadlineReason[state],undefined,{old:attempt.old,profile:attempt.profile,decision});return result();
+          commit({phase:'held',code:'codex_recycle_stop_deadline',reason:deadlineReason[state],basis:{old:attempt.old,profile:attempt.profile,decision},retryPending:true});return result();
         }
         if(state!=='dead'){
           if(state!=='alive'||stage.signal!=='unsubmitted'){
@@ -270,7 +369,16 @@ export class CodexRecycle {
           const fresh=sampled.kind==='available'?withProgress(sampled,attempt,this.now()):sampled;
                                              
           const gate=attempt.decision.autoEligible;
-          if(fresh.kind!=='available'||decisionFacts(fresh,gate)!==attempt.decision.facts){
+          const latestFacts=fresh.kind==='available'?decisionFacts(fresh,gate):undefined;
+          const acceptedBasis=attempt.acceptance?{old:attempt.old,profile:attempt.profile,decision:attempt.decision,acceptance:attempt.acceptance}:undefined;
+          if(fresh.kind==='held'&&isCodexRecycleTransientObservation(fresh.code)){
+            postponeObservation(fresh.reason,acceptedBasis);return result();
+          }
+          if(lapseIfOverdue(acceptedBasis))return result();
+          if(acceptedBasis&&latestFacts!==undefined&&latestFacts!==attempt.decision.facts){
+            observeAgain(acceptedBasis,latestFacts);return result();
+          }
+          if(fresh.kind!=='available'||latestFacts!==attempt.decision.facts){
             throw new BridgeError('codex_recycle_work_changed','发出停止请求前，原会话的工作或归属证据已改变。');
           }
                                                 
@@ -283,6 +391,8 @@ export class CodexRecycle {
           let stopping=stage;
           const authorize=()=>{
             guard();
+            if(stopping.signal==='unsubmitted'&&lapseIfOverdue(acceptedBasis))
+              throw new BridgeError('codex_recycle_approval_lapsed','回收确认已经过期，未发出停止信号。');
             if(trigger==='loaded_unleased'&&!ports.ledger().held.length)
               throw new BridgeError('codex_recycle_work_changed','停止前的原消息已不再等待，未停止已加载的会话。');
           };
@@ -353,6 +463,7 @@ export class CodexRecycle {
       }
       return result();
     }catch(error){
+      if(error instanceof BridgeError&&error.code==='codex_recycle_approval_lapsed')return result();
       if(error instanceof BridgeError&&error.code==='codex_recycle_authority_lost'){
         const loss=(error as BridgeError&{loss?:AuthorityLoss}).loss;
         this.recovery.closeRecycle(incident,loss?()=>ports.authorityLost?.(incident,loss):undefined);

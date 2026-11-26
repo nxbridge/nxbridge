@@ -1,7 +1,7 @@
 import type { Store } from '../../storage/store.js';
-import { probeProcesses } from '../../process/process.js';
+import { codexIsAppServer, processIdentity, probeProcesses } from '../../process/process.js';
 import { normalizedHome, registrationWindow, windowKey } from '../../integration/hooks/session-bindings.js';
-import {BridgeError} from '../../shared/errors.js';
+import {BridgeError,describeError} from '../../shared/errors.js';
 import {type BridgeConfig,type Peer,type RegisterInput} from '../../types.js';
 import type { SendIntent } from '../pairing/pair-selection.js';
 import { pairLoss } from '../pairing/pair-loss.js';
@@ -9,6 +9,7 @@ import { managedRecoveryKey } from './managed-recovery.js';
 import { recordManagedAdoption } from './takeover.js';
 import { hostingRecord, writeHosting } from './session-hosting.js';
 import {sameDirectory} from '../../shared/files.js';
+import {memberEnabled} from '../member-control.js';
 
 interface PendingWindow {peerId:string;input:RegisterInput;state:'unverified'|'choice';deadline:number;nextAt:number}
 const stateKey='windowRecoveryPending';
@@ -17,6 +18,23 @@ const proofWindowMs=60000,proofRetryMs=5000;
                                            
 export class WindowRecovery {
   constructor(private store:Store,private probe=probeProcesses,private managedConflict?:(peer:Peer)=>Promise<void>,private sessionState?:(peer:Peer)=>Promise<'alive'|'dead'|'unknown'>,private managedRejoin?:(input:RegisterInput)=>Peer|undefined|Promise<Peer|undefined>){}
+  async reconcileBindingsAtStartup():Promise<void>{
+    const {store}=this;
+    await store.faults.run('startup_bindings',async()=>{
+      for(const peer of store.peers()){
+        const current=store.getPeer(peer.id);if(!current||!memberEnabled(store,current))continue;
+        if(peer.owner!=='user'||!peer.sessionId||!['root','fork'].includes(peer.kind)||store.bindings.current(peer.id))continue;
+        const endpoints=store.endpoints(peer.id).filter(e=>e.active&&e.mode!=='app-server'&&e.processKind!=='app-server'&&e.configHome&&e.pid&&e.procStart);
+        if(endpoints.length!==1)continue;
+        const endpoint=endpoints[0]!;
+        try{
+          const identity=await processIdentity(endpoint.pid!);
+          if(identity.startedAt!==endpoint.procStart||!new RegExp('^'+peer.host+'(?:\\.exe)?$','i').test(identity.name)||peer.host==='codex'&&await codexIsAppServer(identity))continue;
+          store.transaction(()=>{const binding=store.bindings.activate({host:peer.host,configHome:endpoint.configHome!,pid:identity.pid,procStart:identity.startedAt},peer.id,peer.sessionId!,'legacy verified window');store.saveEndpoint({...endpoint,bindingEpoch:binding.epoch});});
+        }catch(error){store.event('context.backfill.unverified',{peerId:peer.id,error:describeError(error)});}
+      }
+    });
+  }
   private pending():Record<string,PendingWindow>{return this.store.setting(stateKey)??{};}
   private forget(id:string):void{const all=this.pending();if(all[id]){delete all[id];this.store.setSetting(stateKey,all);}}
   private managedConflicts(peerId:string):Peer[]{return this.store.faults.map('managed_conflict_scan',this.store.peers(),peer=>peer.id,peer=>this.store.setting<{memberId:string}>('managedSessionConflict:'+peer.id)?.memberId===peerId?peer:undefined).filter((peer):peer is Peer=>!!peer);}

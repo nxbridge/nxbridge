@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Store } from '../../storage/store.js';
 import type { Endpoint, Pair, Peer, RegisterInput } from '../../types.js';
 import type { CodexAdapter, CodexContextReceipt } from '../../hosts/codex/adapter.js';
+import { catchUpCodexHistory } from '../../hosts/codex/codex-history.js';
 import { runtimeFor } from '../../hosts/managed-runtimes.js';
 import { BridgeError } from '../../shared/errors.js';
 import { sameDirectory } from '../../shared/files.js';
@@ -10,7 +11,7 @@ import { memberEnabled } from '../member-control.js';
 import { hostingRecord, writeHosting } from './session-hosting.js';
 import { CodexRecycle, codexRecycleFenced, codexRecycleWorkKind, type CodexRecycleAcceptance, type CodexRecycleOperation, type CodexRecycleTrigger, type CodexRecycleWork } from './codex-recycle.js';
 import { recoveryUserStep, type ManagedIncident, type ManagedRecovery } from './managed-recovery.js';
-import { RECYCLE_AMBIGUOUS_USER_STEP, RECYCLE_CLEANUP_USER_STEP, RECYCLE_OLD_UNKNOWN_USER_STEP, recycleAuthorityLostNotice, recycleCleanupBlockedNotice, recycleDoneNotice, recycleHeldNotice, recycleLaunchUnknownNotice, recycleOldUnknownNotice, recycleStopFailedNotice, recycleRefusedResult, staleRevisionResult, stuckNotice, stuckStatusText, stuckUserLine, type AuthorityLoss, type OldOutcome, type RecycleStage, type StaleChange, type StuckProgress, type StuckTrigger, type SuspendReason } from '../stuck-session-text.js';
+import { RECYCLE_AMBIGUOUS_USER_STEP, RECYCLE_CLEANUP_USER_STEP, RECYCLE_OLD_UNKNOWN_USER_STEP, recycleAcceptanceLapsedNotice, recycleAcceptanceQueuedResult, recycleAuthorityLostNotice, recycleCleanupBlockedNotice, recycleDoneNotice, recycleHeldNotice, recycleLaunchUnknownNotice, recycleOldUnknownNotice, recycleStopFailedNotice, recycleStopFailedPendingNotice, recycleRefusedResult, staleRevisionResult, stuckNotice, stuckStatusText, stuckUserLine, type AuthorityLoss, type OldOutcome, type RecycleStage, type StaleChange, type StuckProgress, type StuckTrigger, type SuspendReason } from '../stuck-session-text.js';
 
 interface Candidate { pairId:string; sessionId:string; runtimeId:string; pid:number; procStart:string; trigger:CodexRecycleTrigger; at:number; idleSince?:number }
 interface DeliveryProgress {sessionId:string;pairId:string;turns:Record<string,{received?:true;completedAt?:number}>;lastCompleted?:number}
@@ -39,6 +40,7 @@ interface Services {
 export class CodexRecycleControl {
   private engine:CodexRecycle;
   private due=new Map<string,number>();
+  private observationBackoff=new Map<string,number>();
   constructor(private services:Services){this.engine=new CodexRecycle(services.recovery);}
 
   fenced(id:string):boolean {return codexRecycleFenced(this.services.recovery.get(id));}
@@ -49,11 +51,26 @@ export class CodexRecycleControl {
 
   reconcileAuthority(peer:Peer):void{
     const {store,recovery}=this.services,incident=recovery.get(peer.id);
-    if(!incident?.recycle||incident.state==='closed')return;
+    if(!incident?.recycle)return;
+    if(incident.state==='closed'){this.finalizeProfile(incident);return;}
     const loss=this.authorityLoss(peer,incident);
     if(loss){
+      this.finalizeProfile(incident);
       recovery.closeRecycle(incident,()=>this.notifyAuthorityLost(peer,incident,loss));store.setSetting(marker(peer.id),null);
+      this.observationBackoff.delete(peer.id);
     }
+  }
+
+  private finalizeProfile(incident:ManagedIncident):void{
+    const stage=incident.recycle;
+    if(stage?.phase!=='ready'||!stage.finalized)return;
+    try{this.services.codex.finalizeRecycle?.(incident.peerId,incident.sessionId,stage.fresh,stage.attempt.profile.sourceId);}
+    catch(error){this.services.store.event('codex.recycle.profile_cleanup_pending',{peerId:incident.peerId,error:String(error)});}
+  }
+
+  reconcileFinishedProfile(peerId:string):void{
+    const incident=this.services.recovery.get(peerId);
+    if(incident)this.finalizeProfile(incident);
   }
 
   private authorityLoss(peer:Peer,incident:ManagedIncident):AuthorityLoss|undefined{
@@ -67,7 +84,7 @@ export class CodexRecycleControl {
 
   private notifyAuthorityLost(peer:Peer,incident:ManagedIncident,loss:AuthorityLoss):void{
     const {store,delivery}=this.services,pair=store.pairFor(peer.id),stage=incident.recycle;
-    if(!pair||pair.id!==incident.pairId||!stage)return;
+    if(!pair||pair.id!==incident.pairId||!stage||stage.phase==='ready'&&stage.finalized)return;
     delivery.cancelKind(pair.id,pair.claude,'codex_recycle_decision:'+peer.id);
     const phase=stage.phase==='held'?stage.paused??stage:stage;
     const old:OldOutcome=phase.phase==='stop_requested'&&phase.signal!=='unsubmitted'||terminalStop(stage)?'unknown':
@@ -94,7 +111,7 @@ export class CodexRecycleControl {
     if(prior?.runtimeId===runtime.id&&prior.procStart===runtime.procStart&&prior.pairId===pair.id&&prior.sessionId===peer.sessionId
       &&(prior.trigger===trigger||prior.trigger!=='loaded_unleased'&&trigger==='loaded_unleased'))return true;
     store.setSetting(marker(peer.id),{pairId:pair.id,sessionId:peer.sessionId,runtimeId:runtime.id,pid:runtime.pid,procStart:runtime.procStart,trigger,at:Date.now()} satisfies Candidate);
-    this.due.delete(peer.id);return true;
+    this.due.delete(peer.id);this.observationBackoff.delete(peer.id);return true;
   }
 
   observeDeliveredTurn(peer:Peer,turnId:string,phase:'received'|'completed',at=Date.now()):void {
@@ -113,7 +130,7 @@ export class CodexRecycleControl {
 
   private endpoint(peer:Peer,incident:ManagedIncident|undefined,candidate:Candidate|undefined):Endpoint|undefined {
     const {store}=this.services,live=store.endpoint(peer.id),operation=incident?.recycle;
-    const runtimeId=operation?.phase==='ready'||operation?.phase==='handback'?operation.fresh?.runtimeId:basisOf(operation)?.old.runtimeId??candidate?.runtimeId;
+    const runtimeId=operation?.phase==='ready'?operation.fresh.runtimeId:operation?.phase==='handback'?undefined:basisOf(operation)?.old.runtimeId??candidate?.runtimeId;
     if(!runtimeId||live?.runtimeId===runtimeId)return live;
     return store.endpoints(peer.id).filter(value=>value.runtimeId===runtimeId).at(-1);
   }
@@ -127,7 +144,7 @@ export class CodexRecycleControl {
     const operation=incident?.state==='closed'?undefined:incident?.recycle;
     if(!operation&&(!candidate||candidate.pairId!==pair.id||candidate.sessionId!==peer.sessionId))return false;
     const cancelDecisions=(keep?:string)=>delivery.cancelKind(pair.id,pair.claude,'codex_recycle_decision:'+peer.id,keep);
-    if(!acceptance&&(this.due.get(peer.id)??0)>Date.now())return this.fenced(peer.id);
+    if(!acceptance&&(this.due.get(peer.id)??0)>Date.now())return terminalStop(operation)||this.fenced(peer.id);
     const endpoint=this.endpoint(peer,incident,candidate);
     if(!endpoint?.runtimeId)return this.fenced(peer.id);
     const selected=store.endpoint(peer.id);
@@ -206,11 +223,22 @@ export class CodexRecycleControl {
       stop:async(old,deadline,authorize,markSignal,force)=>{authorize();await this.services.noExternalHolder(peer);authorize();await host.stop(old,deadline,authorize,markSignal,force);},
       launch:async(intent,authorize,profile)=>{authorize();await this.services.noExternalHolder(peer);authorize();await host.launch(intent,authorize,profile);},
       prepareUnsubscribed:async(fresh,profile)=>{unsubscribed=await host.prepareUnsubscribed(fresh,profile);},
-      recoveredSubscription:expected=>{
+      recoveredSubscription:()=>{
         const route=store.endpoint(peer.id),native=route?.native??route;
-        if(!route?.runtimeId||!native?.pid||!native.procStart||expected&&(route.runtimeId!==expected.runtimeId||route.address!==expected.endpoint||
-          native.pid!==expected.pid||native.procStart!==expected.procStart)||!codex.hasSubscription(store.peer(peer.id),route))return;
-        return {runtimeId:route.runtimeId,endpoint:route.address,pid:native.pid,procStart:native.procStart,bootId:expected?.bootId};
+        if(!route?.runtimeId||!native?.pid||!native.procStart||!codex.hasSubscription(store.peer(peer.id),route))return;
+        const expected=operation?.phase==='handback'?operation.fresh:undefined;
+        const bootId=route.runtimeId===expected?.runtimeId?expected?.bootId:runtimeFor(home,{id:route.runtimeId})?.value.bootId;
+        return {runtimeId:route.runtimeId,endpoint:route.address,pid:native.pid,procStart:native.procStart,bootId};
+      },
+      foldHandbackReceipts:async(profile,ledger)=>{
+        const pending=store.recycleDeliveryFacts(pair.id,peer.id);
+        const ids=new Set([...ledger.uncertain.map(row=>row.id),...ledger.held]);
+        const tracked=pending.filter(row=>ids.has(row.id));
+        if(!tracked.length)return ()=>{};
+        const since=tracked.reduce((earliest,row)=>Math.min(earliest,row.createdAt),Infinity);
+        const history=await catchUpCodexHistory(profile.file,peer.sessionId!,since);
+        const receipts=history.receipts.filter(receipt=>ids.has(receipt.messageId));
+        return ()=>{const target=store.peer(peer.id);for(const receipt of receipts)this.services.fold(target,receipt);};
       },
       admitUnsubscribed:()=>{
         const input=unsubscribed!;
@@ -234,6 +262,15 @@ export class CodexRecycleControl {
             ...copyWork(decision.work),held:ledger.held.length,
             incidentId:current.id,revision:decision.revision,updated:operation?.phase==='awaiting_partner'})});
       },
+      acceptanceLapsed:(current,revision)=>{
+        cancelDecisions();delivery.cancelKind(pair.id,owner.id,'codex_recycle_held:'+peer.id);
+        const fact=JSON.stringify([current.id,revision]);
+        const wake=!!store.endpoint(owner.id)&&store.peer(owner.id).state==='ready';
+        delivery.enqueue(pair.id,owner.id,{id:'recycle-lapsed:'+createHash('sha256').update(fact).digest('hex').slice(0,32),
+          source:'managed_recovery',kind:'codex_recycle_acceptance_lapsed:'+peer.id,incidentId:current.id,scope:this.services.scope(pair,owner),
+          state:'pending',wake,tier:wake?4:3,factKey:fact,...(!wake?{wakeWhenIdle:true as const}:{}),
+          message:recycleAcceptanceLapsedNotice({peerName:peer.name,peerHost:'codex',revision,held:readLedger().held.length})});
+      },
       admit:(_current,fresh)=>{
         const admitted=host.admission(fresh);
         for(const previous of store.endpoints(peer.id))if(previous.active&&previous.address!==fresh.endpoint)store.deactivate(peer.id,previous.epoch);
@@ -251,6 +288,7 @@ export class CodexRecycleControl {
         const userLine=stuckUserLine(by==='auto'?'auto_recovered':by==='partner'?'partner_recovered':'user_recovered',
           {peerName:peer.name,peerHost:'codex',trigger:copyTrigger(trigger),since:ready.attempt.decision.since,work});
         cancelDecisions();
+        delivery.cancelKind(pair.id,owner.id,'codex_recycle_held:'+peer.id);
         delivery.enqueue(pair.id,owner.id,{id:ready.attempt.id+':result',source:'managed_recovery',kind:'codex_recycle_result:'+peer.id,
           incidentId:current.id,scope:this.services.scope(pair,owner),state:'pending',wake,tier:wake?4:3,factKey:ready.attempt.id,affectedMessageIds:unknown,
           ...(actionable&&!wake?{wakeWhenIdle:true as const}:{}),
@@ -261,29 +299,38 @@ export class CodexRecycleControl {
         store.event('codex.recycle.ready',{incidentId:current.id,peerId:peer.id,sessionId:peer.sessionId,uncertain:unknown,userLine});
       },
     },acceptance);
-    if(result.incident.recycle?.phase==='ready'&&result.incident.recycle.finalized){
-      try{host.finalize?.(result.incident.recycle.fresh);}
-      catch(error){store.event('codex.recycle.profile_cleanup_pending',{peerId:peer.id,error:String(error)});}
-    }
+    this.finalizeProfile(result.incident);
     const stage=result.incident.state==='closed'?undefined:result.incident.recycle;
+    if(result.retryObservation||!acceptance&&operation?.phase==='observing'&&stage?.phase==='observing'){
+      const delay=Math.min(30000,2*(this.observationBackoff.get(peer.id)??5000));
+      this.observationBackoff.set(peer.id,delay);this.due.set(peer.id,Date.now()+delay);
+    }else this.observationBackoff.delete(peer.id);
     if(stage?.phase==='observing'&&operation?.phase==='awaiting_partner')cancelDecisions();
     if(!stage){
       cancelDecisions();
+      delivery.cancelKind(pair.id,owner.id,'codex_recycle_held:'+peer.id);
       if(trigger!=='loaded_unleased')store.setSetting(marker(peer.id),null);
     }
-    if(stage?.phase==='held'&&stage.code!=='codex_recycle_partner_unreachable'&&stage.code!=='incident_changed'&&result.kind!=='stale'
+    const exhausted=stage?.phase==='held'&&stage.observationGap?.exhausted;
+    const lapsed=exhausted?stage?.observationGap?.lapsedRevision:undefined;
+    if(exhausted&&!lapsed)cancelDecisions();
+    if(operation?.observationGap?.exhausted&&!exhausted&&stage&&stage.phase!=='held')
+      delivery.cancelKind(pair.id,owner.id,'codex_recycle_held:'+peer.id);
+    if(!lapsed&&stage?.phase==='held'&&stage.code!=='codex_recycle_partner_unreachable'&&stage.code!=='incident_changed'&&(result.kind!=='stale'||exhausted)
       &&store.endpoint(owner.id)&&!['offline','unknown','paused'].includes(store.peer(owner.id).state)){
-      const fact=JSON.stringify([result.incident.id,copyStage(stage),stage.code,stage.reason,stage.leftover,stage.code==='codex_recycle_stop_deadline'?stage.basis?.decision.revision:undefined]);
+      const stopFailed=stage.code==='codex_recycle_stop_deadline',revision=stage.basis?.decision.revision;
+      const fact=JSON.stringify([result.incident.id,copyStage(stage),stage.code,stage.reason,stage.leftover,stopFailed?revision:undefined,...(stage.retryPending?['awaiting_stable_evidence']:[])]);
       const wake=store.peer(owner.id).state==='ready';
       const id='recycle-held:'+createHash('sha256').update(fact).digest('hex').slice(0,32);
       const common={peerName:peer.name,peerHost:'codex' as const,held:readLedger().held.length};
-      const message=stage.code==='codex_recycle_stop_deadline'&&stage.basis?recycleStopFailedNotice({...common,recipientHost:owner.host,
-        incidentId:result.incident.id,revision:stage.basis.decision.revision}):stage.paused&&['launch_requested','verifying','retiring'].includes(stage.paused.phase)?
+      const message=stopFailed?stage.retryPending||!revision?recycleStopFailedPendingNotice(common):recycleStopFailedNotice({...common,recipientHost:owner.host,
+        incidentId:result.incident.id,revision}):stage.paused&&['launch_requested','verifying','retiring'].includes(stage.paused.phase)?
           recycleLaunchUnknownNotice({...common,reason:stage.reason,userStep:RECYCLE_AMBIGUOUS_USER_STEP}):stage.paused?.phase==='stopped'?
           recycleCleanupBlockedNotice({...common,leftover:stage.leftover||undefined,userStep:RECYCLE_CLEANUP_USER_STEP}):stage.paused?.phase==='stop_requested'?
           recycleOldUnknownNotice({...common,reason:stage.reason,userStep:RECYCLE_OLD_UNKNOWN_USER_STEP}):
           recycleHeldNotice({...common,stage:copyStage(stage),reason:stage.reason,userStep:recoveryUserStep(peer,result.incident)});
-      cancelDecisions();
+      if(!exhausted)cancelDecisions();
+      if(stopFailed||exhausted)delivery.cancelKind(pair.id,owner.id,'codex_recycle_held:'+peer.id,id);
       delivery.enqueue(pair.id,owner.id,{id,source:'managed_recovery',kind:'codex_recycle_held:'+peer.id,incidentId:result.incident.id,scope:this.services.scope(pair,owner),
         state:'pending',wake,tier:wake?4:3,factKey:fact,...(!wake?{wakeWhenIdle:true as const}:{}),
         message});
@@ -296,6 +343,11 @@ export class CodexRecycleControl {
   acceptanceText(peer:Peer,previous:ManagedIncident|undefined,acceptance:CodexRecycleAcceptance):string|undefined {
     const current=this.services.recovery.get(peer.id),stage=current?.recycle,before=basisOf(previous?.recycle),after=basisOf(stage);
     if(!stage)return 'No recycle was performed. There is no current recycle decision. See recovery status.';
+    if(current?.id===acceptance.incidentId&&after?.acceptance?.evidenceRevision===acceptance.evidenceRevision&&(stage.phase==='awaiting_partner'||stage.phase==='observing'||stage.phase==='held'&&stage.code==='codex_recycle_stop_deadline'))
+      return recycleAcceptanceQueuedResult({revision:acceptance.evidenceRevision});
+    if(current?.id===acceptance.incidentId&&stage.observationGap?.lapsedRevision===acceptance.evidenceRevision)
+      return recycleAcceptanceLapsedNotice({peerName:peer.name,peerHost:'codex',revision:acceptance.evidenceRevision,
+        held:this.services.store.recycleDeliveryFacts(current.pairId,peer.id).filter(message=>['held','accepted'].includes(message.state)).length});
     if(stage?.phase==='held')return recycleRefusedResult(stage.code);
     if(stage?.phase!=='awaiting_partner'||after?.decision.revision===acceptance.evidenceRevision)return;
     const changes:StaleChange[]=[];
@@ -314,9 +366,9 @@ export class CodexRecycleControl {
     const basis=basisOf(stage);
     const fields={peerName:peer.name,peerHost:'codex' as const,trigger:copyTrigger(stage.trigger),since:basis?.decision.since,
       work:basis&&codexRecycleWorkKind(basis.decision.work),
-      ...(stage.phase==='held'?{stage:copyStage(stage),reasonText:stage.reason,userStep:recoveryUserStep(peer,incident),suspend:stage.suspend,
+      ...(stage.phase==='held'?{stage:copyStage(stage),reasonText:stage.reason,userStep:recoveryUserStep(peer,incident),suspend:stage.suspend,retryPending:stage.retryPending,
         leftover:stage.leftover||undefined}:{})};
-    return {phase:stage.phase,trigger:stage.trigger,revision:basis?.decision.revision,work:basis?.decision.work,
+    return {phase:stage.phase,trigger:stage.trigger,revision:stage.phase==='held'&&(stage.retryPending||stage.observationGap?.exhausted)?undefined:basis?.decision.revision,work:basis?.decision.work,
       since:basis?.decision.since,old_generation:basis?.old,reason:stage.phase==='held'?stage.reason:undefined,
       original_source:basis?.profile?{lineage:basis.profile.lineage,rollout:basis.profile.file,version:basis.profile.launch?.version}:undefined,
       status_text:stage.phase==='handback'?stuckStatusText(stage.fresh?'reconnecting':'handed_to_recovery',fields):stage.phase==='held'&&stage.code==='codex_recycle_partner_unreachable'?stuckUserLine('no_partner',fields):

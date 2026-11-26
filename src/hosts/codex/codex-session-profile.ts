@@ -1,4 +1,4 @@
-import { createReadStream, globSync, statSync } from 'node:fs';
+import { closeSync, createReadStream, fstatSync, globSync, openSync, statSync, type BigIntStats } from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import {BridgeError,RuntimeRecoveryHold,describeError} from '../../shared/errors.js';
@@ -13,6 +13,7 @@ export interface SessionPolicy {
 }
 export interface SessionProfile {
   sessionId:string;file?:string;offset:number;settingsOffset?:number;complete:boolean;verified:boolean;meta:Record<string,any>;settings:Record<string,any>;
+  pendingTail?:true;
   live?:Record<string,any>;livePermissionConfig?:Record<string,unknown>;
   activePermission?:{id:string;extends?:string}|null;
   appliedServiceTier?:{offset:number;present:boolean;value?:string|null};
@@ -21,8 +22,11 @@ export interface SessionProfile {
   usage?:{inputTokens:number;at:number};
   compaction?:{id:string;at:number};
 }
-interface Cache extends SessionProfile {dev:number;ino:number;size:number;mtime:number;invalid:boolean}
+interface Cache {profile:SessionProfile;stat:BigIntStats;invalid:boolean}
 const caches=new Map<string,Cache>();
+const pendingProfiles=new Map<string,{stat:BigIntStats;work:Promise<SessionProfile>}>();
+const sameFile=(a:BigIntStats,b:BigIntStats)=>a.dev===b.dev&&a.ino===b.ino;
+const sameVersion=(a:BigIntStats,b:BigIntStats)=>sameFile(a,b)&&a.size===b.size&&a.mtimeNs===b.mtimeNs;
 const fields={model:'model',model_provider:'modelProvider',model_provider_id:'modelProvider',approval_policy:'approvalPolicy',approvals_reviewer:'approvalsReviewer',permission_profile:'permissionProfile',sandbox_policy:'sandbox',cwd:'cwd',runtime_workspace_roots:'runtimeWorkspaceRoots',effort:'reasoningEffort',reasoning_effort:'reasoningEffort',collaboration_mode:'collaborationMode',service_tier:'serviceTier',disabled_plugin_ids:'disabledPluginIds'} as const;
 function knownTier(profile:SessionProfile):string|undefined{
   const live=profile.live&&Object.hasOwn(profile.live,'serviceTier'),applied=profile.appliedServiceTier;
@@ -49,28 +53,51 @@ async function verifyResumedTier(rpc:RpcClient,id:string,profile:SessionProfile,
 
                                             
 export async function readSessionProfile(file:unknown,sessionId:string,options:{trackWork?:boolean}={}):Promise<SessionProfile>{
-  const empty=():SessionProfile=>({sessionId,offset:0,complete:true,verified:false,meta:{},settings:{}});
-  if(typeof file!=='string'||!file)return empty();
-  const key=JSON.stringify([file,sessionId,!!options.trackWork]);let stream:ReturnType<typeof createReadStream>|undefined;
+  if(typeof file!=='string'||!file)return emptyProfile(sessionId);
+  const key=JSON.stringify([file,sessionId,!!options.trackWork]);
+  let fd:number|undefined,stat:BigIntStats;
+  try{fd=openSync(file,'r');stat=fstatSync(fd,{bigint:true});}
+  catch{if(fd!==undefined)closeSync(fd);return{...emptyProfile(sessionId),file};}
+  const pending=pendingProfiles.get(key);
+  if(pending){
+    closeSync(fd);
+    if(sameVersion(pending.stat,stat))return structuredClone(await pending.work);
+                                           
+    await pending.work;
+    return readSessionProfile(file,sessionId,options);
+  }
+  const work=readProfile(file,sessionId,key,fd,stat,options.trackWork).finally(()=>pendingProfiles.delete(key));
+  pendingProfiles.set(key,{stat,work});
+  return structuredClone(await work);
+}
+const emptyProfile=(sessionId:string):SessionProfile=>({sessionId,offset:0,complete:true,verified:false,meta:{},settings:{}});
+async function readProfile(file:string,sessionId:string,key:string,fd:number,stat:BigIntStats,trackWork?:boolean):Promise<SessionProfile>{
+  const empty=()=>emptyProfile(sessionId);let stream:ReturnType<typeof createReadStream>|undefined;
   try{
-    const stat=statSync(file);let cache=caches.get(key);
-    if(cache&&!cache.invalid&&cache.dev===stat.dev&&cache.ino===stat.ino&&cache.size===stat.size&&cache.mtime===stat.mtimeMs)return structuredClone(cache);
-    if(!cache||cache.dev!==stat.dev||cache.ino!==stat.ino||stat.size<cache.size||stat.size===cache.size&&stat.mtimeMs!==cache.mtime)cache={...empty(),file,dev:stat.dev,ino:stat.ino,size:0,mtime:0,invalid:false};
-    let tail='';
-    if(stat.size>cache.offset){
-      stream=createReadStream(file,{encoding:'utf8',start:cache.offset,end:stat.size-1});
-      for await(const chunk of stream){tail+=chunk;let newline:number;
-        while((newline=tail.indexOf('\n'))>=0){
-          const line=tail.slice(0,newline);tail=tail.slice(newline+1);cache.offset+=Buffer.byteLength(line+'\n');
+    const size=Number(stat.size),previous=caches.get(key);
+    if(!Number.isSafeInteger(size))return{...empty(),file};
+    if(previous&&sameVersion(previous.stat,stat))return previous.invalid?{...empty(),file,complete:previous.profile.complete}:previous.profile;
+    const append=previous&&sameFile(previous.stat,stat)&&stat.size>previous.stat.size;
+    const cache=append?structuredClone(previous.profile):{...empty(),file};
+    let invalid=append?previous.invalid:false;
+    let tail=Buffer.alloc(0);
+    if(size>cache.offset){
+      stream=createReadStream(file,{fd,start:cache.offset,end:size-1});
+      for await(const chunk of stream){tail=tail.length?Buffer.concat([tail,chunk]):chunk;let newline:number;
+        while((newline=tail.indexOf(10))>=0){
+          const line=tail.subarray(0,newline).toString('utf8');tail=tail.subarray(newline+1);cache.offset+=newline+1;
           if(!line.trim())continue;
           if(cache.verified&&!/"(?:session_meta|turn_context|thread_settings_applied|task_started|task_complete|turn_complete|turn_aborted|token_count|compacted)"/.test(line)
-            &&!(options.trackWork&&/"(?:exec_command_(?:begin|end)|mcp_tool_call_(?:begin|end)|function_call(?:_output)?|custom_tool_call(?:_output)?|patch_apply_(?:begin|end)|agent_message|agent_reasoning|reasoning|assistant)"/.test(line)))continue;
-          let row:any;try{row=JSON.parse(line);}catch{cache.invalid=true;continue;}
+            &&!(trackWork&&/"(?:exec_command_(?:begin|end)|mcp_tool_call_(?:begin|end)|function_call(?:_output)?|custom_tool_call(?:_output)?|patch_apply_(?:begin|end)|agent_message|agent_reasoning|reasoning|assistant)"/.test(line))){
+            if(!line.trimEnd().endsWith('}'))invalid=true;
+            continue;
+          }
+          let row:any;try{row=JSON.parse(line);}catch{invalid=true;continue;}
                                             
           if(!cache.verified){
-            if(row.type!=='session_meta'||row.payload?.id!==sessionId){cache.invalid=true;continue;}
+            if(row.type!=='session_meta'||row.payload?.id!==sessionId){invalid=true;continue;}
             const m=row.payload;cache.meta={id:m.id,cwd:m.cwd,model_provider:m.model_provider,cli_version:m.cli_version,history_mode:m.history_mode,
-              ...(options.trackWork?{session_id:m.session_id,parent_thread_id:m.parent_thread_id,attached_thread:m.attached_thread,thread_source:m.thread_source,source:m.source}:{})};cache.verified=true;
+              ...(trackWork?{session_id:m.session_id,parent_thread_id:m.parent_thread_id,attached_thread:m.attached_thread,thread_source:m.thread_source,source:m.source}:{})};cache.verified=true;
           }else if(row.type==='session_meta')continue;
           else{
             const at=Date.parse(row.timestamp);
@@ -82,16 +109,16 @@ export async function readSessionProfile(file:unknown,sessionId:string,options:{
             if(row.type==='event_msg'&&['task_started','task_complete','turn_complete','turn_aborted'].includes(row.payload?.type)&&typeof row.payload.turn_id==='string'){
               if(Number.isFinite(at)){
                 cache.turn={id:row.payload.turn_id,state:row.payload.type==='task_started'?'running':row.payload.type==='turn_aborted'?'paused':'ready',at};
-                if(options.trackWork)(cache.rolloutWork??={turnOffset:0,lastWorkOffset:0}).turnOffset=cache.offset;
+                if(trackWork)(cache.rolloutWork??={turnOffset:0,lastWorkOffset:0}).turnOffset=cache.offset;
               }
             }
-            if(options.trackWork&&(row.type==='event_msg'&&/^(?:exec_command|mcp_tool_call|patch_apply)_(?:begin|end)$/.test(row.payload?.type)
+            if(trackWork&&(row.type==='event_msg'&&/^(?:exec_command|mcp_tool_call|patch_apply)_(?:begin|end)$/.test(row.payload?.type)
               ||row.type==='response_item'&&/^(?:function_call|custom_tool_call)(?:_output)?$/.test(row.payload?.type))){
               const work=cache.rolloutWork??={turnOffset:0,lastWorkOffset:0};
               work.lastWorkOffset=cache.offset;
               if(Number.isFinite(at))work.lastWorkAt=at;
             }
-            if(options.trackWork&&Number.isFinite(at)&&(row.type==='event_msg'&&['agent_message','agent_reasoning'].includes(row.payload?.type)
+            if(trackWork&&Number.isFinite(at)&&(row.type==='event_msg'&&['agent_message','agent_reasoning'].includes(row.payload?.type)
               ||row.type==='response_item'&&(row.payload?.type==='reasoning'||row.payload?.type==='message'&&row.payload?.role==='assistant'))){
                                                 
               const work=cache.rolloutWork??={turnOffset:0,lastWorkOffset:0};
@@ -118,12 +145,14 @@ export async function readSessionProfile(file:unknown,sessionId:string,options:{
           }
         }
       }
+      if(!sameFile(stat,statSync(file,{bigint:true})))return{...empty(),file};
     }
-    cache.size=stat.size;cache.mtime=stat.mtimeMs;cache.complete=!tail.trim();
-    caches.delete(key);caches.set(key,cache);while(caches.size>24)caches.delete(caches.keys().next().value!);
-    if(cache.invalid)return{...empty(),file,complete:cache.complete};
-    return structuredClone(cache);
-  }catch{return{...empty(),file};}finally{stream?.destroy();}
+    cache.complete=cache.offset===size;
+    if(cache.complete)delete cache.pendingTail;else cache.pendingTail=true;
+    caches.delete(key);caches.set(key,{profile:cache,stat,invalid});while(caches.size>24)caches.delete(caches.keys().next().value!);
+    if(invalid)return{...empty(),file,complete:cache.complete};
+    return cache;
+  }catch{return{...empty(),file};}finally{if(stream)stream.destroy();else closeSync(fd);}
 }
 
 export function sessionFile(home:string,sessionId:string):string|undefined{
@@ -271,7 +300,8 @@ export function requireExactRestartProfile(profile:SessionProfile):void{
                                       
 export async function verifyRestartProfileCurrent(profile:SessionProfile,options:{exact?:boolean;current?:SessionProfile}={}):Promise<void>{
   const current=options.current??await readSessionProfile(profile.file,profile.sessionId);
-  if(!current.verified||!current.complete||(current.settingsOffset??0)<(profile.settingsOffset??0)
+  if(!current.verified&&current.pendingTail)throw new BridgeError('restart_profile_pending_tail','原会话历史正在写入首条记录，等待下一次核验。');
+  if(!current.verified||(current.settingsOffset??0)<(profile.settingsOffset??0)
     ||(options.exact||(current.settingsOffset??0)>(profile.settingsOffset??0))&&(
       !samePermission(current.settings.permissionProfile,profile.settings.permissionProfile)
       ||knownTier(current)!==knownTier(profile)
@@ -279,6 +309,8 @@ export async function verifyRestartProfileCurrent(profile:SessionProfile,options
       ||(options.exact?['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots','collaborationMode','disabledPluginIds']:
         ['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots']).some(key=>!isDeepStrictEqual(current.settings[key],profile.settings[key]))))
     throw new BridgeError('restart_profile_changed','原会话历史无法核验，或在自动重启快照后写入了不同的设置。已保留消息，等待确认原会话设置。');
+  if(current.pendingTail)throw new BridgeError('restart_profile_pending_tail','原会话历史正在写入下一条记录，等待下一次核验。');
+  if(!current.complete)throw new BridgeError('restart_profile_changed','原会话历史无法完整核验。');
 }
 
                                        

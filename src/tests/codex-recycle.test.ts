@@ -280,14 +280,60 @@ test('原进程过时限仍存活只接受新的明确批准，旧批准与自�
   const f=fixture(),stop=f.ports.stop;
   f.ports.stop=async(_old,_deadline,_guard,mark)=>{mark();throw new Error('停止结果未知');};
   await f.run();f.tick(15000);await f.run();
+  for(let i=0;i<6;i++){
+    f.work({roles:[i%2?'transient-a':'transient-b'],progress:'unknown'});
+    await f.run();
+    const flapping=f.want('held');assert.ok(flapping.phase==='held'&&flapping.retryPending);
+  }
+  f.work({roles:[],progress:'idle'});await f.run();await f.run();
   const failed=f.want('held');assert.ok(failed.phase==='held'&&failed.basis);
+  assert.equal(failed.retryPending,undefined);
   const approval={incidentId:f.incident().id,evidenceRevision:failed.basis.decision.revision,reason:'确认再次停止。',by:'user' as const};
   f.ports.stop=async()=>assert.fail('缺少新决定不得停止');
+  f.work({roles:['changed'],progress:'unknown'});await f.run();
+  assert.equal((await f.sample('native_thread_wedged',approval)).kind,'stale');
+  const changed=f.want('held');assert.ok(changed.phase==='held'&&changed.basis);
+  assert.notEqual(changed.basis.decision.revision,approval.evidenceRevision);
+  f.work({roles:[],progress:'idle'});await f.run();await f.run();
+  const current=f.want('held');assert.ok(current.phase==='held'&&current.basis);
   await f.run();await f.run('native_thread_wedged',{...approval,evidenceRevision:'旧版本'});
   assert.equal(f.lastRecycle(),1000);
-  f.ports.stop=stop;await f.run('native_thread_wedged',approval);f.want('ready');
+  f.ports.stop=stop;await f.run('native_thread_wedged',{...approval,evidenceRevision:current.basis.decision.revision});f.want('ready');
   assert.equal(f.lastRecycle(),16000);
   assert.deepEqual(f.seen.effects,['profile','profile','stop','retire','launch','resume']);
+});
+
+for(const [readNumber,phase] of [[2,'preflight'],[3,'stop_requested']] as const)
+test(`停止失败后在 ${phase} 重启，取证超限仍只允许按新版本明确重试`,async()=>{
+  const f=fixture(),observe=f.ports.observe,trigger='native_thread_wedged';
+  f.ports.stop=async(_old,_deadline,_guard,mark)=>{mark();throw Error('停止结果未知');};
+  await f.sample(trigger);f.tick(15000);await f.sample(trigger);await f.sample(trigger);await f.sample(trigger);
+  const deadline=f.want('held');assert.ok(deadline.phase==='held'&&deadline.basis&&!deadline.retryPending);
+  const approval={incidentId:f.incident().id,evidenceRevision:deadline.basis.decision.revision,reason:'确认再次停止。'};
+  let entered!:()=>void,resume!:()=>void;
+  const entering=new Promise<void>(resolve=>{entered=resolve;}),resuming=new Promise<void>(resolve=>{resume=resolve;});
+  let reads=0;
+  f.ports.observe=async cause=>{
+    if(++reads===readNumber){entered();await resuming;}
+    return observe(cause);
+  };
+  const interrupted=f.sample(trigger,approval);
+  try{
+    await entering;f.want(phase);f.restore();
+    f.ports.observe=async()=>({kind:'held',code:'timeout',reason:'原生取证超时'});
+    f.ports.stop=async()=>assert.fail('失效确认不能再次发出停止信号');
+    for(let i=0;i<6;i++){await f.sample(trigger);f.tick(5000);}
+    const expired=f.want('held');
+    assert.ok(expired.phase==='held'&&expired.code==='codex_recycle_stop_deadline'&&expired.retryPending);
+    assert.equal(expired.observationGap?.lapsedRevision,approval.evidenceRevision);
+    assert.equal(codexRecycleFenced(f.current()),false);
+    f.ports.observe=observe;f.ports.deliveredTurnCompletedSince=()=>true;
+    await f.sample(trigger);await f.sample(trigger);await f.sample(trigger,approval);
+    const renewed=f.want('held');
+    assert.ok(renewed.phase==='held'&&renewed.basis&&!renewed.retryPending);
+    assert.notEqual(renewed.basis.decision.revision,approval.evidenceRevision);
+    assert.equal(f.lastRecycle(),1000);
+  }finally{resume();await interrupted;}
 });
 
 test('停止额度使用可能提交信号时刻，意图写入后的先行完成不会返还额度',async()=>{
@@ -296,6 +342,29 @@ test('停止额度使用可能提交信号时刻，意图写入后的先行完�
   await f.run();f.want('ready');assert.equal(f.lastRecycle(),1200);
   f.nextIncident(false);f.ports.deliveredTurnCompletedSince=at=>1100>at;
   await f.run();f.want('awaiting_partner');assert.equal(f.seen.effects.filter(effect=>effect==='stop').length,1);
+});
+
+for(const factsChange of [false,true])test('暂存批准只在同一份证据稳定时生效：'+factsChange,async()=>{
+  const f=fixture(),observe=f.ports.observe,trigger='native_thread_wedged';
+  f.work({activeTurnIds:['original-turn'],progress:'stalled'});
+  await f.run();f.want('awaiting_partner');const approval=accept(f);
+  f.ports.observe=async()=>{throw new BridgeError('restart_profile_pending_tail','等待下一条完整记录');};
+  await f.sample(trigger,approval);
+  const queued=f.want('awaiting_partner');
+  assert.ok(queued.phase==='awaiting_partner'&&queued.basis.acceptance?.evidenceRevision===approval.evidenceRevision);
+  f.restore();f.ports.observe=observe;
+  f.work({roles:['temporary']});await f.sample(trigger);
+  f.work({roles:[]});await f.sample(trigger);
+  assert.equal(f.seen.effects.includes('stop'),false);
+  if(factsChange){
+    f.work({activeTurnIds:['different-turn']});await f.sample(trigger);await f.sample(trigger);
+    f.want('awaiting_partner');assert.equal(f.seen.notices.length,2);
+    assert.notEqual(f.seen.notices[1],approval.evidenceRevision);assert.equal(f.seen.effects.includes('stop'),false);
+    await f.sample(trigger,approval);assert.equal(f.seen.effects.includes('stop'),false);
+  }else{
+    await f.sample(trigger);f.want('ready');
+    assert.equal(f.seen.effects.filter(effect=>effect==='stop').length,1);assert.deepEqual(f.seen.notices,[approval.evidenceRevision]);
+  }
 });
 
 test('替代进程已确定退出时保留账本交给普通托管启动',async()=>{

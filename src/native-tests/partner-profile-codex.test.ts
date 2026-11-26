@@ -8,6 +8,7 @@ import path from 'node:path';
 import { readModelBody } from './model-http-fixture.js';
 import { stringify } from 'smol-toml';
 import { CodexAdapter } from '../hosts/codex/adapter.js';
+import { readCodexThread } from '../hosts/codex/codex-evidence.js';
 import { Broker, type Adapters } from '../broker/coordinator.js';
 import { Store } from '../storage/store.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
@@ -85,6 +86,7 @@ test('真实自有 Codex：默认与显式选择、原会话双字段切换、�
       const request=bodies.slice(before).find(body=>JSON.stringify(body.input).includes(marker));assert.ok(request,'原生轮次没有到达本地模型');
       assert.equal(request.model,expected.model);assert.equal(request.reasoning?.effort,expected.effort);
       if(expected.serviceTier!==undefined)assert.equal(request.service_tier,expected.serviceTier==='standard'?undefined:expected.serviceTier);
+      return started.turn.id as string;
     }finally{rpc.off('notification',onNotification);}
   };
   const primary=await create('default'),first=await native(primary.peerId);
@@ -94,7 +96,7 @@ test('真实自有 Codex：默认与显式选择、原会话双字段切换、�
   const baseline=invariants(first.value),capture=frozenProfiles(home,config).codex!;
   assert.equal(capture.model,defaults.model);assert.equal(capture.effort,defaults.effort);
   assert.equal(readFileSync(nativeFile,'utf8'),initialNative);
-  await run(primary.peerId,'PROFILE_DEFAULT_TURN',{...defaults,serviceTier:'flex'});
+  const firstTurn=await run(primary.peerId,'PROFILE_DEFAULT_TURN',{...defaults,serviceTier:'flex'});
   const originalPermission=normalizedPermission((await readSessionProfile(first.value.thread.path,primary.sessionId)).settings.permissionProfile);
   assert.ok(originalPermission,'原生权限需要有持久基线');
   const changed=await broker!.dispatch('partner.profile',{actor:primary.actor,action:'set',...selected}) as any;
@@ -102,19 +104,25 @@ test('真实自有 Codex：默认与显式选择、原会话双字段切换、�
   const hot=await native(primary.peerId);assert.equal(hot.value.model,selected.model);assert.equal(hot.value.reasoningEffort,selected.effort);
   assert.equal(hot.value.serviceTier,'default');
   assert.deepEqual(invariants(hot.value),baseline,'切换模型不得更换会话、提供方、目录或权限');
-  await run(primary.peerId,'PROFILE_CHANGED_TURN',selected);
+  const editedTurn=await run(primary.peerId,'PROFILE_CHANGED_TURN',selected);
   assert.deepEqual(frozenProfiles(home,config).codex,capture,'成员选择不能改写首次冻结的宿主默认值');
   const oldRuntime=runtimeFor(home,{peerId:primary.peerId})!.value;
   const driftedNative=nativeConfig({model:'gpt-6-sol',effort:'high'});writeFileSync(nativeFile,driftedNative,'utf8');
                                            
   await broker!.stop();broker=undefined;adapter=undefined;store!.close();store=undefined;
   config={...config,partnerProfiles:{codex:{source:'frozen'}}};open();
+                                               
+  await broker!.start();
+  await wait(()=>{const endpoint=store!.endpoint(primary.peerId);return !!endpoint&&adapter!.hasSubscription(store!.peer(primary.peerId),endpoint);},'协调器启动后未重建原后台订阅');
+  assert.equal(store!.endpoint(primary.peerId)?.runtimeId,oldRuntime.id);
   const persisted=await broker!.dispatch('partner.profile',{host:'codex',peer_id:primary.peerId,action:'get'}) as any;
   assert.deepEqual(persisted.requested,selected);assert.equal(persisted.status,'applied');
   const beforeRestart=bodies.length,restarted=await broker!.dispatch('codex.restart',{peer_id:primary.peerId}) as any;
   assert.equal(restarted.restarted,true);assert.equal(restarted.session_id,primary.sessionId);assert.notEqual(restarted.pid,oldRuntime.pid);
   assert.equal(bodies.length,beforeRestart,'重启恢复不得调用模型');
   const recovered=await native(primary.peerId);assert.deepEqual(invariants(recovered.value),baseline);
+  const history=await readCodexThread(recovered.rpc,primary.sessionId,{turnId:firstTurn});
+  for(const id of [firstTurn,editedTurn])assert.equal(history.turns?.find(turn=>turn.id===id)?.status,'completed');
   assert.equal(recovered.value.model,selected.model);assert.equal(recovered.value.reasoningEffort,selected.effort);
   assert.equal(recovered.value.serviceTier,'default');
   const restored=await readSessionProfile(recovered.value.thread.path,primary.sessionId);

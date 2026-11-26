@@ -6,10 +6,11 @@ type Result={status:string;expires_at?:string};
 const transient=new Set(['handoff_retry','starting','stopping','ENOENT','ECONNREFUSED','ECONNRESET','EPIPE','disconnected','broker_timeout','timeout']);
 
                              
-export async function waitForQuestion<T extends Result>(poll:(deadline?:number)=>Promise<T>):Promise<T>{
+export async function waitForQuestion<T extends Result>(poll:(connectionDeadline?:number)=>Promise<T>):Promise<T>{
   let expiresAt=Infinity,retryUntil:number|undefined;
   for(;;){
     try{
+                                                 
       const value=await poll(retryUntil);
       if(value.status!=='pending'&&value.status!=='awaiting_user')return value;
       if(value.expires_at){
@@ -28,5 +29,5 @@ export async function waitForQuestion<T extends Result>(poll:(deadline?:number)=
 }
 
 export function waitForPartnerQuestion<T extends Result>(params:object,home?:string):Promise<T>{
-  return waitForQuestion(deadline=>brokerCall<T>('question.wait',{...params,handoff:1},{home,start:false,deadline}));
+  return waitForQuestion(connectionDeadline=>brokerCall<T>('question.wait',{...params,handoff:1},{home,start:false,connectionDeadline}));
 }

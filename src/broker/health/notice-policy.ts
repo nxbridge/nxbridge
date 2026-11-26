@@ -41,7 +41,7 @@ export class HealthNoticePolicy {
     if(!retry&&notice.factKey!==undefined&&last?.factKey===notice.factKey)return false;
                                           
     if(notice.kind==='explicit_recovery'||notice.source==='managed_recovery'&&notice.factKey
-      &&/^codex_recycle_(?:decision|result|held):/.test(notice.kind??''))return true;
+      &&/^codex_recycle_(?:decision|result|held|acceptance_lapsed):/.test(notice.kind??''))return true;
     if(state&&now-state.lastAt<HEALTH_NOTICE_INTERVAL_MS)return false;
     if(retry)return true;
                                    

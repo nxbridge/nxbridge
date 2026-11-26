@@ -112,8 +112,91 @@ test('调低上限或设为零立即阻止新干预，调高仍不能给当前�
 });
 
 test('来自其他版本的额度记录保持原样，功能不可用但不使停止或状态查询抛错',()=>{
-  const f=setup();f.storage.setSetting('completionWakeBudget:'+peer,{version:2,used:7});
+  const f=setup();f.storage.setSetting('completionWakeBudget:'+peer,{version:3,used:7});
   assert.equal(f.budget.status(peer).available,false);assert.equal(f.budget.admit(peer,'unknown',scope),undefined);
   assert.equal(f.budget.human(peer,{id:'new-human',at:Date.now()}),false);
-  assert.deepEqual(f.storage.setting('completionWakeBudget:'+peer),{version:2,used:7});
+  assert.deepEqual(f.storage.setting('completionWakeBudget:'+peer),{version:3,used:7});
+});
+
+test('旧版六种预约只在写入时转换，保留原额度、批次和绑定事实',()=>{
+  const f=setup(),budget=new CompletionWakeBudget(f.storage,8),key='completionWakeBudget:'+peer;
+  const legacy={version:1,epoch:'saved-epoch',limit:8,used:4,human:{id:'saved-epoch',at:10},reservations:[
+    {id:'reserved',scope,at:20},
+    {id:'retryable',scope,at:21,retryable:true},
+    {id:'started',scope,at:22,turnId:'started-turn'},
+    {id:'completed',scope,at:23,turnId:'completed-turn',settled:true},
+    {id:'refunded',scope,at:24,turnId:'refunded-turn',settled:true,refunded:true},
+    {id:'released',scope,at:25,retryable:true,settled:true,refunded:true,released:true},
+  ]};
+  f.storage.setSetting(key,legacy);
+  assert.deepEqual(budget.status(peer),{used:4,limit:8,remaining:4,awaitingProof:3});
+  assert.equal(budget.humanInputAt(peer),10);assert.equal(budget.reservedAllowed(peer,'completed',scope),false);
+  assert.deepEqual(f.storage.setting(key),legacy,'只读操作不抢先改写旧版记录');
+  assert.deepEqual(budget.admit(peer,'new',scope),{epoch:'saved-epoch'});
+  const saved=f.storage.setting<{version:number;epoch:string;limit:number;used:number;human:object;reservations:Record<string,unknown>[]}>(key)!;
+  assert.equal(saved.version,2);assert.equal(saved.epoch,legacy.epoch);assert.equal(saved.limit,8);assert.equal(saved.used,5);
+  assert.deepEqual(saved.human,legacy.human);
+  assert.deepEqual(saved.reservations.map(entry=>entry.state),['reserved','retryable','started','completed','refunded','released','reserved']);
+  for(const entry of saved.reservations)for(const flag of ['retryable','settled','refunded','released'])assert.equal(Object.hasOwn(entry,flag),false);
+  assert.equal(budget.completed(peer,'started',scope,'other-turn',true),false);
+  assert.ok(budget.completed(peer,'started',scope,'started-turn',true));assert.equal(budget.status(peer).used,4);
+  assert.equal(budget.admit(peer,'refunded',scope),undefined);assert.equal(budget.admit(peer,'completed',scope),undefined);
+  assert.equal(budget.admit(peer,'released','other-scope'),undefined);assert.ok(budget.admit(peer,'released',scope));
+  assert.equal(budget.status(peer).used,5);
+});
+
+test('有界预约轨迹在每个动作之间重建后仍精确扣额、返还和拒绝重放',t=>{
+  let now=1000;t.mock.method(Date,'now',()=>now);
+  type Step={run:(budget:CompletionWakeBudget)=>boolean;result:boolean;used:number;waiting:number};
+  const admit=(id='one')=>(budget:CompletionWakeBudget)=>!!budget.admit(peer,id,scope);
+  const traces:Step[][]=[
+    [
+      {run:admit(),result:true,used:1,waiting:1},
+      {run:admit(),result:false,used:1,waiting:1},
+      {run:b=>b.started(peer,'one','other-scope','turn'),result:false,used:1,waiting:1},
+      {run:b=>b.started(peer,'one',scope,'turn'),result:true,used:1,waiting:1},
+      {run:b=>b.completed(peer,'one',scope,'wrong-turn',true),result:false,used:1,waiting:1},
+      {run:b=>b.completed(peer,'one',scope,'turn',true),result:true,used:0,waiting:0},
+      {run:b=>b.completed(peer,'one',scope,'turn',true),result:false,used:0,waiting:0},
+      {run:admit(),result:false,used:0,waiting:0},
+    ],
+    [
+      {run:admit(),result:true,used:1,waiting:1},
+      {run:b=>b.beforeSubmitFailed(peer,'one',scope),result:true,used:1,waiting:1},
+      {run:b=>b.releaseUnsubmitted(peer,'one'),result:true,used:0,waiting:0},
+      {run:b=>!!b.admit(peer,'one','other-scope'),result:false,used:0,waiting:0},
+      {run:admit(),result:true,used:1,waiting:1},
+      {run:b=>b.started(peer,'one',scope,'turn'),result:true,used:1,waiting:1},
+      {run:b=>b.beforeSubmitFailed(peer,'one',scope,'different-turn'),result:false,used:1,waiting:1},
+      {run:b=>b.beforeSubmitFailed(peer,'one',scope,'turn'),result:true,used:1,waiting:1},
+      {run:admit(),result:true,used:1,waiting:1},
+      {run:b=>b.started(peer,'one',scope,'retried-turn'),result:true,used:1,waiting:1},
+      {run:b=>b.completed(peer,'one',scope,'retried-turn',false),result:false,used:1,waiting:0},
+      {run:b=>b.completed(peer,'one',scope,'retried-turn',true),result:false,used:1,waiting:0},
+      {run:admit(),result:false,used:1,waiting:0},
+    ],
+    [
+      {run:admit(),result:true,used:1,waiting:1},
+      {run:b=>b.started(peer,'one',scope,'old-turn'),result:true,used:1,waiting:1},
+      {run:b=>b.human(peer,{id:'fresh-human',at:Date.now()}),result:true,used:0,waiting:0},
+      {run:b=>b.completed(peer,'one',scope,'old-turn',true),result:false,used:0,waiting:0},
+      {run:b=>b.human(peer,{id:'fresh-human',at:Date.now()}),result:false,used:0,waiting:0},
+      {run:admit('next'),result:true,used:1,waiting:1},
+      {run:b=>b.human(peer,{id:'late-human',at:Date.now()-15}),result:true,used:1,waiting:1},
+      {run:b=>b.started(peer,'next',scope,'new-turn'),result:true,used:1,waiting:1},
+      {run:b=>b.completed(peer,'next',scope,'new-turn',true),result:true,used:0,waiting:0},
+    ],
+  ];
+  for(const [traceIndex,steps] of traces.entries())for(let cut=0;cut<=steps.length;cut++){
+    now=1000;const f=setup();let budget=f.budget;
+    for(const [index,step] of steps.entries()){
+      if(index===cut)budget=new CompletionWakeBudget(f.storage);
+      const label=`轨迹 ${traceIndex}，重建点 ${cut}，动作 ${index}`;
+      assert.equal(step.run(budget),step.result,label);
+      const state=budget.status(peer);
+      assert.equal(state.used,step.used,label);assert.equal(state.awaitingProof,step.waiting,label);
+      assert.equal(state.remaining,COMPLETION_WAKE_LIMIT-step.used,label);now+=10;
+    }
+    assert.deepEqual(new CompletionWakeBudget(f.storage).status(peer),budget.status(peer));
+  }
 });

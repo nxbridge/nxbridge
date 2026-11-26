@@ -2,6 +2,8 @@ import type { RpcClient } from '../../ipc/rpc.js';
 import { RuntimeRecoveryHold } from '../../shared/errors.js';
 import type { Endpoint, Peer } from '../../types.js';
 import { managedRuntimeNativeState, runtimeFor } from '../managed-runtimes.js';
+import { profileState } from '../launch-profiles.js';
+import { sameDirectory } from '../../shared/files.js';
 import { probeProcesses } from '../../process/process.js';
 
 export interface OwnedCodexRoute {
@@ -15,14 +17,20 @@ export interface OwnedCodexLaunchProof {
                                         
 export async function exitedOwnedCodexRoute(home:string,{peer,endpoint}:OwnedCodexRoute,launch?:OwnedCodexLaunchProof):Promise<boolean>{
   const native=endpoint.native??endpoint;
-  if(peer.owner!=='nxbridge'||endpoint.daemon||!endpoint.runtimeId||!native.pid||!native.procStart)return false;
+  if(peer.host!=='codex'||peer.owner!=='nxbridge'||endpoint.peerId!==peer.id||endpoint.mode!=='app-server'||endpoint.daemon||!endpoint.runtimeId||!native.pid||!native.procStart)return false;
   const runtime=runtimeFor(home,{id:endpoint.runtimeId})?.value;
   if(runtime)return runtime.kind==='owned'&&runtime.endpoint===endpoint.address&&runtime.peerId===peer.id
     &&(!runtime.sessionId||runtime.sessionId===peer.sessionId)&&runtime.pid===native.pid&&runtime.procStart===native.procStart
     &&await managedRuntimeNativeState(home,runtime)==='dead';
-                                              
-  if(!launch||launch.sessionId!==peer.sessionId||launch.runtimeId!==endpoint.runtimeId
-    ||launch.endpoint&&launch.endpoint!==endpoint.address||launch.pid&&launch.pid!==native.pid||launch.procStart&&launch.procStart!==native.procStart)return false;
+  if(launch?.runtimeId){
+    if(launch.sessionId!==peer.sessionId||launch.runtimeId!==endpoint.runtimeId||launch.endpoint&&launch.endpoint!==endpoint.address
+      ||launch.pid&&launch.pid!==native.pid||launch.procStart&&launch.procStart!==native.procStart)return false;
+  }else{
+                                                       
+    const configHome=endpoint.configHome;
+    if(endpoint.active||!configHome||!profileState(home).observations?.some(value=>value.host==='codex'&&value.kind==='managed'&&value.owned===true
+      &&value.sourceSession===peer.sessionId&&value.sourcePid===native.pid&&value.sourceGeneration===native.procStart&&sameDirectory(value.configHome,configHome)))return false;
+  }
   return (await probeProcesses([{pid:native.pid,procStart:native.procStart}]))[0]==='dead';
 }
 

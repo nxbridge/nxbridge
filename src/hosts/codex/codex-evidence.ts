@@ -22,7 +22,8 @@ export async function catalogCodexThreads(rpc:RpcClient,ids:ReadonlySet<string>,
   const cursors=new Set<string>();
   for(let pageIndex=0;pageIndex<10;pageIndex++){
     const timeout=Math.ceil(deadline-performance.now());if(timeout<=0)break;
-    const page=await rpc.request('thread/list',{limit:100,modelProviders:[],sourceKinds:['cli','vscode','exec','appServer','subAgent','subAgentReview','subAgentCompact','subAgentThreadSpawn','subAgentOther','unknown'],...(cursor?{cursor}:{})},{timeout});
+                                                     
+    const page=await rpc.request('thread/list',{limit:100,modelProviders:[],sourceKinds:['cli','vscode','exec','appServer','subAgent','subAgentReview','subAgentCompact','subAgentThreadSpawn','subAgentOther','unknown'],...(options.independent?{useStateDbOnly:true}:{}),...(cursor?{cursor}:{})},{timeout});
     if(!Array.isArray(page.data))break;
     for(const thread of page.data)if(typeof thread?.id==='string'&&ids.has(thread.id)&&typeof thread.cwd==='string')threads.set(thread.id,thread);
     if(page.nextCursor==null){options.onComplete?.();break;}

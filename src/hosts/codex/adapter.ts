@@ -23,7 +23,7 @@ import {codexSocketTargetMissing,currentCodexSocketAlias,proveUnixCodexSocket,ty
 import {spawnCli} from '../../process/host-command.js';
 import {processIdentity,type ProcessIdentity} from '../../process/process.js';
 import { assertCodexRuntimeScope, codexThreadLoaded, forgetAbsentChildControls, loadedCodexThreads, restartCodexRuntime, type CodexChildWorkMethod, type CodexChildWorkPage, type CodexRestartResult } from './codex-restart.js';
-import {prepareOwnedLaunch,recordHostLaunch,spawnSelectedHost,type HostLaunch} from '../host-launch.js';
+import {prepareOwnedLaunch,recordHostLaunch,selectHostLaunch,spawnSelectedHost,type HostLaunch,type HostLaunchOptions} from '../host-launch.js';
 import { nativeDescendant } from '../../process/process.js';
 import { providerRetryInfo } from '../../broker/health/turn-health.js';
 import {probeAppServer,probePeerRuntime} from '../../broker/health/probe.js';
@@ -33,7 +33,7 @@ import {ownedProcessState,type OwnedIdentity} from '../../process/process-stop.j
 import { managedMarker } from '../../install/installation.js';
 import { managedRuntimes, runtimeFor, saveManagedRuntime, writeExistingRuntime, removeManagedRuntime, managedRuntimeState, managedRuntimeNativeState, managedRuntimeToken,createRuntimeToken,localCodexEndpoint,assertManagedRuntimeEndpoint,type ManagedRuntime, type RuntimeRecord } from '../managed-runtimes.js';
 import { launchIndependentWindows } from '../../process/windows/windows-background.js';
-import { requireDedicatedCodex, verifyCodexNativeGeneration, verifyDedicatedCodex, verifyDedicatedCodexArguments, requireRestoreBootstrap, CODEX_RESTORE_BOOTSTRAP } from './codex-isolation.js';
+import { requireDedicatedCodex, verifyCodexNativeGeneration, verifyDedicatedCodex, verifyDedicatedCodexArguments, requireRestoreBootstrap, restoreBootstrapKey, CODEX_RESTORE_BOOTSTRAP } from './codex-isolation.js';
 import {hookTrustFromList} from './codex-hook-trust.js';
 import {configClient} from './stdio-codex.js';
 import {persistentSocketDirectory} from '../../process/posix/persistent-socket-directory.js';
@@ -42,7 +42,7 @@ import { selectSessionLaunch } from '../session-launch.js';
 import { recordManagedSessionLaunch } from '../launch-profiles.js';
 import { restoreState } from '../../broker/pairing/pair-restore.js';
 import { backgroundState, requireBackgroundRetry } from '../background-state.js';
-import { readCodexHistory, type HistoryCursor, type HistoryEvidence } from './codex-history.js';
+import { catchUpCodexHistory, readCodexHistory, type HistoryCursor, type HistoryEvidence } from './codex-history.js';
 import { catalogCodexThreads, observeCodexThreadIdentity, readCodexThread, readCodexItems } from './codex-evidence.js';
 import { classifyCodexPermission, codexRuntimeEvidence } from './codex-permission.js';
 import { startOwnedCodex, unloadFailedOwnedCodex } from '../owned-launch-policy.js';
@@ -466,6 +466,7 @@ export class CodexAdapter extends EventEmitter {
       });
       rpc.on('disconnected',()=>{
         this.ownedRoutes.revoke(endpoint,undefined,rpc);
+        for(const [id,ack] of this.recycleAcks)if(ack.rpc===rpc)this.recycleAcks.delete(id);
         if(this.clients.get(endpoint)!==rpc)return;
         this.clients.delete(endpoint);
         for(const key of this.nativeStates.keys())if(key.startsWith(endpoint+'|'))this.nativeStates.delete(key);
@@ -653,6 +654,14 @@ export class CodexAdapter extends EventEmitter {
       if(!codexUserWindow(peer)||codexSubagent(result.thread)||result.thread.status?.type!=='active'||native&&native.revision>revision&&!['busy','needsHuman'].includes(native.state))return;
       await this.attachThread(peer,endpoint);
     });
+  }
+  async restoreRegisteredRoute(peer:Peer,endpoint:Endpoint,attachOptions:()=>{verify:boolean;prepare:()=>void}):Promise<void>{
+    if(codexUserWindow(peer))await this.observe(peer,endpoint);
+    else await this.attach(peer,endpoint,attachOptions());
+  }
+  bootstrapProbeKey(peer:Peer,configHome:string|undefined,proof?:Pick<HostLaunchOptions,'executable'|'profileId'>):string{
+    return restoreBootstrapKey(selectHostLaunch('codex',this.config,{home:this.home,sessionId:peer.sessionId!,cwd:peer.cwd,configHome,
+      ...(proof?.executable?{executable:proof.executable,profileId:proof.profileId}:{})}));
   }
   async attach(peer:Peer,endpoint:Endpoint,options:{verify?:boolean;prepare?:()=>void}={}):Promise<RpcClient>{
     return this.threadOperation(peer,endpoint,()=>this.attachThread(peer,endpoint,options));
@@ -1161,8 +1170,16 @@ export class CodexAdapter extends EventEmitter {
   }
   inspectRecycleOld(old:CodexRecycleGeneration){return inspectCodexRecycleOld(this.home,old);}
 
+  finalizeRecycle(peerId:string,sessionId:string,fresh:CodexRecycleGeneration,sourceId:string):void{
+    const runtime=runtimeFor(this.home,{id:fresh.runtimeId,endpoint:fresh.endpoint})?.value;
+    if(runtime?.kind!=='owned'||runtime.peerId!==peerId||runtime.sessionId!==sessionId||runtime.pid!==fresh.pid||runtime.procStart!==fresh.procStart||runtime.bootId!==fresh.bootId
+      ||runtime.sessionVerification?.sessionId!==sessionId||runtime.sessionVerification.restartSourceId!==sourceId)return;
+    completeRestartProfile(this.home,runtime);delete runtime.sessionVerification;
+    if(runtime.state==='starting')runtime.state='ready';
+    saveManagedRuntime(this.home,runtime);
+  }
                                                    
-  recycleHost(peer:Peer,endpoint:Endpoint,requesterSession?:string):RecycleHostPorts&{admission:(fresh:CodexRecycleGeneration)=>RecycleAdmission;prepareUnsubscribed:(fresh:CodexRecycleGeneration,source:CodexRecycleProfileRef)=>Promise<RegisterInput>;subscribe:(route:OwnedCodexRoute,receipt:RecycleAdmission)=>void;finalize:(fresh:CodexRecycleGeneration)=>void}{
+  recycleHost(peer:Peer,endpoint:Endpoint,requesterSession?:string):RecycleHostPorts&{admission:(fresh:CodexRecycleGeneration)=>RecycleAdmission;prepareUnsubscribed:(fresh:CodexRecycleGeneration,source:CodexRecycleProfileRef)=>Promise<RegisterInput>;subscribe:(route:OwnedCodexRoute,receipt:RecycleAdmission)=>void}{
     const id=peer.sessionId!,home=this.home;
     let observed:RecycleObservation|undefined,prepared:PreparedRuntimeLaunch|undefined,planned:string|undefined,receipt:RecycleAdmission|undefined;
     const exactLaunch=async(source:NonNullable<CodexRecycleProfileRef['launch']>)=>{
@@ -1267,7 +1284,7 @@ export class CodexAdapter extends EventEmitter {
           const {policy}=await verifyCodexResumeAck(profile,ack,{cwd:peer.cwd,guard:options.guard,requireFreshSettings:true});
           const input=threadRegistration(ack.thread,fresh.endpoint,ack);
           if(!input)throw new BridgeError('session_changed','未核验替代后台中的原根会话。');
-          const history=options.uncertainSince===undefined?undefined:await readCodexHistory(profile.file,id,{since:options.uncertainSince});
+          const history=options.uncertainSince===undefined?undefined:await catchUpCodexHistory(profile.file,id,options.uncertainSince);
           options.guard();getNew(fresh);
           input.endpoint={...input.endpoint,configHome:runtime.configHome,runtimeId:runtime.id,pid:fresh.pid,procStart:fresh.procStart};
           receipt={input,rpc,runtime,policy,receipts:history?.receipts??[]};verified=true;
@@ -1297,12 +1314,6 @@ export class CodexAdapter extends EventEmitter {
         this.ownedRoutes.subscribed(route,admitted.rpc);
         this.recycleAcks.delete(admitted.runtime.id);
         const key=route.endpoint.address+'|'+id;this.attached.add(key);this.invalidated.delete(key);
-      },
-      finalize:fresh=>{
-        const runtime=getNew(fresh);
-        if(!runtime.sessionVerification)return;
-        completeRestartProfile(home,runtime);delete runtime.sessionVerification;
-        runtime.state='ready';saveManagedRuntime(home,runtime);
       },
     };
   }
@@ -1582,8 +1593,8 @@ export class CodexAdapter extends EventEmitter {
     }
     finally{rpc.close();}
   }
-  async release(peer:Peer,endpoint:Endpoint):Promise<void>{
-    return this.threadOperation(peer,endpoint,()=>this.releaseThread(peer,endpoint));
+  async release(peer:Peer,endpoint:Endpoint,guard?:()=>void):Promise<void>{
+    return this.threadOperation(peer,endpoint,()=>this.releaseThread(peer,endpoint,guard));
   }
   hasSubscription(peer:Peer,endpoint:Endpoint):boolean{const rpc=this.clients.get(endpoint.address);return !!rpc&&!rpc.closed&&(peer.owner==='nxbridge'?this.ownedRoutes.permits({peer,endpoint},rpc):this.attached.has(endpoint.address+'|'+peer.sessionId));}
   userSubscriptions():{peer:Peer;endpoint:Endpoint}[]{return[...this.subscriptionOwners].filter(([key,value])=>this.attached.has(key)&&codexUserWindow(value.peer)).map(([,value])=>value);}
@@ -1606,14 +1617,16 @@ export class CodexAdapter extends EventEmitter {
       await rpc.request('thread/unsubscribe',{threadId:peer.sessionId});this.attached.delete(key);this.subscriptionOwners.delete(key);return'released';
     });
   }
-  private async releaseThread(peer:Peer,endpoint:Endpoint):Promise<void>{
+  private async releaseThread(peer:Peer,endpoint:Endpoint,guard?:()=>void):Promise<void>{
                                                         
     const native=endpoint.native??endpoint;
     if(native.pid&&native.procStart&&await ownedProcessState({pid:native.pid,startedAt:native.procStart})==='dead'){
+      guard?.();
       this.ownedRoutes.revoke(endpoint.address,peer.sessionId??undefined);
       this.attached.delete(endpoint.address+'|'+peer.sessionId);this.subscriptionOwners.delete(endpoint.address+'|'+peer.sessionId);return;
     }
     const rpc=await this.connect(endpoint.address);
+    guard?.();
     try{
       if(peer.owner==='nxbridge'){
         const runtime=runtimeFor(this.home,{endpoint:endpoint.address})?.value;
@@ -1630,17 +1643,20 @@ export class CodexAdapter extends EventEmitter {
     this.attached.delete(endpoint.address+'|'+peer.sessionId);
     this.subscriptionOwners.delete(endpoint.address+'|'+peer.sessionId);
   }
-  async releaseRuntime(protectedEndpoints:Endpoint[]=[],address?:string,retired:Peer[]=[]):Promise<string|undefined>{
+  async releaseRuntime(protectedEndpoints:Endpoint[]=[],address?:string,retired:Peer[]=[],options:{guard?:()=>void;runtimeId?:string}={}):Promise<string|undefined>{
     const notes:string[]=[];
-    for(const record of managedRuntimes(this.home).filter(r=>!address||r.value.endpoint===address)){const note=await this.releaseOneRuntime(record,protectedEndpoints,retired);if(note)notes.push(note);}
+    const records=managedRuntimes(this.home).filter(r=>(!address||r.value.endpoint===address)&&(!options.runtimeId||r.value.id===options.runtimeId));
+    for(const record of records){const note=await this.releaseOneRuntime(record,protectedEndpoints,retired,options.guard);if(note)notes.push(note);}
     return notes.length?notes.join('；'):undefined;
   }
-  private async releaseOneRuntime(record:RuntimeRecord,protectedEndpoints:Endpoint[],retired:Peer[]):Promise<string|undefined>{
+  private async releaseOneRuntime(record:RuntimeRecord,protectedEndpoints:Endpoint[],retired:Peer[],guard?:()=>void):Promise<string|undefined>{
     const saved=record.value;
     if(protectedEndpoints.some(endpoint=>endpoint.active&&endpoint.address===saved.endpoint))return'托管 App Server 仍被用户窗口引用，保留运行时及归属记录。';
-    const owned=ownedProcesses(this.home).records.filter(value=>value.proof.launchId===saved.id||value.proof.launchId===saved.endpoint||value.role==='codex-runtime'&&value.identity.pid===saved.pid);
+    const owned=ownedProcesses(this.home).records.filter(value=>value.proof.launchId===saved.id||
+      saved.kind==='legacy'&&value.proof.launchId===saved.endpoint||
+      value.role==='codex-runtime'&&value.identity.pid===saved.pid&&value.identity.startedAt===saved.procStart);
     if(owned.some(value=>value.releasedToUser))return'托管 App Server 已交给用户窗口，保留运行时及归属记录。';
-    if(await managedRuntimeState(this.home,saved)==='dead'){await removeOwnedSocket(this.home,saved.endpoint);for(const value of owned)if(await ownedRecordState(value)==='dead')await retireDeadOwnedProcess(value);removeManagedRuntime(record);this.emit('runtimeStopped',{address:saved.endpoint,pid:saved.pid??null,procStart:saved.procStart??null,runtimeId:saved.id});return;}
+    if(await managedRuntimeState(this.home,saved)==='dead'){guard?.();await removeOwnedSocket(this.home,saved.endpoint);for(const value of owned)if(await ownedRecordState(value)==='dead')await retireDeadOwnedProcess(value,'dead-generation',guard);guard?.();removeManagedRuntime(record);this.emit('runtimeStopped',{address:saved.endpoint,pid:saved.pid??null,procStart:saved.procStart??null,runtimeId:saved.id});return;}
     const nativeState=saved.pid&&saved.procStart?await ownedProcessState({pid:saved.pid,startedAt:saved.procStart}):undefined;
     if(nativeState==='unknown')return'无法核验托管 App Server 的进程代次，保留进程。';
     if(nativeState==='alive'){
@@ -1650,18 +1666,18 @@ export class CodexAdapter extends EventEmitter {
       const rpc=await this.connect(saved.endpoint);
       if(allowed.size===1){try{await assertCodexRuntimeScope(rpc,[...allowed][0]!);}catch(error){return'托管 App Server 的线程范围或未完成工作尚未核验，保留运行时：'+describeError(error);}}
       else if((await loadedCodexThreads(rpc)).size)return'后台 Codex 里还有会话没卸载（可能还在 Codex 的卸载等待期内），这次没有停止它。';
-      rpc.close();
+      guard?.();rpc.close();
     }
     else if(saved.dedicated!==true)return'原生后台尚无独占性证明，保留仍存活的启动包装器及其后代。';
     if(!owned.length)return'托管运行时的启动归属尚未核验，保留预约和归属记录。';
-    for(const value of owned.sort((a,b)=>Number(!!(b.windowsJob||b.posixGroup))-Number(!!(a.windowsJob||a.posixGroup))||b.createdAt-a.createdAt))await releaseOwnedProcess(value);
+    for(const value of owned.sort((a,b)=>Number(!!(b.windowsJob||b.posixGroup))-Number(!!(a.windowsJob||a.posixGroup))||b.createdAt-a.createdAt))await releaseOwnedProcess(value,guard);
                                         
-    saved.launchSettled=true;if(saved.kind==='owned')saveManagedRuntime(this.home,saved);
+    guard?.();saved.launchSettled=true;if(saved.kind==='owned')saveManagedRuntime(this.home,saved);
     if(await managedRuntimeState(this.home,saved)!=='dead')return'托管运行时仍有无法核验的进程，保留预约和归属记录。';
-    await removeOwnedSocket(this.home,saved.endpoint);
+    guard?.();await removeOwnedSocket(this.home,saved.endpoint);guard?.();
     removeManagedRuntime(record);this.emit('runtimeStopped',{address:saved.endpoint,pid:saved.pid??null,procStart:saved.procStart??null,runtimeId:saved.id});
   }
-  close():void {this.coldResumeSealed=true;this.deferredNative=undefined;for(const rpc of this.clients.values())rpc.close();this.clients.clear();this.nativeStates.clear();this.subscriptionOwners.clear();this.ownedRoutes.clear();}
+  close():void {this.coldResumeSealed=true;this.deferredNative=undefined;for(const rpc of this.clients.values())rpc.close();this.clients.clear();this.recycleAcks.clear();this.nativeStates.clear();this.subscriptionOwners.clear();this.ownedRoutes.clear();}
 }
 
 export function codexPermission(result:any):Peer['permission']{

@@ -53,7 +53,7 @@ export function recoveryUserStep(peer:Pick<Peer,'host'|'cwd'>,incident:ManagedIn
     case 'codex_recycle_stop_cancelled':
       return `如需继续，在独立终端运行 nxbridge open codex --member ${incident.peerId} 打开原会话`;
     case 'codex_recycle_stop_deadline':{
-      const stage=incident.recycle,revision=stage?.phase==='held'?stage.basis?.decision.revision:undefined;
+      const stage=incident.recycle,revision=stage?.phase==='held'&&!stage.retryPending?stage.basis?.decision.revision:undefined;
       return revision?`nxbridge recover codex --member ${incident.peerId} --recycle --incident ${incident.id} --revision ${revision} --reason "填写原因"`:undefined;
     }
     case 'codex_recycle_launch_unknown':case 'codex_recycle_verify_unknown':case 'codex_recycle_ack_missing':

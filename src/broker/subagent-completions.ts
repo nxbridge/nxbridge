@@ -1,17 +1,23 @@
 import { randomUUID } from 'node:crypto';
 import type { Store } from '../storage/store.js';
 import type { Peer } from '../types.js';
-import { captureCodexSubagentReadFloor, readCodexSubagentCompletions, type CodexSubagentReadFloor } from '../hosts/codex/codex-subagent-read.js';
+import { captureCodexSubagentReadFloor, readCodexSubagentContinuation, readCodexSubagentCompletions, type CodexSubagentReadFloor } from '../hosts/codex/codex-subagent-read.js';
 import { CODEX_WAKE_RETRY_MS } from '../hosts/codex/codex-wake.js';
+import { HEALTH_UNVERIFIED_MS } from './health/notice-policy.js';
 
 interface Completion {key:string;agentId:string;childTurnId:string;agentPath?:string;floor?:CodexSubagentReadFloor;notified?:boolean;offered?:boolean}
 interface Wake {id:string;channel:string;state:'submitting'|'submitted'|'queued'|'unknown';at:number;own:boolean;keys:string[];batchId?:string;turnId?:string}
 interface Ledger {scope:string;seen:string[];pending:Completion[];batchId?:string;wake?:Wake}
 const key=(peerId:string)=>'subagentCompletions:'+peerId;
+export const SUBAGENT_PROGRESS_STALE_MS=15*60_000;
+export type SubagentObservationState='running'|'checking'|'stale'|'ended'|'unknown';
+interface Observation {scope:string;continued:ReadonlySet<string>;openTurnId?:string;closedTurnId?:string;closedAt?:number;lastProgressAt?:number}
 
                                     
 export class SubagentCompletions {
   private inFlight=new Set<string>();
+  private observations=new Map<string,Observation>();
+  private startedAt=Date.now();
   constructor(private store:Store){}
                                            
   private holdsWakeLease(wake:Wake|undefined):boolean{return wake?.own===true&&(this.inFlight.has(wake.id)||Date.now()-wake.at<CODEX_WAKE_RETRY_MS);}
@@ -21,6 +27,11 @@ export class SubagentCompletions {
     return JSON.stringify([pair.id,current.sessionId,endpoint.epoch,endpoint.bindingEpoch]);
   }
   context(peer:Peer):string|undefined{return this.scope(peer);}
+  private recent(at:number|undefined):boolean{const now=Date.now();return at!==undefined&&at<=now&&now-at<SUBAGENT_PROGRESS_STALE_MS;}
+  private wakeCandidates(peer:Peer,value:Ledger):Completion[]{
+    const observation=this.observations.get(peer.id),continued=observation?.scope===value.scope&&observation.openTurnId&&this.recent(observation.lastProgressAt)?observation.continued:undefined;
+    return value.pending.filter(completion=>!completion.notified&&!continued?.has(completion.key));
+  }
   private get(peer:Peer):Ledger|undefined{
     const value=this.store.setting<Ledger>(key(peer.id));if(!value)return;
     const scope=this.scope(peer);
@@ -45,18 +56,50 @@ export class SubagentCompletions {
     if(value.wake?.turnId===parentTurnId)delete value.wake;
     this.store.setSetting(key(peer.id),value);if(read.size)this.store.event('subagent.results_read',{peerId:peer.id,count:read.size});
   }
-  pending(peer:Peer):boolean{return !!this.get(peer)?.pending.some(completion=>!completion.notified);}
+                                          
+  async observe(peer:Peer,file:unknown):Promise<void>{
+    const before=this.get(peer);if(!before?.pending.length||!peer.sessionId){this.observations.delete(peer.id);return;}
+    const scope=before.scope,candidates=before.pending.flatMap(completion=>completion.floor?[{...completion,floor:completion.floor}]:[]);
+    const proof=await readCodexSubagentContinuation(file,peer.sessionId,candidates);
+    const value=this.get(peer);if(!value||value.scope!==scope)return;
+    if(!value.pending.length){this.observations.delete(peer.id);return;}
+                                           
+    if(!proof.verified)return;
+    const priorCount=value.pending.length;
+    value.pending=value.pending.filter(completion=>!proof.read.has(completion.key));
+    const previous=this.observations.get(peer.id);
+    if(value.pending.length)this.observations.set(peer.id,{scope,continued:proof.continued,openTurnId:proof.openTurnId,closedTurnId:proof.closedTurnId,
+      closedAt:proof.closedTurnId?(previous?.scope===scope&&previous.closedTurnId===proof.closedTurnId?previous.closedAt:Date.now()):undefined,lastProgressAt:proof.lastProgressAt});
+    else this.observations.delete(peer.id);
+    const readCount=priorCount-value.pending.length;
+    const settledWake=!!proof.openTurnId&&this.recent(proof.lastProgressAt)&&value.wake?.turnId===proof.openTurnId;
+    if(!readCount&&!settledWake)return;
+                                                    
+    if(!value.pending.some(completion=>!completion.notified))delete value.batchId;
+    if(settledWake)delete value.wake;
+    this.store.setSetting(key(peer.id),value);
+    if(readCount)this.store.event('subagent.results_read',{peerId:peer.id,count:readCount});
+  }
+  observation(peer:Peer):{state:SubagentObservationState;closedAt?:number}{
+    const value=this.observations.get(peer.id),current=value?.scope===this.scope(peer)?value:undefined;
+    if(current?.openTurnId&&this.recent(current.lastProgressAt))return{state:'running'};
+    if(current?.closedTurnId&&!current.openTurnId)return{state:'ended',closedAt:current.closedAt};
+    if(current?.openTurnId&&current.lastProgressAt!==undefined)return{state:'stale'};
+    return{state:Date.now()-this.startedAt<HEALTH_UNVERIFIED_MS?'checking':'unknown'};
+  }
+  running(peer:Peer):boolean{return this.observation(peer).state==='running';}
+  pending(peer:Peer):boolean{const value=this.get(peer);return !!value&&!!this.wakeCandidates(peer,value).length;}
   available(peer:Peer):boolean{return !!this.get(peer)?.pending.some(completion=>!completion.offered);}
   forwardChildren(peer:Peer):{pending:string[];known:string[];wakePending:boolean}{
     const value=this.get(peer);
                                            
-    return{pending:value?.pending.filter(completion=>!completion.notified).map(completion=>completion.childTurnId)??[],known:value?.seen.map(identity=>JSON.parse(identity)[1] as string)??[],wakePending:this.holdsWakeLease(value?.wake)};
+    return{pending:value?this.wakeCandidates(peer,value).map(completion=>completion.childTurnId):[],known:value?.seen.map(identity=>JSON.parse(identity)[1] as string)??[],wakePending:this.holdsWakeLease(value?.wake)};
   }
-  batch(peer:Peer):string|undefined{const value=this.get(peer);return value?.pending.some(completion=>!completion.notified)?value.batchId:undefined;}
+  batch(peer:Peer):string|undefined{const value=this.get(peer);return value&&this.wakeCandidates(peer,value).length?value.batchId:undefined;}
   blocked(peer:Peer):boolean{return this.holdsWakeLease(this.get(peer)?.wake);}
   status(peer:Peer):{unconfirmed:number;needsWake:number;awaitingContext:number;batchId?:string;wake?:{channel:string;state:Wake['state'];at:number}}|undefined{
     const value=this.get(peer);if(!value?.pending.length)return;
-    return{unconfirmed:value.pending.length,needsWake:value.pending.filter(completion=>!completion.notified).length,awaitingContext:value.pending.filter(completion=>!completion.offered).length,
+    return{unconfirmed:value.pending.length,needsWake:this.wakeCandidates(peer,value).length,awaitingContext:value.pending.filter(completion=>!completion.offered).length,
       batchId:value.batchId??value.wake?.batchId,...(value.wake?.own?{wake:{channel:value.wake.channel,state:value.wake.state,at:value.wake.at}}:{})};
   }
                                         
@@ -64,8 +107,8 @@ export class SubagentCompletions {
     const scope=this.scope(peer);if(!scope)return;
     const value=this.get(peer)??{scope,seen:[],pending:[]};
     if(this.holdsWakeLease(value.wake))return;
-    const own=value.pending.some(completion=>!completion.notified),specific=['native','queue','embedded_queue'].includes(channel);
-    const keys=own&&specific?value.pending.filter(completion=>!completion.notified).map(completion=>completion.key):[];
+    const pending=this.wakeCandidates(peer,value),own=!!pending.length,specific=['native','queue','embedded_queue'].includes(channel);
+    const keys=own&&specific?pending.map(completion=>completion.key):[];
     const id=randomUUID();value.wake={id,channel,state:'submitting',at:Date.now(),own,keys,...(value.batchId?{batchId:value.batchId}:{})};
     this.inFlight.add(id);
     for(const completion of value.pending)if(keys.includes(completion.key))completion.notified=true;

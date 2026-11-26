@@ -70,7 +70,7 @@ export async function ownedGroupState(identity:OwnedIdentity):Promise<ProcessSta
 }
 
                                         
-export async function stopOwnedGroup(identity:OwnedIdentity,timeout=5000):Promise<void>{
-  await stopOwnedProcess(identity,{timeout});
+export async function stopOwnedGroup(identity:OwnedIdentity,timeout=5000,beforeSignal?:()=>void):Promise<void>{
+  await stopOwnedProcess(identity,{timeout,beforeSignal});
   if(await ownedGroupState(identity)!=='dead')throw new BridgeError('process_identity_unknown','监督进程已退出，但组内仍可能有未确认的后代；数字组号不能授权停止，保留记录。');
 }

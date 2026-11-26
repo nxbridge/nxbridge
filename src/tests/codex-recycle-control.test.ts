@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import { randomUUID } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
+import path from 'node:path';
 import type { CodexAdapter } from '../hosts/codex/adapter.js';
 import { saveManagedRuntime } from '../hosts/managed-runtimes.js';
 import { managedMarker } from '../install/installation.js';
@@ -10,12 +12,13 @@ import { DeliveryHealth } from '../broker/health/delivery.js';
 import { CodexRecycleControl } from '../broker/recovery/codex-recycle-control.js';
 import { ManagedRecovery } from '../broker/recovery/managed-recovery.js';
 import { RECYCLE_CLEANUP_USER_STEP } from '../broker/stuck-session-text.js';
-import type { CodexRecycleWork } from '../broker/recovery/codex-recycle.js';
+import type { CodexRecycle, CodexRecycleWork } from '../broker/recovery/codex-recycle.js';
 import { registration } from './support/registration.js';
 import { temporary } from './support/temporary.js';
 
 function recycleFixture(t:TestContext,initialWork:CodexRecycleWork,loadedUnleased=false){
   const home=temporary(t),store=new Store(':memory:');
+  const rollout=path.join(home,'rollout.jsonl');
   t.after(()=>store.close());
   const target=store.register({...registration('codex','recycle-root'),cwd:home,owner:'nxbridge'} as ReturnType<typeof registration>);
   store.updatePeer(target.id,{owner:'nxbridge',state:'ready'});
@@ -28,21 +31,31 @@ function recycleFixture(t:TestContext,initialWork:CodexRecycleWork,loadedUnlease
     kind:'owned',state:'ready',peerId:peer.id,sessionId:peer.sessionId!,configHome:home,dedicated:true,createdAt:Date.now()});
   const recovery=new ManagedRecovery(store),delivery=new DeliveryHealth(store);
   let work=initialWork,oldAlive=true,afterObserve:(()=>void)|undefined,checkingHolders:(()=>void)|undefined,afterSignal:(()=>void)|undefined,
-    retiringOld:(()=>void)|undefined,draining=false,lostAck=false,baseSubscription=false,observeFailed=false;
-  const effects={stops:0,launches:0,subscriptions:0};
+    retiringOld:(()=>void)|undefined,draining=false,lostAck=false,baseSubscription=false,observeFailed=false,firstReplacementExited=false,stopPending=false;
+  const effects={stops:0,launches:0,subscriptions:0},finalized:Parameters<CodexAdapter['finalizeRecycle']>[]=[];
+  let failProfileCleanup=false,observeTimeout:'return'|'throw'|undefined;
   const input={...registration('codex',peer.sessionId!),cwd:home,endpoint:{
     ...registration('codex',peer.sessionId!).endpoint,address:fresh.endpoint,epoch:fresh.runtimeId,runtimeId:fresh.runtimeId,
     pid:fresh.pid,procStart:fresh.procStart,configHome:home,
   }};
-  const codex={hasSubscription:()=>baseSubscription,inspectRecycleOld:async()=>oldAlive?'alive':'dead',recycleHost:()=>({
+  const codex={hasSubscription:()=>baseSubscription,inspectRecycleOld:async()=>oldAlive?'alive':'dead',
+    finalizeRecycle:(...identity:Parameters<CodexAdapter['finalizeRecycle']>)=>{
+      if(failProfileCleanup)throw new Error('临时配置文件暂时无法删除');
+      finalized.push(identity);
+    },recycleHost:()=>({
     observe:async(trigger:string)=>{
       afterObserve?.();
+      if(observeTimeout==='throw')throw new BridgeError('timeout','thread/list 等待确认超时');
+      if(observeTimeout==='return')return {kind:'held',code:'timeout',reason:'thread/list 等待确认超时'};
       if(observeFailed)return {kind:'held',code:'codex_recycle_evidence_unverified',reason:'原进程已无法连接'};
       if(trigger==='loaded_unleased'&&work.progress==='idle')return {kind:'natural',idleLoaded:true};
-      return {kind:'available',old,profile:{sourceId:old.runtimeId,sessionId:peer.sessionId,file:'rollout',settingsKey:'exact'},work};
+      return {kind:'available',old,profile:{sourceId:old.runtimeId,sessionId:peer.sessionId,file:rollout,settingsKey:'exact'},work};
     },
-    persistProfile(){},inspectOld:async()=>oldAlive?'alive':'dead',stop:async(_old:unknown,_deadline:number,_guard:()=>void,markSignal:()=>void)=>{
-      markSignal();effects.stops++;afterSignal?.();oldAlive=false;
+    persistProfile(){},inspectOld:async(target:typeof old)=>target.runtimeId===fresh.runtimeId?(firstReplacementExited?'dead':'alive'):oldAlive?'alive':'dead',
+    stop:async(_old:unknown,_deadline:number,_guard:()=>void,markSignal:()=>void)=>{
+      markSignal();effects.stops++;afterSignal?.();
+      if(stopPending)throw new BridgeError('process_stop_pending','原代次仍在运行');
+      oldAlive=false;
     },retireOld:async()=>{retiringOld?.();},
     prepareLaunch:async()=>({runtimeId:fresh.runtimeId}),launch:async()=>{effects.launches++;},inspectLaunch:async()=>effects.launches?{kind:'matched',fresh}:{kind:'unstarted'},
     verify:async(_fresh:unknown,_profile:unknown,{markSubmitted}:{markSubmitted:()=>void})=>{
@@ -51,12 +64,17 @@ function recycleFixture(t:TestContext,initialWork:CodexRecycleWork,loadedUnlease
     prepareUnsubscribed:async()=>input,
     admission:()=>({input,receipts:[],policy:{source:'persisted'}}),subscribe:()=>{effects.subscriptions++;},
   })} as unknown as CodexAdapter;
-  const control=new CodexRecycleControl({home,store,codex,recovery,delivery,stopped:()=>draining,scope:()=>pair.id,
-    incident:target=>recovery.observe(target,pair,endpoint),noExternalHolder:async()=>{checkingHolders?.();},fold:()=>{}});
+  const makeControl=()=>new CodexRecycleControl({home,store,codex,recovery,delivery,stopped:()=>draining,scope:()=>pair.id,
+    incident:target=>recovery.observe(target,pair,endpoint),noExternalHolder:async()=>{checkingHolders?.();},
+    fold:(_target,receipt)=>{store.transition(receipt.messageId,'contextObserved');}});
+  let control=makeControl();
   const hold=loadedUnleased?Object.assign(new RuntimeRecoveryHold('owned_subscription_waiting','等待原生订阅'),{recycleEvidence:'loaded_unleased'}):
     new RuntimeRecoveryHold('native_thread_wedged','原生工作不可用');
   assert.equal(control.noteHold(peer,hold),true);
-  return {store,peer,sender,pair,fresh,recovery,delivery,control,effects,
+  return {store,peer,sender,pair,old,fresh,recovery,delivery,get control(){return control;},effects,rollout,finalized,
+    reopenControl:()=>{control=makeControl();},
+    failProfileCleanup:(value:boolean)=>{failProfileCleanup=value;},
+    timeOutObservation:(value:'return'|'throw'|undefined)=>{observeTimeout=value;},
     advanceStable:async(acceptance?:Parameters<typeof control.advance>[1])=>{
       await control.advance(peer,acceptance);
       const stage=recovery.get(peer.id)?.recycle;
@@ -71,8 +89,10 @@ function recycleFixture(t:TestContext,initialWork:CodexRecycleWork,loadedUnlease
     signalHook:(hook?:()=>void)=>{afterSignal=hook;},
     retireHook:(hook?:()=>void)=>{retiringOld=hook;},
     setDraining:(value:boolean)=>{draining=value;},
+    setStopPending:(value:boolean)=>{stopPending=value;},
     loseAck:()=>{lostAck=true;},
     installBaseSubscription:()=>{baseSubscription=true;},
+    exitFirstReplacement:()=>{firstReplacementExited=true;},
     exitBeforeObserve:()=>{oldAlive=false;observeFailed=true;},
     notices:(part:'decision'|'result')=>delivery.peek(pair.id,sender.id).filter(notice=>notice.kind?.startsWith('codex_recycle_'+part+':'))};
 }
@@ -114,6 +134,218 @@ test('同一事故的实际消息账本保持，只有当前工作证据可接�
   assert.equal(effects.launches,1);
 });
 
+test('停止超时后反复变化的证据不发新通知，稳定后只发布当前版本',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const work:CodexRecycleWork={activeTurnIds:[],progress:'idle',roles:[],unresolved:[]};
+  const f=recycleFixture(t,work);f.setStopPending(true);await f.control.advance(f.peer);
+  const poll=async()=>{now+=5001;await f.control.advance(f.peer);};
+  const notices=()=>f.delivery.peek(f.pair.id,f.sender.id).filter(notice=>notice.kind?.startsWith('codex_recycle_held:'));
+  const status=()=>f.control.summary(f.peer,f.recovery.get(f.peer.id)!) as {revision?:string;status_text:string};
+  now+=15000;await poll();
+  const deadline=f.recovery.get(f.peer.id)?.recycle;
+  assert.ok(deadline?.phase==='held'&&deadline.code==='codex_recycle_stop_deadline'&&deadline.retryPending);
+  const entry=notices();assert.equal(entry.length,1);assert.match(entry[0]!.message,/old process was still alive at the deadline/);
+  assert.doesNotMatch(entry[0]!.message,/evidence_revision=/);
+  assert.match(entry[0]!.message,/Its facts are still settling/);
+  assert.match(status().status_text,/情况还在变化，稳定后会给出再试一次的命令/);
+  for(let i=0;i<4;i++){
+    f.setWork({...work,progress:'unknown',roles:[i%2?'first-tool':'second-tool']});await poll();
+    assert.equal(status().revision,undefined);
+    assert.doesNotMatch(status().status_text,/--revision/);
+    assert.deepEqual(notices().map(notice=>notice.id),[entry[0]!.id]);
+  }
+  f.setWork(work);await poll();assert.equal(status().revision,undefined);
+  await poll();const revision=status().revision;
+  assert.ok(revision);assert.notEqual(revision,deadline.basis?.decision.revision);
+  const retry=notices();assert.equal(retry.length,1);assert.equal(retry[0]?.wake,true);assert.ok(retry[0]?.message.includes(revision));
+  await poll();assert.deepEqual(notices().map(notice=>notice.id),[retry[0]?.id]);
+  let reads=0;f.observeHook(()=>{reads++;});f.timeOutObservation('return');
+  now+=5000;assert.equal(await f.control.advance(f.peer),true);
+  await poll();now+=4000;assert.equal(await f.control.advance(f.peer),true);assert.equal(reads,1);
+  assert.equal(status().revision,revision);assert.deepEqual(notices().map(notice=>notice.id),[retry[0]?.id]);
+  f.timeOutObservation(undefined);
+  assert.deepEqual(f.effects,{stops:1,launches:0,subscriptions:0});
+  f.setStopPending(false);
+  await f.control.advance(f.peer,{incidentId:f.recovery.get(f.peer.id)!.id,evidenceRevision:revision,reason:'当前原进程可明确停止',by:'user'});
+  assert.equal(f.recovery.get(f.peer.id)?.recycle?.phase,'ready');assert.deepEqual(notices(),[]);
+  assert.deepEqual(f.effects,{stops:2,launches:1,subscriptions:1});
+});
+
+test('关闭成功事故后仍按原替代代次结清临时配置，不重发结果',async t=>{
+  const f=recycleFixture(t,{activeTurnIds:[],progress:'idle',roles:[],unresolved:[]});
+  f.failProfileCleanup(true);await f.control.advance(f.peer);
+  const ready=f.recovery.get(f.peer.id)!;assert.ok(ready.recycle?.phase==='ready'&&ready.recycle.finalized);
+  assert.deepEqual(f.finalized,[]);
+  f.store.unpair(f.pair.id);f.control.reconcileAuthority(f.peer);
+  assert.equal(f.recovery.get(f.peer.id)?.state,'closed');
+  f.failProfileCleanup(false);f.control.reconcileFinishedProfile(f.peer.id);
+  assert.deepEqual(f.finalized,[[f.peer.id,f.peer.sessionId,f.fresh,f.old.runtimeId]]);
+  assert.equal(f.notices('result').length,1);
+});
+
+for(const outcome of ['return','throw'] as const)test(`停止信号前原生读取超时保持静默并退避：${outcome}`,async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const f=recycleFixture(t,{activeTurnIds:['active'],progress:'stalled',roles:[],unresolved:[]},true);
+  f.store.accept(f.pair,f.sender,'安全待投递消息','held');
+  let reads=0;f.observeHook(()=>{reads++;});f.timeOutObservation(outcome);
+  await f.control.advance(f.peer);
+  now+=5001;await f.control.advance(f.peer);
+  now+=5001;await f.control.advance(f.peer);
+  assert.equal(reads,2);assert.equal(f.recovery.get(f.peer.id)?.recycle?.phase,'observing');
+  assert.deepEqual(f.delivery.peek(f.pair.id,f.sender.id),[]);
+  assert.deepEqual(f.effects,{stops:0,launches:0,subscriptions:0});
+  f.timeOutObservation(undefined);now+=20001;await f.control.advance(f.peer);
+  now+=30001;await f.control.advance(f.peer);
+  assert.equal(f.recovery.get(f.peer.id)?.recycle?.phase,'awaiting_partner');assert.equal(f.notices('decision').length,1);
+});
+
+for(const changed of [false,true])test(`等候确认时短暂缺少证据，恢复后的工作${changed?'已变化':'未变化'}`,async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const work:CodexRecycleWork={activeTurnIds:['active'],progress:'stalled',roles:[],unresolved:[]};
+  const f=recycleFixture(t,work),poll=async(ms:number)=>{now+=ms;await f.control.advance(f.peer);};
+  await poll(0);await poll(5000);
+  const incident=f.recovery.get(f.peer.id)!,waiting=incident.recycle;
+  assert.ok(waiting?.phase==='awaiting_partner');
+  const {noticeId,revision,since}=waiting.basis.decision;
+  const approval={incidentId:incident.id,evidenceRevision:revision,reason:'确认当前工作证据。'};
+  const ids=()=>f.notices('decision').map(notice=>notice.id);
+  let reads=0;f.observeHook(()=>{reads++;});f.timeOutObservation('return');
+  await poll(5000);await poll(5000);
+  const interrupted=f.recovery.get(f.peer.id)?.recycle;
+  assert.equal(reads,1);assert.ok(interrupted?.phase==='awaiting_partner');
+  assert.deepEqual(interrupted.basis,waiting.basis);assert.deepEqual(ids(),[noticeId]);
+  f.timeOutObservation('throw');await f.control.advance(f.peer,approval);
+  const queued=f.recovery.get(f.peer.id)?.recycle;
+  assert.ok(queued?.phase==='awaiting_partner');assert.deepEqual(queued.basis.acceptance,approval);
+  assert.deepEqual(queued.basis.decision,waiting.basis.decision);assert.deepEqual(ids(),[noticeId]);
+  assert.ok(f.control.acceptanceText(f.peer,incident,approval)?.includes(revision));
+  f.timeOutObservation(undefined);
+  if(changed)f.setWork({...work,activeTurnIds:['replacement']});
+  await poll(19999);assert.equal(reads,2);
+  await poll(1);assert.equal(reads,3);assert.equal(f.effects.stops,0);
+  assert.deepEqual(ids(),changed?[]:[noticeId]);
+  await poll(5000);
+  if(!changed){
+    assert.equal(f.effects.stops,1);assert.equal(f.recovery.get(f.peer.id)?.recycle?.phase,'ready');
+    assert.deepEqual(ids(),[]);assert.equal(f.notices('result').length,1);return;
+  }
+  const next=f.recovery.get(f.peer.id)?.recycle;
+  assert.ok(next?.phase==='awaiting_partner');assert.equal(next.basis.decision.since,since);
+  assert.notEqual(next.basis.decision.revision,revision);assert.notEqual(next.basis.decision.noticeId,noticeId);
+  await f.control.advance(f.peer,approval);await poll(5000);
+  assert.equal(f.effects.stops,0);assert.deepEqual(ids(),[next.basis.decision.noticeId]);
+});
+
+for(const read of [2,3])test(`已确认后第 ${read} 次取证超时保留通知和批准，不使用过期证据停止`,async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const f=recycleFixture(t,{activeTurnIds:['active'],progress:'stalled',roles:[],unresolved:[]});
+  await f.control.advance(f.peer);now+=5000;await f.control.advance(f.peer);
+  const incident=f.recovery.get(f.peer.id)!,waiting=incident.recycle;
+  assert.ok(waiting?.phase==='awaiting_partner');
+  const approval={incidentId:incident.id,evidenceRevision:waiting.basis.decision.revision,reason:'确认当前工作证据。'};
+  let reads=0;f.observeHook(()=>{if(++reads===read)f.timeOutObservation('return');});
+  await f.control.advance(f.peer,approval);
+  const queued=f.recovery.get(f.peer.id)?.recycle;
+  assert.ok(queued?.phase==='awaiting_partner');assert.deepEqual(queued.basis.acceptance,approval);
+  assert.deepEqual(f.notices('decision').map(notice=>notice.id),[waiting.basis.decision.noticeId]);
+  assert.equal(f.effects.stops,0);
+  f.timeOutObservation(undefined);
+  now+=5000;await f.control.advance(f.peer);assert.equal(reads,read);
+  now+=5000;await f.control.advance(f.peer);assert.equal(reads,read+1);assert.equal(f.effects.stops,0);
+  now+=5000;await f.control.advance(f.peer);assert.equal(f.effects.stops,1);
+});
+
+test('反复取证失败达到次数上限后只留一条阻塞通知，继续退避且不围住原会话',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const f=recycleFixture(t,{activeTurnIds:[],progress:'idle',roles:[],unresolved:[]});
+  const held=f.store.accept(f.pair,f.sender,'等待确认的消息','held');
+  const notices=()=>f.delivery.peek(f.pair.id,f.sender.id);
+  f.timeOutObservation('return');
+  for(let attempt=1;attempt<=6;attempt++){
+    await f.control.advance(f.peer);now+=30000;
+    assert.equal(notices().length,attempt===6?1:0);
+    if(attempt===3)f.reopenControl();
+  }
+  const incident=f.recovery.get(f.peer.id)!;
+  assert.equal(incident.state,'blocked');assert.equal(incident.recycle?.phase,'held');
+  assert.match(incident.precondition!,/连续 6 次/);assert.equal(f.control.fenced(f.peer.id),false);
+  const notice=notices()[0]!;assert.ok(notice.wake);assert.match(notice.message,/1 msg/);
+  for(let i=0;i<40;i++){await f.control.advance(f.peer);now+=60000;}
+  assert.deepEqual(notices().map(value=>value.id),[notice.id]);assert.equal(f.effects.stops,0);
+  assert.equal(f.store.message(held.id).state,'accepted');
+  f.timeOutObservation(undefined);await f.control.advance(f.peer);
+  assert.equal(f.effects.stops,1);assert.equal(f.recovery.get(f.peer.id)?.recycle?.phase,'ready');
+});
+
+test('排队确认超过时限即使当前读取恢复也已作废，同一份忙碌证据须重新确认',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const work:CodexRecycleWork={activeTurnIds:['active'],progress:'stalled',roles:[],unresolved:[]};
+  const f=recycleFixture(t,work);f.store.accept(f.pair,f.sender,'等待恢复的消息','held');
+  await f.control.advance(f.peer);now+=5000;await f.control.advance(f.peer);
+  const incident=f.recovery.get(f.peer.id)!,decision=incident.recycle;
+  assert.ok(decision?.phase==='awaiting_partner');
+  const approval={incidentId:incident.id,evidenceRevision:decision.basis.decision.revision,reason:'此前已核对。'};
+  f.timeOutObservation('throw');await f.control.advance(f.peer,approval);f.reopenControl();
+  const engine=(f.control as unknown as {engine:CodexRecycle}).engine;
+  const advance=engine.advance.bind(engine);
+  t.mock.method(engine,'advance',async(...args:Parameters<CodexRecycle['advance']>)=>{
+    await advance(...args);
+    throw Error('回收状态刚提交时协调器退出');
+  });
+  now+=300000;f.timeOutObservation(undefined);
+  await assert.rejects(f.control.advance(f.peer),/回收状态刚提交时协调器退出/);
+  f.reopenControl();
+  const exhausted=f.recovery.get(f.peer.id)?.recycle;
+  assert.ok(exhausted?.phase==='held'&&!exhausted.basis?.acceptance);
+  assert.match(exhausted.reason,/已持续约 5 分钟/);
+  assert.equal(f.control.fenced(f.peer.id),false);assert.equal(f.effects.stops,0);
+  assert.deepEqual(f.notices('decision'),[]);
+  const pending=()=>f.delivery.peek(f.pair.id,f.sender.id);
+  const lapsed=pending()[0]!;assert.equal(pending().length,1);assert.match(lapsed.message,/lapsed/);
+  assert.ok(lapsed.message.includes(approval.evidenceRevision));
+  for(let i=0;i<2;i++){
+    now+=30000;await f.control.advance(f.peer);assert.equal(f.effects.stops,0);
+  }
+  const next=f.recovery.get(f.peer.id)?.recycle;
+  assert.ok(next?.phase==='awaiting_partner');assert.notEqual(next.basis.decision.revision,approval.evidenceRevision);
+  assert.deepEqual(pending().flatMap(notice=>notice.componentIds??[notice.id]).sort(),[lapsed.id,next.basis.decision.noticeId].sort());
+  await f.control.advance(f.peer,approval);assert.equal(f.effects.stops,0);
+  await f.control.advance(f.peer,{...approval,evidenceRevision:next.basis.decision.revision});assert.equal(f.effects.stops,1);
+});
+
+test('排队确认期间工作变为空闲，重新核验后自动恢复且不发送新的确认通知',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const work:CodexRecycleWork={activeTurnIds:['active'],progress:'stalled',roles:[],unresolved:[]};
+  const f=recycleFixture(t,work);
+  await f.control.advance(f.peer);now+=5000;await f.control.advance(f.peer);
+  const incident=f.recovery.get(f.peer.id)!,decision=incident.recycle;
+  assert.ok(decision?.phase==='awaiting_partner');
+  const approval={incidentId:incident.id,evidenceRevision:decision.basis.decision.revision,reason:'此前已核对。'};
+  f.timeOutObservation('return');await f.control.advance(f.peer,approval);
+  f.timeOutObservation(undefined);f.setWork({...work,activeTurnIds:[],progress:'idle'});
+  now+=10000;await f.control.advance(f.peer);assert.equal(f.effects.stops,0);
+  now+=5000;await f.control.advance(f.peer);
+  assert.equal(f.effects.stops,1);assert.deepEqual(f.notices('decision'),[]);
+  const stage=f.recovery.get(f.peer.id)?.recycle;
+  assert.ok(stage?.phase==='ready'&&!stage.attempt.acceptance);
+});
+
+test('停止信号提交前最后的进程核验超过确认时限时，保留原进程并使确认作废',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const f=recycleFixture(t,{activeTurnIds:['active'],progress:'stalled',roles:[],unresolved:[]});
+  await f.control.advance(f.peer);now+=5000;await f.control.advance(f.peer);
+  const incident=f.recovery.get(f.peer.id)!,decision=incident.recycle;
+  assert.ok(decision?.phase==='awaiting_partner');
+  const approval={incidentId:incident.id,evidenceRevision:decision.basis.decision.revision,reason:'此前已核对。'};
+  f.timeOutObservation('return');await f.control.advance(f.peer,approval);
+  f.timeOutObservation(undefined);now+=10000;await f.control.advance(f.peer);
+  now+=5000;f.holderHook(()=>{now+=300000;});await f.control.advance(f.peer);
+  const stage=f.recovery.get(f.peer.id)?.recycle;
+  assert.ok(stage?.phase==='held'&&!stage.paused&&stage.observationGap?.lapsedRevision===approval.evidenceRevision);
+  assert.equal(f.control.fenced(f.peer.id),false);assert.equal(f.recovery.lastRecycle(f.peer.id),undefined);
+  assert.deepEqual(f.effects,{stops:0,launches:0,subscriptions:0});
+});
+
 test('协调器交接在旧进程退出后暂停，恢复后沿用原尝试启动并重新接入',async t=>{
   let now=Date.now();t.mock.method(Date,'now',()=>now);
   const f=recycleFixture(t,{activeTurnIds:[],progress:'idle',roles:[],unresolved:[]});
@@ -144,21 +376,66 @@ for(const leftover of [undefined,2])test(`${leftover===undefined?'无法确认':
   assert.deepEqual(f.effects,{stops:1,launches:0,subscriptions:0});
 });
 
-test('移交普通接续登记新代次但不授予订阅，核验后只通知一次原发送方',async t=>{
+test('普通接续从长输出之前找回持久回执，只通知一次仍未确认的原消息',async t=>{
   let now=Date.now();t.mock.method(Date,'now',()=>now);
   const f=recycleFixture(t,{activeTurnIds:[],progress:'idle',roles:[],unresolved:[]});
   const input=f.store.accept(f.pair,f.sender,'结果不明的原任务','uncertain');
   f.store.claim(input.id);f.store.transition(input.id,'unknown');
+  const arrived=f.store.accept(f.pair,f.sender,'持久历史能证明已送达的原任务','arrived');
+  f.store.claim(arrived.id);f.store.transition(arrived.id,'unknown');
   f.loseAck();assert.equal(await f.control.advance(f.peer),false);
   const handed=f.recovery.get(f.peer.id)?.recycle;
   assert.ok(handed?.phase==='handback'&&handed.attempt.ledger.uncertain[0]?.id===input.id);
   assert.equal(f.store.endpoint(f.peer.id)?.runtimeId,f.fresh.runtimeId);
   assert.equal(f.control.fenced(f.peer.id),false);assert.deepEqual(f.notices('result'),[]);
+  const timestamp=new Date(now).toISOString();
+  const later=JSON.stringify({timestamp,type:'event_msg',payload:{type:'agent_reasoning',text:'x'.repeat(1024)}})+'\n';
+  writeFileSync(f.rollout,[
+    {type:'session_meta',payload:{id:f.peer.sessionId}},
+    {type:'event_msg',payload:{type:'task_started',turn_id:'receipt-turn'}},
+    {type:'response_item',payload:{type:'function_call',name:'receive_messages',namespace:'claude',call_id:'receipt-call'}},
+    {type:'response_item',payload:{type:'function_call_output',call_id:'receipt-call',output:JSON.stringify({messages:[{message_id:arrived.id}]})}},
+  ].map(row=>JSON.stringify({timestamp,...row})).join('\n')+'\n'+later.repeat(9500)+'{"type":','utf8');
   now+=5001;f.installBaseSubscription();await f.control.advance(f.store.peer(f.peer.id));
   now+=5001;await f.control.advance(f.store.peer(f.peer.id));
   const result=f.notices('result');assert.equal(result.length,1);assert.deepEqual(result[0]?.affectedMessageIds,[input.id]);
   assert.equal(f.store.message(input.id).state,'unknown');
+  assert.equal(f.store.message(arrived.id).state,'contextObserved');
   assert.deepEqual(f.effects,{stops:1,launches:1,subscriptions:0});
+});
+
+test('普通接续在原替代代次退出后启用另一代次，按原尝试完成结果',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const f=recycleFixture(t,{activeTurnIds:[],progress:'idle',roles:[],unresolved:[]});
+  f.loseAck();await f.control.advance(f.peer);
+  const handback=f.recovery.get(f.peer.id)?.recycle;
+  assert.ok(handback?.phase==='handback');
+  const prior=f.store.endpoint(f.peer.id)!,runtimeId=randomUUID();
+  f.store.deactivate(f.peer.id,prior.epoch);
+  f.store.saveEndpoint({...prior,runtimeId,epoch:runtimeId,pid:333,procStart:'ordinary-replacement',address:'ws://127.0.0.1:12347'});
+  f.installBaseSubscription();
+  now+=5001;await f.control.advance(f.store.peer(f.peer.id));
+  assert.equal(f.recovery.get(f.peer.id)?.recycle?.phase,'handback');
+  f.exitFirstReplacement();
+  now+=5001;await f.control.advance(f.store.peer(f.peer.id));
+  const ready=f.recovery.get(f.peer.id)?.recycle;
+  assert.ok(ready?.phase==='ready'&&ready.fresh.runtimeId===runtimeId&&ready.attempt.id===handback.attempt.id);
+  assert.equal(f.notices('result').length,1);
+  assert.deepEqual(f.effects,{stops:1,launches:1,subscriptions:0});
+});
+
+for(const change of ['接管','关闭','解除配对'] as const)test(`已完成的回收遇到${change}时不改写成功结果`,async t=>{
+  const f=recycleFixture(t,{activeTurnIds:[],progress:'idle',roles:[],unresolved:[]});
+  await f.control.advance(f.peer);
+  const key='codexRecycleUserLine:'+f.sender.id,before=f.store.setting(key);
+  assert.ok(before);assert.equal(f.notices('result').length,1);
+  if(change==='接管')f.store.updatePeer(f.peer.id,{owner:'user'});
+  if(change==='关闭')f.store.updatePeer(f.peer.id,{enabled:false});
+  if(change==='解除配对')f.store.unpair(f.pair.id);
+  f.control.reconcileAuthority(f.store.peer(f.peer.id));
+  assert.equal(f.recovery.get(f.peer.id)?.state,'closed');
+  assert.deepEqual(f.store.setting(key),before);
+  assert.equal(f.delivery.peek(f.pair.id,f.sender.id).some(notice=>notice.kind?.startsWith('codex_recycle_authority_lost:')),false);
 });
 
 for(const {reason,by,work} of [

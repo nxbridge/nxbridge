@@ -8,7 +8,7 @@ import {TurnEndEvidence,turnNativeScope,type TurnEndStats} from '../broker/turn-
 import {DeliveryHealth} from '../broker/health/delivery.js';
 import type {BrokerHealthCoordinator} from '../broker/health/coordinator.js';
 import type {CompletionHold} from '../broker/turn-end-text.js';
-import {fixture} from './support/broker-fixture.js';
+import {fixture,lifecycle} from './support/broker-fixture.js';
 import {temporary} from './support/temporary.js';
 import {saveManagedRuntime} from '../hosts/managed-runtimes.js';
 import {managedMarker} from '../install/installation.js';
@@ -229,6 +229,38 @@ test('后台暂时失去端点不会吞掉真人补额，也不会保留可占�
   f.store.saveEndpoint({...endpoint,active:true});f.guard.refresh(f.pair);assert.deepEqual(f.pending().map(row=>row.id),[original]);
 });
 
+test('同一完成事实在门槛撤回、重新准入和协调器重建的轨迹中保持一个通知编号',async t=>{
+  const gates=['paused','pending_user','native_state_unverified'] as const;
+  for(let cut=0;cut<=gates.length;cut++)await t.test('重建点 '+cut,sub=>{
+    const f=setup(sub);f.finish('one-completion');const noticeId=f.pending()[0]!.id;
+    let guard=f.guard,hold:CompletionHold|undefined;
+    const reopen=()=>new TurnEndCoordinator(f.store,f.health,{owned:()=>true,source:()=>f.file,stats:()=>undefined,gate:()=>hold},()=>4);
+    const admit=()=>{
+      const notice=f.pending()[0]!;assert.equal(notice.id,noticeId);assert.ok(guard.ready(f.pair,true));
+      const prepared=f.health.prepare(f.pair.id,f.c.id,notice.id,notice.scope,false,true,true);assert.ok(prepared);
+      guard.admitted(f.pair,prepared);return prepared;
+    };
+    for(const [index,gate] of gates.entries()){
+      if(index===cut)guard=reopen();
+      guard.refresh(f.pair);const notice=admit();assert.equal(guard.budget.status(f.c.id).used,1);
+      guard.notSubmitted(f.fg(),f.health.outcome(f.pair.id,f.c.id,notice.id,'pending'));
+      hold=gate;f.hold(gate);guard.refresh(f.pair);
+      assert.deepEqual(f.pending(),[]);assert.equal(guard.budget.status(f.c.id).used,1,'暂缓同一事实仍保留原预约，不额外扣次');
+      hold=undefined;f.hold(undefined);
+                                            
+      const turn='independent-'+index;guard.begin(f.fg(),turn);
+      guard.complete(f.fg(),{turnId:turn,completedAt:Date.now(),stats:f.stats()});
+      sub.mock.timers.tick(60001);guard.refresh(f.pair);
+      assert.deepEqual(f.pending().map(entry=>entry.id),[noticeId]);
+    }
+    if(cut===gates.length)guard=reopen();
+    const unknown=admit();f.health.outcome(f.pair.id,f.c.id,unknown.id,'unknown');guard=reopen();
+    sub.mock.timers.tick(60001);guard.refresh(f.pair);
+    assert.deepEqual(f.pending(),[]);assert.equal(guard.budget.status(f.c.id).used,1,'结果不明的提交保留扣额且不重新提供');
+    assert.equal(f.store.setting<{noticeId:string}>('turnEndFact:'+f.x.id)?.noticeId,noticeId);
+  });
+});
+
 test('核验为已汇报后保留精确原轮次的提醒编号，但不再提供提醒',t=>{
   const f=setup(t);f.guard.begin(f.bg(),'same-turn');
   f.guard.complete(f.bg(),{turnId:'same-turn',completedAt:Date.now()});f.guard.refresh(f.pair);
@@ -267,6 +299,29 @@ test('实际完成门槛：空闲前台收到后台原生完成；暂缓的完�
   const prepared=internals.runtimeHealth.admitNotices(f.pair,f.c,[notice],notice.scope!,true,true);
   assert.equal(prepared.length,1);assert.equal(prepared[0]?.interventionIds?.[0],notice.id);
   assert.equal(f.broker.turnEnds.status(f.c).state,'completed');assert.equal(f.store.messages().length,0);
+});
+
+test('完成提醒按原顺序报告配对暂停、待人处理和原生端点状态，再考虑生命周期门槛',async t=>{
+  const f=managedFixture(t),foreground=()=>f.store.peer(f.c.id);
+  f.native('turn/started',{turn:{id:'background',status:'inProgress'}});
+  f.native('turn/completed',{turn:{id:'background',status:'completed'}});
+  f.codex.emit('state',f.x.sessionId,'ready',f.previous.address);
+  await new Promise(resolve=>setImmediate(resolve));f.broker.turnEnds.refresh(f.pair);
+  assert.equal(f.broker.turnEnds.ready(f.pair),true);
+  const life=lifecycle(f.broker),hold=()=>f.broker.turnEnds.status(foreground()).hold;
+  const retire=t.mock.method(life,'isRetiring',(id:string)=>id===f.x.id);
+  assert.equal(hold(),'runtime_unavailable');retire.mock.restore();
+  f.store.setSetting('managedSessionConflict:'+f.x.id,{conflict:true});
+  assert.equal(hold(),'runtime_unavailable');
+  f.store.setPaused(true,f.pair.id);assert.equal(hold(),'paused');f.store.setPaused(false,f.pair.id);
+  f.store.updatePeer(f.x.id,{state:'needsHuman'});assert.equal(hold(),'pending_user');
+  const endpoint=f.store.endpoint(f.x.id)!;
+  f.store.saveEndpoint({...endpoint,pendingContext:true});assert.equal(hold(),'native_state_unverified');
+  f.store.saveEndpoint(endpoint);f.store.updatePeer(f.x.id,{state:'ready'});
+  f.store.setSetting('managedSessionConflict:'+f.x.id,null);
+  const cancel=life.beginRestart(f.x.id);
+  try{assert.equal(hold(),'runtime_unavailable');}finally{cancel();}
+  assert.equal(hold(),undefined);assert.equal(f.broker.turnEnds.ready(f.pair),true);
 });
 
 test('实际完成门槛：后台先完成、前台后 Stop；过期或已结束的请求不扣额，应用回执才结清事实',async t=>{
@@ -327,6 +382,8 @@ for(const host of ['claude','codex'] as const)test(host+' 前台真正空闲后�
   assert.equal(f.guard.budget.status(foreground().id).used,1,'未确认的停止建议保持扣额');
   assert.equal(f.guard.confirmStop(foreground(),'foreground'),true);f.guard.refresh(f.pair);
   assert.equal(f.guard.status(foreground()).state,'completed');assert.deepEqual(f.health.peek(f.pair.id,foreground().id),[]);
+  const intervention=f.store.setting<{confirmed?:true;released?:true}>('turnEndIntervention:'+foreground().id)!;
+  assert.equal(intervention.confirmed,true);assert.equal(intervention.released,true,'停止已确认和前台占用已释放是可以并存的事实');
   f.guard.complete(foreground(),{turnId:'foreground',completedAt:Date.now(),stats:f.stats()});
   assert.equal(f.guard.budget.status(foreground().id).used,0,'保留的原生元数据仍支持迟到的无动作证明');
 });

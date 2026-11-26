@@ -80,7 +80,8 @@ export function formatStatus(status:any):string{
     ...[status.self,status.partner].flatMap(profileNotice),
     ...[status.self,status.partner].flatMap(restartPauseNotice),
                                       
-    ...[status.self,status.partner].flatMap(p=>p?.childCompletions?.hold?.reason?[`Codex 的子代理已做完，尚未确认主线程接着处理：${p.childCompletions.hold.reason}。没动的话到原 Codex 窗口说一句继续，不用重跑子代理`]:[]),
+                                                                   
+    ...[status.self,status.partner].flatMap(p=>{const hold=p?.childCompletions?.hold;if(!hold?.reason)return[];return hold.observing?[`Codex 的子代理已做完，正在核对主线程有没有接着处理（${hold.reason}），不用操作`]:[`Codex 的子代理已做完，尚未确认主线程接着处理：${hold.reason}。没动的话到原 Codex 窗口说一句继续，不用重跑子代理`];}),
                                                
     ...completionGuardNotices([status.self,status.partner]),
     `待处理消息：${status.pending}；待处理问题：${status.questions?.length??0}`,

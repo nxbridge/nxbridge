@@ -20,7 +20,7 @@
     "test": "npm run build && npm run build:publish && node tools/run-tests.mjs --test --test-timeout=30000 \"dist/tests/**/*.test.js\"",
     "test:native": "npm run build && npm run build:publish && node tools/run-tests.mjs --test --test-concurrency=1 --test-timeout=180000 \"dist/native-tests/**/*.test.js\"",
     "test:native:target": "npm run build && npm run build:publish && node tools/test-native-version.mjs 0.166.0",
-    "check": "node tools/sync-version.mjs --check && node tools/mod-revision.mjs --check && node tools/identity-revision.mjs --check && tsc -p tsconfig.json --noEmit",
+    "check": "node tools/sync-version.mjs --check && node tools/mod-revision.mjs --check && node tools/identity-revision.mjs --check && node tools/check-import-boundaries.mjs && node --test --test-timeout=30000 tools/check-import-boundaries.test.mjs && tsc -p tsconfig.json --noEmit",
     "prepack": "npm run build:publish"
   },
   "dependencies": {

@@ -433,8 +433,29 @@ test('启动权限不支持只认原生明确拒绝，不把超时、配置损�
   for(const error of [{cause:{code:'ETIMEDOUT',stderr:'unknown nxbridge_bootstrap'}},{cause:{code:1,signal:'SIGTERM',stderr:'invalid default_permissions'}},{cause:{code:1,stderr:'unknown field default_permissions'}},{cause:{code:1,stderr:'invalid config.toml line 5'}},{cause:{code:1,stderr:'TOML parse error: unexpected field default_permissions'}},{cause:{code:1,stderr:'authentication failed'}},new Error('command -c default_permissions failed')])assert.equal(bootstrapPolicyRejected(error),false);
 });
 
+test('恢复已登记路由只读核对用户根会话与分叉，其余路由沿用订阅前核验',async t=>{
+  const f=fixture(t),adapter=new CodexAdapter(f.broker.config,f.broker.home),endpoint=f.store.endpoint(f.x.id)!;
+  t.after(()=>adapter.close());
+  const observed=t.mock.method(adapter,'observe',async()=>{});
+  let guards=0,optionsReads=0;
+  const attachRoute:CodexAdapter['attach']=async(_peer,_endpoint,options)=>{
+    assert.equal(options?.verify,true);options?.prepare?.();return new RpcClient(()=>{},()=>{});
+  };
+  const attach=t.mock.method(adapter,'attach',attachRoute);
+  const options=()=>{optionsReads++;return{verify:true,prepare:()=>{guards++;}};};
+  await adapter.restoreRegisteredRoute({...f.x,owner:'user',kind:'root'},endpoint,options);
+  await adapter.restoreRegisteredRoute({...f.x,owner:'user',kind:'fork'},endpoint,options);
+  assert.equal(observed.mock.callCount(),2);assert.equal(attach.mock.callCount(),0);assert.equal(optionsReads,0);
+  await adapter.restoreRegisteredRoute({...f.x,owner:'nxbridge',kind:'root'},endpoint,options);
+  await adapter.restoreRegisteredRoute({...f.x,owner:'user',kind:'subagent'},endpoint,options);
+  assert.equal(observed.mock.callCount(),2);assert.equal(attach.mock.callCount(),2);
+  assert.equal(optionsReads,2);assert.equal(guards,2);
+});
+
 test('不支持的原生入口保持暂存，入口更新后自动解除旧预检等待并重新核验',async t=>{
   const f=fixture(t,{codexBinary:process.execPath}),home=f.broker.home;f.store.pair(f.c.id,f.x.id);f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'offline'});const endpoint=f.store.endpoint(f.x.id)!;f.store.deactivate(f.x.id);
+  const adapter=new CodexAdapter(f.broker.config,home);t.after(()=>adapter.close());
+  f.codex.bootstrapProbeKey=adapter.bootstrapProbeKey.bind(adapter);
   const selected=selectHostLaunch('codex',f.broker.config,{home,cwd:f.x.cwd,sessionId:f.x.sessionId!,configHome:home}),key=restoreBootstrapKey(selected);
   writeHosting(f.store,f.store.peer(f.x.id),{reason:'bootstrap_policy_unsupported',bootstrapProbeKey:key,nextAt:Number.MAX_SAFE_INTEGER},home);
   let prepares=0;lifecycle(f.broker).prepare=async()=>{prepares++;f.store.saveEndpoint({...endpoint,active:true});f.store.updatePeer(f.x.id,{state:'ready'});};

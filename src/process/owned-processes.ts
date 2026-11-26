@@ -44,6 +44,11 @@ const filename=(record:Pick<OwnedProcessRecord,'home'|'id'>)=>{
 function currentRecord(record:OwnedProcessRecord):OwnedProcessRecord|undefined{
   try{return JSON.parse(readFileSync(filename(record),'utf8'));}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return;throw error;}
 }
+                                  
+function sameStopAuthority(a:OwnedProcessRecord,b:OwnedProcessRecord):boolean{
+  return a.id===b.id&&normalize(a.home)===normalize(b.home)&&a.identity.pid===b.identity.pid&&a.identity.startedAt===b.identity.startedAt&&
+    a.windowsJob===b.windowsJob&&a.posixGroup===b.posixGroup&&a.windowsHolder?.pid===b.windowsHolder?.pid&&a.windowsHolder?.startedAt===b.windowsHolder?.startedAt;
+}
 const prepared=new Map<string,Promise<void>>();
 export async function prepareProcessRegistry(home:string):Promise<void>{
   const root=processRegistryRoot();let work=prepared.get(root);
@@ -180,7 +185,10 @@ export function migrateRetiredCompletions(home:string):void{
 }
                                             
 export async function retireDeadOwnedProcess(record:OwnedProcessRecord,reason='dead-generation',beforeSignal?:()=>void):Promise<void>{
-  if(record.windowsHolder)await stopWindowsProcess(record.windowsHolder,3000,{beforeSignal});
+  const guard=beforeSignal&&(()=>{beforeSignal();const live=currentRecord(record);
+    if(!live||live.releasedToUser||!sameStopAuthority(live,record))throw new BridgeError('process_record_changed','进程的停止权限已经改变，保留进程。');});
+  if(record.windowsHolder)await stopWindowsProcess(record.windowsHolder,3000,{beforeSignal:guard});
+  guard?.();
   forgetOwnedProcess(record,reason);
 }
 export async function ownedRecordState(record:OwnedProcessRecord):Promise<ProcessState>{
@@ -193,31 +201,36 @@ export async function ownedRecordState(record:OwnedProcessRecord):Promise<Proces
   if(record.posixGroup){const state=await ownedGroupState(record.identity);if(state==='dead')completeOwnedContainer(record);return state==='unknown'?unknownContainerState(record):state;}
   return ownedProcessState(record.identity);
 }
-export async function releaseOwnedProcess(record:OwnedProcessRecord):Promise<void>{
+export async function releaseOwnedProcess(record:OwnedProcessRecord,beforeSignal?:()=>void):Promise<void>{
   const current=currentRecord(record);
                                              
   if(!current)return;
                                            
-                                             
-  if(current.id!==record.id||normalize(current.home)!==normalize(record.home)||current.identity.pid!==record.identity.pid||current.identity.startedAt!==record.identity.startedAt||current.windowsJob!==record.windowsJob||current.posixGroup!==record.posixGroup||current.windowsHolder?.pid!==record.windowsHolder?.pid||current.windowsHolder?.startedAt!==record.windowsHolder?.startedAt){
+  if(!sameStopAuthority(current,record)){
     throw new BridgeError('process_record_changed',`进程归属记录已经变化或无法核验，未停止（${record.role}；停止权限已经改变）。`);
   }
   record=current;
   if(record.releasedToUser)throw new BridgeError('process_owned_by_user','该进程已经交给用户窗口，未停止。');
-  if(process.platform==='linux'&&ownedRecordPredatesBoot(record)){completeOwnedContainer(record);await retireDeadOwnedProcess(record,'previous-boot');return;}
-  if((record.windowsJob||record.posixGroup)&&predatesBoot(record)&&await ownedRecordState(record)==='dead'){await retireDeadOwnedProcess(record,'previous-boot');return;}
+  const guard=beforeSignal&&(()=>{
+    beforeSignal();
+    const live=currentRecord(record);
+    if(!live||live.releasedToUser||!sameStopAuthority(live,record))
+      throw new BridgeError('process_record_changed','进程的停止权限已经改变，保留进程。');
+  });
+  if(process.platform==='linux'&&ownedRecordPredatesBoot(record)){guard?.();completeOwnedContainer(record);await retireDeadOwnedProcess(record,'previous-boot',beforeSignal);return;}
+  if((record.windowsJob||record.posixGroup)&&predatesBoot(record)&&await ownedRecordState(record)==='dead'){await retireDeadOwnedProcess(record,'previous-boot',beforeSignal);return;}
   if(record.windowsJob){
-    if(!ownedContainerComplete(record))try{await stopWindowsJob(record.windowsJob,record.identity);completeOwnedContainer(record);}
+    if(!ownedContainerComplete(record))try{await stopWindowsJob(record.windowsJob,record.identity,undefined,guard);completeOwnedContainer(record);}
     catch(error){
       if(!ownedContainerComplete(record)){
-        if((error as {stderr?:string}).stderr?.includes('job_holder_missing')){await stopOwnedProcess(record.identity);throw new BridgeError('process_identity_unknown','Job 持有进程已丢失；只回收登记的精确代次，缺少整组结束凭据，保留记录。');}
+        if((error as {stderr?:string}).stderr?.includes('job_holder_missing')){await stopOwnedProcess(record.identity,{beforeSignal:guard});throw new BridgeError('process_identity_unknown','Job 持有进程已丢失；只回收登记的精确代次，缺少整组结束凭据，保留记录。');}
         throw error;
       }
     }
   }
-  else if(record.posixGroup){if(!ownedContainerComplete(record)){await stopOwnedGroup(record.identity);completeOwnedContainer(record);}}
-  else await stopOwnedProcess(record.identity);
-  await retireDeadOwnedProcess(record,'owned-release');
+  else if(record.posixGroup){if(!ownedContainerComplete(record)){await stopOwnedGroup(record.identity,undefined,guard);completeOwnedContainer(record);}}
+  else await stopOwnedProcess(record.identity,{beforeSignal:guard});
+  await retireDeadOwnedProcess(record,'owned-release',beforeSignal);
 }
 export function transferOwnedPeerToUser(home:string,peerId:string):void{
   for(const record of ownedProcesses(home).records.filter(value=>value.peerId===peerId)){

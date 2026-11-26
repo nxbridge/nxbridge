@@ -1,10 +1,28 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BrokerSession, connectBroker, listenBroker } from '../ipc/ipc.js';
+import { BrokerSession, brokerCall, connectBroker, listenBroker } from '../ipc/ipc.js';
 import { RpcClient } from '../ipc/rpc.js';
 import { registerMcpIdentity } from '../integration/mcp/server.js';
 import {ensureHome} from '../ipc/home.js';
 import { temporary } from './support/temporary.js';
+import {delay} from '../shared/time.js';
+
+test('已接通的问题轮询不受重连截止点截断，原有总截止时间仍生效',async t=>{
+  const home=temporary(t);await ensureHome(home);
+  let now=performance.now(),calls=0;
+  t.mock.method(performance,'now',()=>now);
+  const server=await listenBroker(home,async()=>{
+    calls++;now+=1000;
+    await delay(100);
+    return{status:'pending'};
+  });
+  t.after(server.close);
+  await assert.rejects(brokerCall('question.wait',{}, {home,start:false,connectionDeadline:now-1}),{code:'timeout'});
+  assert.equal(calls,0,'连接期限已到不能再连接');
+  assert.deepEqual(await brokerCall('question.wait',{}, {home,start:false,connectionDeadline:now+50}),{status:'pending'});
+  await assert.rejects(brokerCall('question.wait',{}, {home,start:false,connectionDeadline:now+5000,deadline:now+30}),{code:'timeout'});
+  assert.equal(calls,2);
+});
 
 test('长驻前端并行调用共用一条连接，断线恢复后不重放结果未知的写入',async t=>{
   const home=temporary(t);await ensureHome(home);let opens=0,writes=0,entered!:()=>void;

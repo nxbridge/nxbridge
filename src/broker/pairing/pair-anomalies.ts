@@ -16,6 +16,7 @@ import { diagnosisAdvice, partnerRestartAdvice } from '../../app/commands/agent-
 import { daemonDelivery } from '../delivery/delivery-guidance.js';
 import { mergeObservedFields, type FieldObservation } from '../../storage/observed-fields.js';
 import { modStaleNotice, MOD_STALE_NOTICE_MS } from '../../integration/mod/mod-reload.js';
+import {memberEnabled} from '../member-control.js';
 
 export interface IntegrationEvidence {
   nativeHookDurations?:{event:string;durationMs:number}[];
@@ -26,7 +27,9 @@ export interface IntegrationEvidence {
   currentModAt?:number;
   hookTimeouts?:{count:number;firstAt:number;lastAt:number;limitSeconds?:number};hookTrustIssue?:HookTrustIssue;
   wakeQueueError?:string;pickup?:{exhausted?:boolean;attempts:number;error?:string;anchor?:string;scope?:string};
-  subagentHold?:{batchId:string;reason:string};
+  subagentHold?:{batchId:string;reason:string;
+                                                                                
+    observing?:true};
                                                                     
   failedTurnId?:string;
 }
@@ -56,7 +59,7 @@ export function pairIssues(value:PairObservation):PairIssue[]{
                                                             
   const failedTurn=()=>{if(health?.state==='failed'&&!value.questionPending)add('turn_failed',`${peer.host} turn ${health.turnId} failed${health.error?': '+health.error:''}`,JSON.stringify([peer.id,health.turnId]),true);};
   if(value.pair.archived||endpoint?.pendingContext)return issues;
-  if(peer.host==='codex'&&integration.subagentHold)add('subagent_completion_held','Codex 的子代理已做完，尚未确认主线程接着处理（'+integration.subagentHold.reason+'）；请在原 Codex 窗口继续或查看 nxbridge status/doctor；不要重跑子代理',integration.subagentHold.batchId);
+  if(peer.host==='codex'&&integration.subagentHold&&!integration.subagentHold.observing)add('subagent_completion_held','Codex 的子代理已做完，尚未确认主线程接着处理（'+integration.subagentHold.reason+'）；请在原 Codex 窗口继续或查看 nxbridge status/doctor；不要重跑子代理',integration.subagentHold.batchId);
                                                                
                                                 
   if(peer.state==='offline'){if(endpoint)failedTurn();return issues;}
@@ -177,6 +180,12 @@ const FLAP_MS=120_000;
 const DEPENDENCY_MS=5*60_000,QUIET_MS=15*60_000,DELIVERY_STUCK_MS=3*60_000;
 export class PairAnomalies {
   constructor(private store:Store,private notices:DeliveryHealth,private version:string,private resources?:ResourceHealth,private home?:string){}
+  async reconcileAtStartup():Promise<void>{
+    for(const pair of this.store.pairs())for(const id of [pair.claude,pair.codex])await this.store.faults.run('startup_integration:'+id,()=>{
+      const peer=this.store.getPeer(id);
+      if(peer&&memberEnabled(this.store,peer))this.integration(this.store.peer(id),{});
+    });
+  }
   private scope(peer:Peer):string{return JSON.stringify([peer.sessionId,this.store.bindings.current(peer.id)?.epoch]);}
   private currentEvidence(peer:Peer,scope=this.scope(peer)):IntegrationEvidence{
     const value=this.store.setting<IntegrationEvidence>('integration:'+peer.id);

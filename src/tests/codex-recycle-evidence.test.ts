@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import type { CodexThread } from '../hosts/codex/adapter.js';
-import { observeCodexThreadIdentity } from '../hosts/codex/codex-evidence.js';
-import { collectCodexRecycleEvidence, planExactCodexRecycle, readCodexRecycleScope, readCodexRecycleThreadWork } from '../hosts/codex/codex-recycle.js';
+import { catalogCodexThreads, observeCodexThreadIdentity } from '../hosts/codex/codex-evidence.js';
+import { codexRecycleRuntimeGeneration, collectCodexRecycleEvidence, inspectCodexRecycleOld, planExactCodexRecycle, readCodexRecycleScope, readCodexRecycleThreadWork } from '../hosts/codex/codex-recycle.js';
+import { managedMarker } from '../install/installation.js';
+import { saveManagedRuntime, type ManagedRuntime } from '../hosts/managed-runtimes.js';
 import type { Endpoint, Peer } from '../types.js';
 import { readSessionProfile, verifyCodexResumeAck, withPersistedCodexPermission, type SessionProfile } from '../hosts/codex/codex-session-profile.js';
 import { RpcClient, type RpcMessage } from '../ipc/rpc.js';
@@ -23,6 +26,14 @@ function inspector(loaded:string[],rows:CodexThread[]) {
   },()=>{},'mock');
   return {rpc,requests};
 }
+
+test('PID 已由不同代次占用时确认旧后台已退出，不触碰当前进程',async t=>{
+  const home=temporary(t),runtime:ManagedRuntime={id:randomUUID(),endpoint:'ws://127.0.0.1:12345',pid:process.pid,procStart:'1',owner:managedMarker(home),
+    kind:'owned',state:'ready',configHome:home,dedicated:true,createdAt:Date.now()};
+  saveManagedRuntime(home,runtime);
+  assert.equal(await inspectCodexRecycleOld(home,codexRecycleRuntimeGeneration(runtime)),'dead');
+  assert.equal(process.kill(process.pid,0),true);
+});
 const root={id:'root',cwd:tmpdir()};
 const child={id:'child',cwd:tmpdir(),source:{subAgent:{spawn:{parentThreadId:'parent'}}}};
 const parent={id:'parent',cwd:tmpdir(),parentThreadId:root.id};
@@ -52,6 +63,19 @@ test('独立目录覆盖间接父链且不查询有问题的线程控制队列',
   assert.deepEqual([...scope.loaded],['root','child']);
   assert.deepEqual([...scope.threads.keys()],['root','child','parent']);
   assert.deepEqual(requests.map(request=>request.method),['thread/loaded/list','thread/list','thread/list']);
+});
+
+test('独立范围使用原生状态目录，不触发大历史修补，普通查询仍保留修补模式',async()=>{
+  const rpc=new RpcClient(request=>queueMicrotask(()=>{
+    if(request.method==='thread/list'&&request.params.useStateDbOnly!==true){
+      rpc.receive({id:request.id,error:{code:'timeout',message:'JSONL 大历史修补未能在查询期限内完成'}});return;
+    }
+    rpc.receive({id:request.id,result:{data:request.method==='thread/loaded/list'?['root','child']:[root,parent,child]}});
+  }),()=>{},'mock');
+  assert.deepEqual([...(await readCodexRecycleScope(rpc,root.id)).threads.keys()],['root','child','parent']);
+  const ordinary=inspector([],[root]);
+  assert.equal((await catalogCodexThreads(ordinary.rpc,new Set([root.id]))).get(root.id)?.id,root.id);
+  assert.equal(ordinary.requests[0]!.params.useStateDbOnly,undefined);
 });
 
 test('目录缺少已加载线程或父辈时保留原进程，连接缓存不能补齐原生证据',async()=>{

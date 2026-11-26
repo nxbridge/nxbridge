@@ -1,24 +1,103 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { writeFileSync,appendFileSync } from 'node:fs';
-import { readCodexHistory } from '../hosts/codex/codex-history.js';
+import fs, { writeFileSync,appendFileSync } from 'node:fs';
+import promises from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
+import { catchUpCodexHistory, readCodexHistory } from '../hosts/codex/codex-history.js';
+import { readCodexTurnEvidence } from '../hosts/codex/codex-turn-evidence.js';
 import { temporary } from './support/temporary.js';
+
+test('真实轮换即使大小、时间和取整文件编号相同，也不能沿用旧回执、轮次和检查点',async t=>{
+  const dir=temporary(t),file=path.join(dir,'current.jsonl'),next=path.join(dir,'next.jsonl'),sessionId='rotated',time=new Date('2026-11-26T00:00:00Z');
+  const rollout=(prefix:string)=>[
+    {type:'session_meta',payload:{id:sessionId}},
+    {timestamp:time.toISOString(),type:'event_msg',payload:{type:'task_started',turn_id:prefix+'-turn'}},
+    {type:'response_item',payload:{type:'function_call',name:'receive_messages',namespace:'claude',call_id:prefix+'-call'}},
+    {type:'response_item',payload:{type:'function_call_output',call_id:prefix+'-call',output:{messages:[{message_id:prefix+'-msg'}]}}},
+    {timestamp:time.toISOString(),type:'event_msg',payload:{type:'task_complete',turn_id:prefix+'-turn'}},
+  ].map(row=>JSON.stringify(row)).join('\n')+'\n{"type":';
+  for(const [name,prefix] of [[file,'old'],[next,'new']] as const){writeFileSync(name,rollout(prefix));fs.utimesSync(name,time,time);}
+  const {statSync,fstatSync}=fs,{open}=promises;
+  const a=statSync(file,{bigint:true}),b=statSync(next,{bigint:true});
+  assert.notEqual(a.ino,b.ino);assert.equal(a.size,b.size);assert.equal(a.mtimeNs,b.mtimeNs);
+  let oldInode=11n,newInode=12n,beginRead:(()=>void)|undefined,resumeRead:Promise<void>|undefined;
+  const alias=(value:fs.BigIntStats|fs.Stats|undefined)=>{
+    if(!value)return;
+    const candidates=[[a.ino,oldInode],[b.ino,newInode]] as const;
+    const inode=candidates.find(([id])=>typeof value.ino==='bigint'?id===value.ino:Number(id)===value.ino)?.[1];
+    return inode===undefined?value:Object.assign(value,{ino:typeof value.ino==='bigint'?inode:Number(inode)});
+  };
+  const statMock=t.mock.method(fs,'statSync',((file:fs.PathLike,options?:fs.StatOptions)=>alias(statSync(file,options))) as typeof fs.statSync);
+  const fstatMock=t.mock.method(fs,'fstatSync',((fd:number,options?:fs.StatOptions)=>alias(fstatSync(fd,options))) as typeof fs.fstatSync);
+  const openMock=t.mock.method(promises,'open',async(file:fs.PathLike,flags?:string|number,mode?:fs.Mode)=>{
+    const handle=await open(file,flags,mode),stat=handle.stat.bind(handle),read=handle.read.bind(handle);
+    handle.stat=(async (options?:fs.StatOptions)=>alias(await stat(options))) as typeof handle.stat;
+    handle.read=(async (...args:unknown[])=>{
+      if(beginRead){const notify=beginRead,wait=resumeRead;beginRead=undefined;notify();await wait;}
+      return Reflect.apply(read,handle,args);
+    }) as typeof handle.read;
+    return handle;
+  });
+  syncBuiltinESMExports();
+  try{
+    const initial=await readCodexHistory(file,sessionId),safe=initial.cursor!;
+    assert.ok(safe);
+    const legacy={dev:safe.dev,ino:safe.ino,offset:safe.offset};
+    assert.equal((await readCodexHistory(file,sessionId,{cursor:legacy})).status,'supported');
+    oldInode=2n**63n;newInode=oldInode+1n;
+    assert.equal(fs.statSync(file).ino,fs.statSync(next).ino);
+    const old=await readCodexHistory(file,sessionId,{checkpoint:true});
+    assert.deepEqual(old.receipts.map(value=>value.messageId),['old-msg']);
+    const saved=JSON.parse(JSON.stringify(old.checkpoint!)) as NonNullable<typeof old.checkpoint>;
+    assert.equal(saved.cursor.exactIno,oldInode.toString());
+    const rounded={dev:saved.cursor.dev,ino:saved.cursor.ino,offset:saved.cursor.offset};
+    assert.equal((await readCodexHistory(file,sessionId,{cursor:rounded})).status,'unavailable');
+    assert.equal((await readCodexTurnEvidence(file,sessionId)).latestTurnId,'old-turn');
+
+    let entered!:()=>void,release!:()=>void;
+    const seen=new Promise<void>(resolve=>{entered=resolve;});
+    const resume=new Promise<void>(resolve=>{release=resolve;});
+    const later=new Date(time.getTime()+1000);
+    fs.utimesSync(file,later,later);fs.utimesSync(next,later,later);
+    beginRead=entered;resumeRead=resume;
+    const oldTurn=readCodexTurnEvidence(file,sessionId);
+    try{
+      await Promise.race([seen,oldTurn.then(()=>assert.fail('未开始读取已打开的旧文件'))]);
+      const oldHistory=readCodexHistory(file,sessionId);
+      fs.renameSync(file,path.join(dir,'previous.jsonl'));fs.renameSync(next,file);
+      const newTurn=readCodexTurnEvidence(file,sessionId);
+      release();
+      const refreshed=await readCodexHistory(file,sessionId);
+      assert.deepEqual(refreshed.receipts.map(value=>value.messageId),['new-msg']);
+      assert.deepEqual((await oldHistory).receipts,[]);
+      assert.equal((await oldTurn).status,'unavailable');
+      assert.equal((await newTurn).latestTurnId,'new-turn');
+    }finally{release();await oldTurn;}
+    assert.equal((await readCodexHistory(file,sessionId,{checkpoint:true,resume:saved})).status,'unavailable');
+  }finally{statMock.mock.restore();fstatMock.mock.restore();openMock.mock.restore();syncBuiltinESMExports();}
+});
 
 test('冷启动按未确认消息时间有界回看尾部，仍要求同会话唯一有序调用对',async t=>{
   const file=path.join(temporary(t),'recent.jsonl'),base=Date.parse('2026-11-10T00:00:00Z'),row=(n:number,payload:unknown,type='response_item')=>({timestamp:new Date(base+n).toISOString(),type,payload});
   const call=(id:string)=>({type:'function_call',name:'receive_messages',namespace:'claude',call_id:id}),output=(id:string)=>({type:'function_call_output',call_id:id,output:JSON.stringify({messages:[{message_id:id}]})});
-  writeFileSync(file,[row(0,{id:'recent'},'session_meta'),row(1,call('old')),row(2,output('old')),row(3,{type:'task_started'},'event_msg'),row(5,call('new')),row(6,output('new')),row(7,output('orphan'))].map(value=>JSON.stringify(value)).join('\n')+'\n','utf8');
+  writeFileSync(file,[row(0,{id:'recent'},'session_meta'),row(1,call('old')),row(2,output('old')),row(3,{type:'task_started',turn_id:'anchored'},'event_msg'),row(4,call('new')),row(5,{type:'reasoning'}),row(6,output('new')),row(7,output('orphan'))].map(value=>JSON.stringify(value)).join('\n')+'\n','utf8');
   assert.deepEqual((await readCodexHistory(file,'recent',{tail:true})).receipts,[]);
-  const recent=await readCodexHistory(file,'recent',{since:base+4});assert.equal(recent.status,'supported');assert.deepEqual(recent.receipts.map(receipt=>receipt.messageId),['new']);
-  appendFileSync(file,JSON.stringify(row(8,call('new')))+'\n','utf8');assert.deepEqual((await readCodexHistory(file,'recent',{since:base+4})).receipts,[],'重复调用不能证明唯一进入上下文');
+  const recent=await readCodexHistory(file,'recent',{since:base+6});assert.equal(recent.status,'supported');assert.deepEqual(recent.receipts.map(receipt=>[receipt.messageId,receipt.turnId]),[['new','anchored']]);
+  appendFileSync(file,JSON.stringify(row(8,call('new')))+'\n','utf8');assert.deepEqual((await readCodexHistory(file,'recent',{since:base+6})).receipts,[],'重复调用不能证明唯一进入上下文');
   assert.equal((await readCodexHistory(file,'other',{since:base+4})).status,'unsupported');
 });
 
-test('冷启动回看不扫描整份大历史，窗口外及不完整调用对继续保留未知',async t=>{
+test('冷启动回看分批越过大行，核验随后追加的完整回执',async t=>{
   const file=path.join(temporary(t),'recent-large.jsonl'),meta={type:'session_meta',payload:{id:'recent-large'}},call=(id:string)=>({type:'response_item',payload:{type:'function_call',name:'receive_messages',namespace:'claude',call_id:id}}),output=(id:string)=>({type:'response_item',payload:{type:'function_call_output',call_id:id,output:JSON.stringify({messages:[{message_id:id}]})}});
   writeFileSync(file,[meta,call('outside'),output('outside'),call('partial'),{type:'event_msg',payload:{type:'agent_message',message:'x'.repeat(10*1024*1024)}},output('partial'),call('inside'),output('inside')].map(value=>JSON.stringify(value)).join('\n')+'\n','utf8');
-  const result=await readCodexHistory(file,'recent-large',{since:0});assert.equal(result.status,'supported');assert.deepEqual(result.receipts.map(receipt=>receipt.messageId),['inside']);assert.ok(result.bytesRead!<1024*1024);
+  const first=await readCodexHistory(file,'recent-large',{since:0});assert.equal(first.status,'supported');assert.equal(first.complete,false);
+  assert.deepEqual(first.receipts,[]);assert.ok(first.bytesRead!<=8*1024*1024);
+  let result=first;
+  for(let i=0;i<12&&!result.complete;i++){
+    result=await readCodexHistory(file,'recent-large',{since:0});assert.ok(result.bytesRead!<=8*1024*1024);
+  }
+  assert.equal(result.complete,true);assert.deepEqual(result.receipts.map(receipt=>receipt.messageId),['outside','partial','inside']);
   assert.equal((await readCodexHistory(file,'recent-large',{since:0})).bytesRead,0,'相同时间边界继续增量读取，不反复回看历史');
 });
 
@@ -38,6 +117,57 @@ test('超大普通工具输出可跳过，超大 nxbridge 回执不能证明缺�
     let result=await readCodexHistory(file,'tool');for(let i=0;i<20&&!result.complete&&result.status==='supported';i++)result=await readCodexHistory(file,'tool');
     assert.equal(result.status,own?'unsupported':'supported');assert.equal(result.complete,!own);
   }
+});
+
+test('超大回执的尾行在补上换行前保持待写，完整后才报告超出格式预算',async t=>{
+  const file=path.join(temporary(t),'live-overflow.jsonl'),id='live-overflow';
+  const meta={type:'session_meta',payload:{id}},output={type:'response_item',payload:{type:'function_call_output',call_id:'nxbridge-own',output:'x'.repeat(5*1024*1024)}};
+  writeFileSync(file,JSON.stringify(meta)+'\n'+JSON.stringify(output));
+  const preview=await readCodexHistory(file,id,{since:0});assert.equal(preview.complete,false);assert.deepEqual(preview.receipts,[]);
+  let result=await readCodexHistory(file,id);
+  for(let i=0;i<20&&result.bytesRead;i++)result=await readCodexHistory(file,id);
+  assert.equal(result.status,'supported');assert.equal(result.complete,false);
+  appendFileSync(file,'\n');
+  assert.equal((await readCodexHistory(file,id)).status,'unsupported');
+});
+
+test('按时间补证跨越旧回执后的长输出，轮换或同文件重写后从新历史核验',async t=>{
+  const file=path.join(temporary(t),'since-reopen.jsonl'),id='since-reopen',since=Date.parse('2026-11-26T10:00:00Z');
+  const write=(label:string,filler:number)=>{
+    const rows=[
+      {type:'session_meta',payload:{id}},
+      {type:'event_msg',payload:{type:'task_started',turn_id:label}},
+      {type:'response_item',payload:{type:'function_call',name:'receive_messages',namespace:'claude',call_id:label}},
+      {type:'response_item',payload:{type:'function_call_output',call_id:label,output:JSON.stringify({messages:[{message_id:label}]})}},
+      {type:'event_msg',payload:{type:'task_started',turn_id:'same-clock-turn'}},
+    ].map(row=>JSON.stringify({timestamp:new Date(since).toISOString(),...row})).join('\n')+'\n';
+    const line=JSON.stringify({type:'event_msg',payload:{type:'agent_reasoning',text:label+'x'.repeat(1024)}})+'\n';
+    writeFileSync(file,rows+line.repeat(filler),'utf8');
+  };
+  write('first',4800);
+  assert.deepEqual((await catchUpCodexHistory(file,id,since)).receipts.map(item=>item.messageId),['first']);
+  assert.equal((await readCodexHistory(file,id,{since})).bytesRead,0);
+  write('rewritten',5300);
+  assert.deepEqual((await catchUpCodexHistory(file,id,since)).receipts.map(item=>item.messageId),['rewritten']);
+  fs.renameSync(file,file+'.old');write('rotated',6000);
+  assert.deepEqual((await catchUpCodexHistory(file,id,since)).receipts.map(item=>item.messageId),['rotated']);
+});
+
+test('回收补证无法及时定位早先轮次时，尾部正向回执仍可用但不能证明缺席',async t=>{
+  const file=path.join(temporary(t),'suffix-receipt.jsonl'),id='suffix-receipt';
+  const append=(rows:unknown[])=>appendFileSync(file,rows.map(value=>JSON.stringify(value)+'\n').join(''),'utf8');
+  append([{type:'session_meta',payload:{id}},{type:'event_msg',payload:{type:'task_started',turn_id:'old'},timestamp:'2026-11-26T10:00:00Z'},
+    {type:'response_item',payload:{type:'function_call',name:'receive_messages',namespace:'claude',call_id:'outside'}},
+    {type:'response_item',payload:{type:'function_call_output',call_id:'outside',output:{messages:[{message_id:'outside-budget'}]}}}]);
+  const text='a'.repeat(1024*1024);
+  for(let chunk=0;chunk<34;chunk++)append([{type:'event_msg',payload:{type:'agent_reasoning',text}}]);
+  append([
+    {type:'response_item',payload:{type:'function_call',name:'receive_messages',namespace:'claude',call_id:'latest'}},
+    {type:'response_item',payload:{type:'function_call_output',call_id:'latest',output:{messages:[{message_id:'received'}]}}},
+  ]);
+  const result=await catchUpCodexHistory(file,id,Date.parse('2026-11-26T10:05:00Z'));
+  assert.deepEqual(result.receipts.map(value=>value.messageId),['received']);
+  assert.equal(result.complete,false);assert.equal(result.cursor,undefined);
 });
 
 test('旧版修复扫描检查点保留跨批调用配对，缓存被释放后仍可继续验证',async t=>{

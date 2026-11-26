@@ -15,7 +15,7 @@
                                                                                                         
                                                                                
                                                                                          
-                                                          
+                                                                                    
                                                                            
                                                                                                 
 
@@ -139,6 +139,23 @@ export function staleRevisionResult(f:{oldRevision:string;newRevision:string;cha
   const what=f.changes.map(c=>staleAi[c]).join('; ')||'facts changed';
   return`not applied: facts changed since revision ${f.oldRevision} (${what}). Now: ${workAi(f.work,f.subagents)}; ${progressAi(f.progress,f.now)}${f.held?`; ${f.held} msg${f.held>1?'s':''} held`:''}. Still want it -> recycle again w/ evidence_revision=${f.newRevision}; else wait.`;
 }
+                                                                                
+                                                       
+export function recycleAcceptanceQueuedResult(f:{revision:string}):string{
+  return`accepted for evidence_revision=${f.revision}; nothing stopped yet: it runs on the next stable look with this same revision; if facts change you get a new notice instead and this acceptance lapses.`;
+}
+                                                                                                    
+                                                       
+export function recycleAcceptanceLapsedNotice(f:{peerName:string;peerHost:Host;revision:string;held:number}):string{
+  return`nxbridge: your recycle acceptance for ${peerLabel(f.peerHost,f.peerName)} (evidence_revision=${f.revision}) lapsed: its state couldn't be verified in time; nothing was stopped; ${f.held} msg${f.held===1?'':'s'} held. Still want it -> accept the revision in the next notice.`;
+}
+                                                 
+export type EvidenceSource='catalog'|'history'|'process'|'profile'|'rollout';
+const evidenceSourceUser:Record<EvidenceSource,string>={catalog:'会话列表',history:'会话历史',process:'进程情况',profile:'原来的设置',rollout:'会话记录'};
+export function evidenceUnverifiedReason(source:EvidenceSource|string,detail?:string):string{
+  const name=(evidenceSourceUser as Record<string,string>)[source]??source,clean=detail?.replace(/[。．.；;，,\s]+$/,'');
+  return`没法核验${name}${clean?`：${clean}`:''}`;
+}
                                                                               
 export function recycleRefusedResult(reason:string):string{
   return`not applied: ${reason}. Session kept as is; msgs stay held; nothing replayed. Don't retry this incident; tell the user only if it blocks their task.`;
@@ -158,7 +175,7 @@ export function recycleDoneNotice(f:RecycleDoneFields):string{
   const who=peerLabel(f.peerHost,f.peerName),by=f.by==='auto'?'auto-recycled while idle':f.by==='partner'?'recycled on your request':'recycled on the user\'s request';
   const was=f.work==='active_turn'?'Its running turn was cut; unsaved work lost.':f.work==='unknown_work'?'No active turn seen, but unconfirmed work may have been cut.':'It was idle; nothing was cut.';
   const parts=[`nxbridge: ${who} recovered (same session ${f.sessionId.slice(0,8)}, ${by}). ${was}${f.delivered?` ${f.delivered} held msg${f.delivered>1?'s':''} delivered.`:''} Nothing replayed.`];
-  if(f.uncertainIds.length)parts.push(`These msgs of yours may not have reached it and won't be resent: ${f.uncertainIds.join(', ')}. Still needed -> resend (nxref:msg:<id> avoids retyping).`);
+  if(f.uncertainIds.length)parts.push(`Delivery of these msgs of yours couldn't be confirmed (not resent): ${f.uncertainIds.join(', ')}. Before repeating one, check whether it already acted on it (ask it, or check its history); resend only what's missing (nxref:msg:<id> avoids retyping).`);
   if(f.work==='active_turn')parts.push('Cut work still needed -> send a new instruction; it won\'t resume on its own.');
   else if(f.work==='unknown_work')parts.push('If such work mattered -> check its history/output; it won\'t resume on its own.');
   else if(!f.uncertainIds.length)parts.push('No action needed.');
@@ -174,7 +191,12 @@ export function recycleHeldNotice(f:{peerName:string;peerHost:Host;stage:Recycle
                                                                                          
                                                                                                      
 
-                                           
+                                                                                                        
+                                                                  
+export function recycleStopFailedPendingNotice(f:{peerName:string;peerHost:Host;held:number}):string{
+  return`nxbridge: ending ${peerLabel(f.peerHost,f.peerName)} didn't finish: its old process was still alive at the deadline; nothing relaunched; ${f.held} msg${f.held===1?'':'s'} held; nothing replayed. Its facts are still settling; a retry command follows once they're stable. Nothing to do yet.`;
+}
+                                                    
 export function recycleStopFailedNotice(f:{peerName:string;peerHost:Host;recipientHost:Host;held:number;incidentId:string;revision:string}):string{
   return`nxbridge: ending ${peerLabel(f.peerHost,f.peerName)} didn't finish: its old process was still alive at the deadline; nothing relaunched; ${f.held} msg${f.held===1?'':'s'} held; nothing replayed. Try once more (may cut whatever it is running) -> ${tool(f.recipientHost)} action=recycle incident_id=${f.incidentId} evidence_revision=${f.revision} reason=<why>; else keep waiting.`;
 }
@@ -227,9 +249,13 @@ export interface StuckUserFields {
   leftover?:number;reclaiming?:boolean;
                        
   suspend?:SuspendReason;
+                                         
+  retryPending?:boolean;
 }
                                                                           
-export function stuckUserLine(kind:StuckUserKind,f:StuckUserFields):string{
+export function stuckUserLine(kind:StuckUserKind,f0:StuckUserFields):string{
+                                  
+  const f={...f0,...(f0.reasonText?{reasonText:f0.reasonText.replace(/[。．.；;，,\s]+$/,'')}:{})};
   const who=userPeer(f.peerHost,f.peerName),at=clock(f.since),when=at?`${at} `:'',why=`（${triggerUser[f.trigger]}）`,cut=cutUser(f.work);
   if(kind==='auto_recovered')return`${who}${when}卡住了${why}，当时没在干活，nxbridge 已自动结束它并按原会话恢复`;
   if(kind==='partner_recovered'){
@@ -241,7 +267,7 @@ export function stuckUserLine(kind:StuckUserKind,f:StuckUserFields):string{
     return`已按你的要求结束卡住的${who}并按原会话恢复，${f.work==='active_turn'?'它正在做的那一轮中断了':'如果当时还有工作在跑，可能被一起中断了'}`;
   }
   if(kind==='held')return`${who}卡住了${why}，恢复停在「${stageUser[f.stage??'preflight']}」${f.reasonText?`：${f.reasonText}`:''}；还没动它，消息也保留着${f.userStep?`。${f.userStep}`:''}`;
-  if(kind==='stop_failed')return`结束卡住的${who}没成功：到时限旧进程还在；没有重新启动，消息保留着${f.userStep?`。要再试一次（可能中断它正在做的事）：${f.userStep}`:''}`;
+  if(kind==='stop_failed')return`结束卡住的${who}没成功：到时限旧进程还在；没有重新启动，消息保留着${f.userStep?`。要再试一次（可能中断它正在做的事）：${f.userStep}`:f.retryPending?'；情况还在变化，稳定后会给出再试一次的命令':''}`;
   if(kind==='authority_lost')return`${who}的恢复已停止：${lossReasonUser[f.loss??'unpaired']}；${oldUser[f.old??'unknown']}，nxbridge 不再接着恢复`;
   if(kind==='cleanup_blocked'){
     if(f.reclaiming)return`卡住的${who}旧进程已经结束，正在清理它启动的程序，清理完按原会话重新启动`;

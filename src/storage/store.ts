@@ -492,5 +492,10 @@ export class Store {
     this.event('message.state',{messageId:id,state,evidence,error},[message.from,message.to]);
     if(state==='contextObserved'||state==='responded')this.onDeliveryObserved?.({...message,state,updatedAt:Date.now()});
   }
+                                        
+  interruptedDeliverySnapshot():{pairs:readonly Pair[];sending:ReadonlyMap<string,number>}{
+    const pairs=this.pairs(),sending=new Map(pairs.flatMap(pair=>[pair.codex,pair.claude].map(id=>[id,this.deliveryCounts(pair.id,id).sending] as const)));
+    return{pairs,sending};
+  }
   recover(): void {for(const row of statement(this.db,"SELECT id,sender,recipient FROM messages WHERE state='sending'").all())this.faults.sync('message_recover:'+row.id,()=>this.transaction(()=>{if(memberEnabled(this,this.peer(row.sender as string))&&memberEnabled(this,this.peer(row.recipient as string)))this.transition(row.id as string,'unknown',undefined,'协调器在提交确认完成前退出，需要核对目标历史');}));}
 }

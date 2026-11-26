@@ -15,15 +15,12 @@ import {type ManagedConflict,clearManagedConflict} from '../recovery/managed-con
 import {reconcileManagedCodexConflict} from '../../hosts/managed-registration.js';
 import {claudeAutoHolds,claudeAutoKey,observeClaudeAuto,type ClaudeAutoFallback} from '../../hosts/claude/claude-auto-mode.js';
 import {claudeChild,childCall,childHandoff,type ClaudeChildRecord} from '../../hosts/claude/claude-child.js';
-import {nativeOwnership} from '../../process/owned-native.js';
+import {nativeOwnership,nativeOwnershipRecords} from '../../process/owned-native.js';
 import {ownedProcesses} from '../../process/owned-processes.js';
 import {probeProcesses,liveProcess} from '../../process/process.js';
 import {runtimeFor} from '../../hosts/managed-runtimes.js';
-import {codexUserWindow} from '../../hosts/codex/codex-lineage.js';
 import {partnerConfigHome} from '../pairing/pair-restore.js';
-import {selectHostLaunch} from '../../hosts/host-launch.js';
 import {launchInputFingerprint,parkLaunchFailure} from '../../hosts/launch-park.js';
-import {restoreBootstrapKey} from '../../hosts/codex/codex-isolation.js';
 import {nativeProfileEffort} from '../../integration/mod/mod-protocol.js';
 import {memberEnabled,requireMemberEnabled} from '../member-control.js';
 import {BridgeError,RuntimeRecoveryHold,describeError} from '../../shared/errors.js';
@@ -37,6 +34,7 @@ import {CodexRecycleControl} from '../recovery/codex-recycle-control.js';
 import type {CodexRecycleAcceptance} from '../recovery/codex-recycle.js';
 import type {OwnedCodexRoute} from '../../hosts/codex/codex-owned-routes.js';
 import {codexSocketAlias} from '../../ipc/unix-socket.js';
+import type {RetirementRecord} from '../recovery/retirement-state.js';
 
 interface LifecycleEnvironment {readonly store:Store;readonly config:BridgeConfig;readonly adapters:Adapters;readonly home:string;}
 interface LifecycleServices {
@@ -98,6 +96,7 @@ export class BrokerLifecycleCoordinator {
   isPreparing(id:string):boolean{return this.preparing.has(id);}
   isRestarting(id:string):boolean{return this.restarting.has(id)||this.codexRecycle.fenced(id);}
   isRetiring(id:string):boolean{return this.retiring.has(id);}
+  blocksDeliveryActivation(id:string):boolean{return this.isRestarting(id)||this.isRetiring(id)||!!this.environment.store.setting('managedSessionConflict:'+id);}
   isRestoring(id:string):boolean{return this.restoringMembers.has(id);}
   preparation(id:string):Promise<void>|undefined{return this.preparing.get(id);}
   recoveryWork(id:string):Promise<boolean>|undefined{return this.memberRecoveries.get(id);}
@@ -114,6 +113,24 @@ export class BrokerLifecycleCoordinator {
   clearRetryDelay(id:string):void{this.retryAt.delete(id);this.recoveryAt.delete(id);}
   clearBackoff(id:string):void{this.clearRetryDelay(id);this.recoveryFailures.delete(id);}
   launchInputsChanged(id?:string):void{if(id===undefined)this.parkChecks.clear();else this.parkChecks.delete(id);}
+
+  async reconcileMembersAtStartup(runtimeEndpoint:(id:string)=>Endpoint|undefined):Promise<void>{
+    const {store,adapters}=this.environment;
+    for(const peer of store.peers())await this.pumpStage('startup_member:'+peer.id,()=>{
+      if(!this.enabled(peer.id))adapters[peer.host].setEnabled?.(peer,runtimeEndpoint(peer.id),false);
+      if(peer.host==='codex')this.codexRecycle.reconcileFinishedProfile(peer.id);
+    });
+  }
+
+  async reconcileRetirementsAtStartup():Promise<void>{
+    const {store,home}=this.environment;
+    await this.pumpStage('startup_retirements',()=>{
+      const pending=this.retirements();
+      const ids=new Set([...ownedProcesses(home).records.map(value=>value.peerId),...nativeOwnershipRecords(home).map(value=>value.peerId)]);
+      for(const peer of store.peers())if(peer.owner==='nxbridge'&&!store.pairFor(peer.id)&&ids.has(peer.id))pending[peer.id]??={attempts:0,nextAt:0};
+      this.saveRetirements(pending);
+    });
+  }
 
   ownedCodexRoute(id:string):OwnedCodexRoute|undefined{
     if(this.hooks.stopped())return;
@@ -187,7 +204,7 @@ export class BrokerLifecycleCoordinator {
         }
       }else if(peer.host==='codex'){
         const attach=async(endpoint:Endpoint)=>{
-          try{if(codexUserWindow(peer))await adapters.codex.observe(peer,endpoint);else await adapters.codex.attach(peer,endpoint,{verify:hostingRecord(store,peer)?.phase==='adopting',prepare:guard});}
+          try{await adapters.codex.restoreRegisteredRoute(peer,endpoint,()=>({verify:hostingRecord(store,peer)?.phase==='adopting',prepare:guard}));}
           catch(error){
             const runtime=runtimeFor(this.environment.home,{endpoint:endpoint.address})?.value;
             if(error instanceof RuntimeRecoveryHold||!(error instanceof BridgeError)||error.code!=='policy_verification_incomplete'||peer.owner!=='nxbridge'||!runtime?.dedicated||runtime.peerId!==peer.id||runtime.sessionVerification?.sessionId!==peer.sessionId)throw error;
@@ -302,7 +319,7 @@ export class BrokerLifecycleCoordinator {
     }
     if(peer.host==='codex'&&hosting?.reason==='bootstrap_policy_unsupported'&&hosting.bootstrapProbeKey){
       const proof=store.setting<ManagedIncident['proof']&{sessionId:string}>('managedLaunchProof:'+peer.id);
-      try{const selected=selectHostLaunch('codex',this.environment.config,{home:this.environment.home,sessionId:peer.sessionId!,cwd:peer.cwd,configHome:hosting.configHome,...(proof?.executable?{executable:proof.executable,profileId:proof.profileId}:{})});if(restoreBootstrapKey(selected)!==hosting.bootstrapProbeKey){writeHosting(store,peer,{reason:undefined,userStep:undefined,bootstrapProbeKey:undefined,nextAt:undefined});this.recoveryAt.delete(peer.id);}}catch{                              }
+      try{const key=this.environment.adapters.codex.bootstrapProbeKey(peer,hosting.configHome,proof);if(key!==hosting.bootstrapProbeKey){writeHosting(store,peer,{reason:undefined,userStep:undefined,bootstrapProbeKey:undefined,nextAt:undefined});this.recoveryAt.delete(peer.id);}}catch{                              }
     }
     if((this.recoveryAt.get(peer.id)??0)>Date.now()||(hostingRecord(store,peer)?.nextAt??0)>Date.now())return false;
     let incident:ManagedIncident|undefined;
@@ -783,12 +800,24 @@ export class BrokerLifecycleCoordinator {
     if(proof?.phase!=='bound'||proof.releasedToUser||proof.sessionId!==peer.sessionId)return;
     this.environment.store.setSetting('managedLaunchProof:'+id,{sessionId:peer.sessionId,nativeLaunchId:proof.id,configHome:proof.configHome,executable:proof.executable,profileId:proof.profileId,version:proof.hostVersion});
   }
+  retirements():Record<string,RetirementRecord>{return this.environment.store.setting<Record<string,RetirementRecord>>('processRetirements')??{};}
+  private saveRetirements(pending:Record<string,RetirementRecord>):void{this.environment.store.setSetting('processRetirements',pending);}
+  cancelRetirements(ids:readonly string[]):void{
+    const pending=this.retirements();for(const id of ids)delete pending[id];this.saveRetirements(pending);
+  }
+  resetRetirement(id:string):void{
+    const pending=this.retirements();pending[id]={attempts:0,nextAt:0};this.saveRetirements(pending);
+  }
+  scheduleDueRetirements():void{
+    const due=Object.entries(this.retirements()).filter(([id,value])=>value.nextAt<=Date.now()&&this.enabled(id)).map(([id])=>id);
+    if(due.length)this.background('retirements',()=>this.releaseOwned(due));
+  }
   queueRetirements(ids:string[]):string[]{
     const {store}=this.environment;
-    const pending=store.setting<Record<string,{attempts:number;nextAt:number;error?:string}>>('processRetirements')??{};
+    const pending=this.retirements();
     const release=ids.filter(id=>store.peer(id).owner==='nxbridge'&&!store.pairFor(id));
     for(const id of release)pending[id]??={attempts:0,nextAt:0};
-    store.setSetting('processRetirements',pending);return release;
+    this.saveRetirements(pending);return release;
   }
   async releaseOwned(ids:string[]):Promise<string[]>{
     return(await Promise.all([...new Set(ids)].map(id=>{
@@ -804,8 +833,14 @@ export class BrokerLifecycleCoordinator {
       while(this.restarting.has(id))await delay(20);
       const pair=store.pairFor(id),peer=store.peer(id);
       let failure:unknown;
+      const guard=()=>{
+        const current=store.getPeer(id);
+        if(!current||current.owner!=='nxbridge'||current.sessionId!==peer.sessionId||!memberEnabled(store,current)||store.pairFor(id)||
+          store.bindings.current(id)||this.services.takeovers.get(id))
+          throw new BridgeError('retirement_authority_changed','成员归属已变化，保留后台。');
+      };
       try{
-        if(peer.owner!=='nxbridge'||pair)return[];
+        if(peer.owner!=='nxbridge'||pair||!memberEnabled(store,peer))return[];
         if(this.services.takeovers.get(id))throw new BridgeError('foreground_active','接管窗口仍存活，未回收后台。');
         const ep=store.endpoint(id)??store.endpoints(id).filter(value=>value.mode==='app-server').sort((a,b)=>b.seenAt-a.seenAt)[0];
         this.rememberManagedLaunch(id);
@@ -814,20 +849,43 @@ export class BrokerLifecycleCoordinator {
           if(auto?.source&&proof&&proof.id!==auto.source.id){if(!proof.sessionId&&proof.handle){await adapters.claude.manualCopyRegistration(peer);proof=nativeOwnership(this.environment.home,id);}await adapters.claude.release({...peer,sessionId:proof?.sessionId??peer.sessionId});}
           else await adapters.claude.release(peer);
           if(auto)store.setSetting(claudeAutoKey(id),{...auto,phase:'resolved'});
-        }else if(ep)await adapters.codex.release(peer,ep);
+        }else{
+          guard();if(ep)await adapters.codex.release(peer,ep,guard);guard();
+        }
         store.deactivate(id);store.updatePeer(id,{state:'offline'});
         if(peer.host==='codex'){
           const references=store.peers().filter(value=>(value.owner==='user'||!!store.pairFor(value.id))&&!(value.host==='codex'&&value.kind==='subagent')).flatMap(value=>store.endpoints(value.id));
-          const note=await adapters.codex.releaseRuntime(references,ep?.address,[peer]);
+          const note=await adapters.codex.releaseRuntime(references,ep?.address,[peer],{guard,runtimeId:ep?.runtimeId});
           if(note)throw new BridgeError('runtime_release_pending',note);
+          const stage=this.services.managedRecovery.get(peer.id)?.recycle,paused=stage?.phase==='held'?stage.paused:stage;
+          const replacement=paused?.phase==='verifying'?paused.fresh:paused?.phase==='retiring'?paused.verification.fresh:undefined;
+          if(replacement&&ep&&replacement.runtimeId!==ep.runtimeId){
+            const target={id:replacement.runtimeId};
+            const guardReplacement=()=>{
+              guard();
+              const runtime=runtimeFor(this.environment.home,target)?.value;
+              if(store.endpoints().some(route=>route.active&&route.address===replacement.endpoint)||
+                runtime?.kind!=='owned'||!runtime.dedicated||runtime.peerId!==id||runtime.sessionId!==peer.sessionId||runtime.endpoint!==replacement.endpoint||
+                runtime.pid!==replacement.pid||runtime.procStart!==replacement.procStart||runtime.bootId!==replacement.bootId)
+                throw new BridgeError('retirement_authority_changed','替代后台归属已变化，保留后台。');
+            };
+            if(runtimeFor(this.environment.home,target)){
+              guardReplacement();
+              const held=await adapters.codex.releaseRuntime(references,replacement.endpoint,[peer],{runtimeId:replacement.runtimeId,guard:guardReplacement});
+              if(held)throw new BridgeError('runtime_release_pending',held);
+            }
+          }
         }
-      }catch(error){failure=error;}
+      }catch(error){if(!(error instanceof BridgeError)||error.code!=='retirement_authority_changed')failure=error;}
       finally{
                                                  
-        const pending=store.setting<Record<string,{attempts:number;nextAt:number;error?:string}>>('processRetirements')??{};
-        if(failure){const attempts=(pending[id]?.attempts??0)+1,wait=[0,30000,120000][attempts]??120000,exhausted=attempts>=3||(failure as BridgeError).code==='claude_release_unresolved';pending[id]={attempts,nextAt:exhausted?Number.MAX_SAFE_INTEGER:Date.now()+wait,error:describeError(failure)};store.event('release.failed',{peerId:id,retryInMs:exhausted?null:wait,exhausted,error:describeError(failure)});}
-        else delete pending[id];
-        store.setSetting('processRetirements',pending);
+        const pending=this.retirements();
+        const current=store.getPeer(id),disabled=current?.owner==='nxbridge'&&current.sessionId===peer.sessionId&&!store.pairFor(id)&&!memberEnabled(store,current);
+        if(!disabled){
+          if(failure){const attempts=(pending[id]?.attempts??0)+1,wait=[0,30000,120000][attempts]??120000,exhausted=attempts>=3||(failure as BridgeError).code==='claude_release_unresolved';pending[id]={attempts,nextAt:exhausted?Number.MAX_SAFE_INTEGER:Date.now()+wait,error:describeError(failure)};store.event('release.failed',{peerId:id,retryInMs:exhausted?null:wait,exhausted,error:describeError(failure)});}
+          else delete pending[id];
+          this.saveRetirements(pending);
+        }
       }
       return failure?[`${peer.name} 回收未完成：${describeError(failure)}`]:[];
   }

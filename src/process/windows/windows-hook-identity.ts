@@ -109,8 +109,9 @@ export async function readWindowsJobMembers(job:string,root:{pid:number;startedA
   const {stdout}=await execute(helper,['job-members',job,String(root.pid),root.startedAt],{windowsHide:true,timeout:Math.max(1,Math.floor(remaining)),maxBuffer:16*1024*1024});return JSON.parse(stdout);
 }
 
-export async function stopWindowsJob(job:string,root:{pid:number;startedAt:string},timeout=5000):Promise<void>{
+export async function stopWindowsJob(job:string,root:{pid:number;startedAt:string},timeout=5000,beforeSignal?:()=>void):Promise<void>{
   const helper=await windowsHookIdentityHelper(identityHome());
+  beforeSignal?.();
   try{
     const {stdout}=await execute(helper,['job-stop',job,String(root.pid),root.startedAt,String(timeout)],{windowsHide:true,timeout:timeout+2000});
     if(JSON.parse(stdout)==='pending')throw new BridgeError('process_stop_pending','自有 Job 尚未退出，保留归属记录。');

@@ -1,5 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import {type Pair,type Peer} from '../../types.js';
+import type {Store} from '../../storage/store.js';
 import {HealthNoticePolicy,noticeCanWake,noticeTier} from './notice-policy.js';
 import {type RuntimeAvailability,type DeliveryCounts,unsettledCount,type RuntimeNotice,type HealthStorage,deliveryHealthKey} from './contracts.js';
 import {missingClaudeInboxModelText,missingCodexSocketModelText} from './runtime-incidents.js';
@@ -11,6 +12,10 @@ const waitingIdle=(notice:RuntimeNotice)=>(notice.source==='idle_unanswered'||no
 export class DeliveryHealth {
   private policy:HealthNoticePolicy;
   constructor(private storage:HealthStorage){this.policy=new HealthNoticePolicy(storage);}
+  async reconcileAtStartup(store:Pick<Store,'faults'|'peer'|'deliveryCounts'|'unsettledDeliveryFacts'>,snapshot:ReturnType<Store['interruptedDeliverySnapshot']>):Promise<void>{
+    for(const pair of snapshot.pairs)for(const id of [pair.codex,pair.claude])await store.faults.run('startup_delivery:'+id,()=>
+      this.restarted(pair,store.peer(id),store.deliveryCounts(pair.id,id),store.unsettledDeliveryFacts(pair.id,id),snapshot.sending.get(id)??0));
+  }
   enqueue(pairId:string,recipientId:string,notice:RuntimeNotice):void{
     this.storage.transaction(()=>{
       if(this.policy.sameFact(recipientId,notice))return;
