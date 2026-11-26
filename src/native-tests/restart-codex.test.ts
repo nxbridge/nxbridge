@@ -340,11 +340,13 @@ await server.connect(new StdioServerTransport());
   t.diagnostic(JSON.stringify({automatic:acceptedRevision===undefined,loadedOriginal:true,sameSession:true,
     scope:recycleStatus?.recycle?.work?.unattested??[],originalSource:recycleStatus?.recycle?.original_source?.lineage}));
   if(process.platform==='darwin'&&named){
-    const source=store.endpoint(peer.id)!,target=codexSocketAlias(source.address.slice(7));
+                                      
+    const source=recycled,survivingRpc=await codex.connect(source.address),target=codexSocketAlias(source.address.slice(7));
+    assert.notEqual(survivingRpc,restored);
     unlinkSync(target);
     assert.equal(codexSocketTargetMissing(source.address.slice(7)),true);
     await assert.rejects(connectAppServer(source.address,config,undefined,home,{readOnly:true}),{code:'ENOENT'});
-    assert.equal((await restored.request('thread/read',{threadId:peer.sessionId,includeTurns:false})).thread.id,peer.sessionId);
+    assert.equal((await survivingRpc.request('thread/read',{threadId:peer.sessionId,includeTurns:false})).thread.id,peer.sessionId);
     let stopClaims=0;
     const repair=await(async()=>{
       for(let attempt=1;;attempt++)try{
