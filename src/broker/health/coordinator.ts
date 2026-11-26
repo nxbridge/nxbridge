@@ -38,10 +38,10 @@ import {ManagedRecovery} from '../recovery/managed-recovery.js';
 import {hostingGate,hostingStatus} from '../recovery/session-hosting.js';
 import {readSessionProfile,sessionFile} from '../../hosts/codex/codex-session-profile.js';
 import type {Adapters} from '../coordinator.js';
-import type {CodexFinalForwards} from '../codex-final-forwards.js';
+import type {TurnEndCoordinator} from '../turn-end.js';
 
 interface HealthEnvironment {readonly store:Store;readonly config:BridgeConfig;readonly adapters:Adapters;readonly home:string;readonly resources?:ResourceHealth;}
-interface HealthServices {readonly incidents:RuntimeIncidents;readonly deliveryHealth:DeliveryHealth;readonly communicationTips:CommunicationTips;readonly pairAnomalies:PairAnomalies;readonly idleNotices:IdleNotices;readonly profiles:PartnerProfiles;readonly foregroundHealth:ForegroundHealth;readonly managedRecovery:ManagedRecovery;readonly health:TurnHealthTracker;readonly codexDirect:CodexDirectDelivery;readonly daemons:CodexDaemons;readonly questions:Questions;readonly finalForwards:CodexFinalForwards;}
+interface HealthServices {readonly incidents:RuntimeIncidents;readonly deliveryHealth:DeliveryHealth;readonly communicationTips:CommunicationTips;readonly pairAnomalies:PairAnomalies;readonly idleNotices:IdleNotices;readonly profiles:PartnerProfiles;readonly foregroundHealth:ForegroundHealth;readonly managedRecovery:ManagedRecovery;readonly health:TurnHealthTracker;readonly codexDirect:CodexDirectDelivery;readonly daemons:CodexDaemons;readonly questions:Questions;readonly turnEnds:TurnEndCoordinator;}
 interface HealthHooks {
  stopped():boolean;
  actor(input:Actor):Peer;
@@ -133,7 +133,7 @@ export class BrokerHealthCoordinator {
   refreshNoticeConditions(pair:Pair,site:string):void{
     const {store}=this.environment;
       if(!this.hooks.enabled(pair.claude)||!this.hooks.enabled(pair.codex))return;
-      this.services.finalForwards.refresh(pair);
+      this.services.turnEnds.refresh(pair);
       const stages=[...new Set(store.faults.status().filter(value=>value.degraded).map(value=>value.stage.split(':')[0]!))].sort(),key='brokerDegraded:'+pair.id;
       let degraded=store.setting<{id:string}>(key);
       if(stages.length){if(!degraded){degraded={id:randomUUID()};store.setSetting(key,degraded);}}
@@ -184,10 +184,10 @@ export class BrokerHealthCoordinator {
 
   admitNotices(pair:Pair,sender:Peer,selected:RuntimeNotice[],scope:string,requireWake=false,readyBoundary=false):RuntimeNotice[]{
       return this.environment.store.transaction(()=>selected.flatMap(n=>{
-        const allowReady=sender.host==='claude'&&readyBoundary&&this.services.finalForwards.ready(pair,true);
+        const allowReady=readyBoundary&&this.services.turnEnds.ready(pair,true);
         const prepared=this.services.deliveryHealth.prepare(pair.id,sender.id,n.id,scope,false,requireWake,allowReady);
         if(prepared){
-          this.services.finalForwards.admitted(pair,prepared);
+          this.services.turnEnds.admitted(pair,prepared);
           const key='turnHealthIncident:'+pair.id,value=this.environment.store.setting<{id:string;alertAdmitted?:boolean}>(key);
           if(value&&prepared.componentIds?.includes(value.id)){value.alertAdmitted=true;this.environment.store.setSetting(key,value);}
         }
@@ -334,8 +334,16 @@ export class BrokerHealthCoordinator {
       const target=store.peer(pair[otherHost(peer.host)]),endpoint=store.endpoint(target.id);if(!endpoint||!target.sessionId||['paused','needsHuman','offline'].includes(target.state))return'pending';
       if(!this.hooks.ownedClaudeLaunchReady(target)||this.services.profiles.blocks(target))return'pending';
       const actor:Actor={host:target.host,memberId:target.id,sessionId:target.sessionId,callId:randomUUID(),...(store.bindings.current(target.id)?{binding:{key:store.bindings.current(target.id)!.key,epoch:store.bindings.current(target.id)!.epoch}}:{})};
-      let admitted=false;
-      const delivery:DeliveryMessage={id,pairId,from:peer.id,to:target.id,body:message,inReplyTo:null,via:null,callId:id,state:'accepted',createdAt:Date.now(),updatedAt:Date.now(),evidence:null,error:null,attempts:1,notice:true,...(source?{noticeSource:source}:{}),beforeSubmit:async()=>{const fresh=(await this.prepareNotices(actor,[id],true,true))[0];if(!fresh||this.services.profiles.blocks(store.peer(target.id)))return false;admitted=true;delivery.body=fresh.message;return true;}};
+      let admitted=false,finished=false;
+      const unsubmitted=(notice:RuntimeNotice)=>store.transaction(()=>this.services.turnEnds.notSubmitted(target,this.services.deliveryHealth.outcome(pairId,target.id,notice.id,'pending')));
+      const delivery:DeliveryMessage={id,pairId,from:peer.id,to:target.id,body:message,inReplyTo:null,via:null,callId:id,state:'accepted',createdAt:Date.now(),updatedAt:Date.now(),evidence:null,error:null,attempts:1,notice:true,...(source?{noticeSource:source}:{}),beforeSubmit:async deadline=>{
+        const fresh=(await this.prepareNotices(actor,[id],true,true,true))[0];if(!fresh)return false;
+        const completionId=fresh.interventionIds?.[0]??fresh.interventionId;
+        if(finished||deadline!==undefined&&performance.now()>=deadline||this.services.profiles.blocks(store.peer(target.id))||completionId&&!this.services.turnEnds.reservedReady(pair,completionId)){
+          if(completionId)unsubmitted(fresh);return false;
+        }
+        admitted=true;delivery.body=fresh.message;return true;
+      }};
                                       
       try{
         if(endpoint.daemon){await this.hooks.signalCodexWake(target,endpoint);return'pending';}
@@ -349,13 +357,18 @@ export class BrokerHealthCoordinator {
         }
         const result=await this.environment.adapters.claude.deliver(target,endpoint,delivery,peer);
         store.event('health.notice',{noticeId:id,peerId:target.id,state:result.state});
-        const outcome=result.state==='expired'?'denied':result.state==='unknown'?'unknown':'submitted';
-        if(admitted)this.services.deliveryHealth.outcome(pairId,target.id,id,outcome);
+        const outcome=result.state==='expired'&&source==='background_completed'?'pending':result.state==='expired'?'denied':result.state==='unknown'?'unknown':'submitted';
+        if(admitted){const notices=this.services.deliveryHealth.outcome(pairId,target.id,id,outcome);if(outcome==='pending')this.services.turnEnds.notSubmitted(target,notices);}
         return outcome;
       }catch(error){
         store.event('health.notice.unknown',{noticeId:id,peerId:target.id,error:describeError(error)});
-        const outcome=error instanceof DeliveryError&&!error.uncertain?'pending':'unknown';if(admitted)this.services.deliveryHealth.outcome(pairId,target.id,id,outcome);return outcome;
-      }
+        const outcome=error instanceof DeliveryError&&!error.uncertain?'pending':'unknown';
+        if(admitted)store.transaction(()=>{
+          const notices=this.services.deliveryHealth.outcome(pairId,target.id,id,outcome);
+          if(outcome==='pending')this.services.turnEnds.notSubmitted(target,notices);
+        });
+        return outcome;
+      }finally{finished=true;}
     }
 
   async checkDeliveryHealth():Promise<void>{
@@ -374,7 +387,7 @@ export class BrokerHealthCoordinator {
         if(!endpoint||sender.host==='claude'&&endpoint.questionSupport||['paused','needsHuman','offline'].includes(sender.state))return;
         if(endpoint.mode==='embedded'&&sender.state!=='ready')return;
                                              
-        for(const notice of this.services.deliveryHealth.peek(pair.id,id).filter(n=>n.wake===true)){
+        for(const notice of this.services.deliveryHealth.peek(pair.id,id).filter(n=>n.wake===true&&(!n.readyOnly||this.services.turnEnds.ready(pair)))){
           await this.healthNotice(pair.id,partner,notice.id,notice.message,notice.source);
         }
       })));

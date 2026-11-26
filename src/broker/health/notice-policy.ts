@@ -35,14 +35,16 @@ export class HealthNoticePolicy {
   sameFact(recipient:string,notice:RuntimeNotice):boolean{return notice.factKey!==undefined&&this.state(recipient)?.kinds[notice.kind??notice.source??'runtime']?.factKey===notice.factKey;}
   eligible(recipient:string,notice:RuntimeNotice,now=Date.now()):boolean{
     if(noticeTier(notice)<3)return false;
+    const retry=notice.source==='background_completed'&&notice.retryBeforeSubmit===true;
     const state=this.state(recipient);
     const last=state?.kinds[notice.kind??notice.source??'runtime'];
-    if(notice.factKey!==undefined&&last?.factKey===notice.factKey)return false;
+    if(!retry&&notice.factKey!==undefined&&last?.factKey===notice.factKey)return false;
                                           
     if(notice.kind==='explicit_recovery')return true;
     if(state&&now-state.lastAt<HEALTH_NOTICE_INTERVAL_MS)return false;
-                                               
-    if(notice.source==='codex_final'&&notice.factKey!==undefined)return true;
+    if(retry)return true;
+                                   
+    if(notice.source==='background_completed'&&notice.factKey!==undefined)return true;
     if(notice.source==='managed_recovery'&&notice.recovery?.wake===true)return true;
     if(notice.phase==='recovery')return true;
     return !last||now-last.at>=HEALTH_NOTICE_REPEAT_MS||(notice.severity??1)>last.severity;

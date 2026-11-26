@@ -21,6 +21,18 @@ test('429 失败后的 systemError 仍可注入新消息并续跑；回执和正
   await run();await run();assert.equal(f.store.message(message.id).state,'contextObserved');assert.equal(f.store.message(message.id).attempts,1);assert.equal(f.codex.injected.length,1);assert.equal(f.codex.woken.length,1);
 });
 
+test('完成通知注入前明确失败才释放预约，成功回执后绑定唯一续跑轮次',async t=>{
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),endpoint=f.store.endpoint(f.x.id)!,notice={...f.store.accept(pair,f.c,'完成状态事实','notice-fixture'),notice:true};
+  const delivery=new CodexDirectDelivery(f.store,f.codex),notSubmitted:string[]=[],observed:string[]=[],continued:string[]=[];
+  let offered=true;
+  const run=()=>delivery.deliver(f.x,endpoint,offered?[notice]:[],async m=>JSON.stringify({messages:[],notices:[{notice_id:m.id,message:m.body}]}),()=>true,
+    receipt=>observed.push(receipt.messageId),()=>true,turnId=>continued.push(turnId),id=>notSubmitted.push(id));
+  f.codex.fail=new DeliveryError('not-written','隔离的提交前失败',false);await assert.rejects(run(),{code:'not-written'});
+  assert.deepEqual(notSubmitted,[notice.id]);assert.deepEqual(observed,[]);assert.deepEqual(continued,[]);
+  f.codex.fail=undefined;await run();offered=false;await run();assert.deepEqual(observed,[notice.id]);assert.deepEqual(continued,['injection-turn-1']);
+  assert.equal(f.codex.injected.length,1);assert.equal(f.codex.woken.length,1);
+});
+
 test('协调器在取件后冷启动，按实际持久调用对补证旧 unknown，不重投也不误结算无回执消息',async t=>{
   const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),home=temporary(t),file=path.join(home,'cold-receipt.jsonl'),message=f.store.accept(pair,f.c,'重启前已取件','cold-receipt'),unseen=f.store.accept(pair,f.c,'没有原生回执','no-receipt');
   for(const value of [message,unseen]){f.store.claim(value.id);f.store.transition(value.id,'unknown');}

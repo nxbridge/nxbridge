@@ -23,6 +23,15 @@ export const nativeDecisionSchema=z.object({bash:z.enum(['allow','ask','deny']),
 export const nativeSessionSchema=z.object({transcriptPath:z.string().min(1).max(4096).optional(),interactive:z.boolean().optional()});
 export type NativeDecision=z.infer<typeof nativeDecisionSchema>;
 
+const turnId=z.string().min(1).max(256),at=z.number().finite().nonnegative(),count=z.number().int().safe().nonnegative();
+export const claudeTurnStatsSchema=z.object({startedAt:at,covered:z.boolean(),actions:count,workTools:count,lastWorkAt:at.optional(),
+  partnerDriven:z.boolean().optional(),partnerMessageIds:z.array(z.string().min(1).max(128)).max(16).optional()}).strict();
+export const claudeTurnBackgroundSchema=z.object({tasks:count.optional(),crons:count.optional()}).strict();
+export const claudeTurnStopSchema=z.object({turn_id:turnId,stop_hook_active:z.boolean(),stats:claudeTurnStatsSchema,background:claudeTurnBackgroundSchema,deadline_at:at.optional()}).strict();
+export const claudeTurnCompletedSchema=z.object({turn_id:turnId,completed_at:at,stats:claudeTurnStatsSchema,background:claudeTurnBackgroundSchema,
+  interventions:z.array(z.object({id:z.string().min(1).max(128),inert:z.boolean()}).strict()).max(16)}).strict();
+export const claudeHumanPromptSchema=z.object({human_origin:z.enum(['composer','desktop','vscode']),human_turn_id:turnId,human_input_at:at}).strict();
+
                                             
 export const modContextSchema=z.object({
   sessionId:z.string(),inbox:z.string().min(1),cwd:z.string().optional(),

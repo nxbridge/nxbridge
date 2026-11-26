@@ -12,15 +12,6 @@ export async function observeAutoDecision($,attributes){
   return context;
 }
                                                         
-export async function observeStop($,event){
-  if(event.agent_id||event.agent_transcript_path)return;
-  const context=await captureContext($);
-  if(event.session_id!==context.sessionId)return;
-  const count=value=>Array.isArray(value)?value.length:undefined,tasks=count(event.background_tasks),crons=count(event.session_crons);
-  context.nativeBackground={...(tasks!==undefined?{tasks}:{}),...(crons!==undefined?{crons}:{}),observedAt:Date.now()};
-  return context;
-}
-                                                        
                                                                                                      
 const short80=v=>typeof v==='string'&&v?v.slice(0,80):undefined;
 export function autoModeText(h){

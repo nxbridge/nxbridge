@@ -1,7 +1,7 @@
 import { writeTransport, clearWrite } from './mod-read.js';
 
                                                        
-const operations=new Set(['state','prompt','register','recovery','observe','tip-agent','tip-sync','ref-capture']);
+const operations=new Set(['state','prompt','register','recovery','observe','tip-agent','tip-sync','ref-capture','turn-stop-check','turn-completed']);
 const bytes=value=>new TextEncoder().encode(value);
 const json=value=>JSON.stringify(value).replace(/[^\x00-\x7f]/g,char=>'\\u'+char.charCodeAt(0).toString(16).padStart(4,'0'));
                                                    
@@ -25,17 +25,24 @@ async function exchange($,transport,body,budget){
 export async function smallWrite($,context,input){
   const transport=writeTransport(context);
   if(!transport||!operations.has(input.operation)||context.contextStart!==false)return{handled:false};
+  const deadline=input.operation==='turn-stop-check'&&input.stop_hook_active===false?input.deadline_at:undefined;
+  const budget=maximum=>{
+    if(deadline===undefined)return maximum;
+    const remaining=deadline-Date.now();
+    if(remaining<=0)throw Error('Stop check deadline elapsed');
+    return Math.min(maximum,remaining);
+  };
   let nonce,ticket;
                                                
   try{
     const length=bytes(json(input)).length;if(length>2*1024*1024-256)return{handled:false};
     nonce=Array.from(crypto.getRandomValues(new Uint8Array(32)),value=>value.toString(16).padStart(2,'0')).join('');
-    const ready=await exchange($,transport,{phase:'prepare',nonce,operation:input.operation,bytes:length},2000);
+    const ready=await exchange($,transport,{phase:'prepare',nonce,operation:input.operation,bytes:length},budget(2000));
     if(ready.status!==200||ready.ready!==true||typeof ready.ticket!=='string'||!/^[a-f0-9]{64}$/.test(ready.ticket))throw Error('Mod write unavailable');
     ticket=ready.ticket;
   }catch{clearWrite(context,transport);return{handled:false};}
   let result;
-  try{result=await exchange($,transport,{phase:'commit',nonce,ticket,input},9000);}
+  try{result=await exchange($,transport,{phase:'commit',nonce,ticket,input},budget(input.operation==='turn-stop-check'||input.operation==='turn-completed'?4500:9000));}
   catch(error){clearWrite(context,transport);throw Object.assign(error,{uncertain:true,model_message:'connection lost or confirmation timeout; outcome unknown, may have applied; check delivery before retry; resend may duplicate'});}
   if(result.admitted===false){clearWrite(context,transport);return{handled:false};}
   if(result.error)throw Object.assign(new Error(result.error.message),result.error,{model_message:result.error.message});

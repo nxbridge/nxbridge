@@ -175,10 +175,12 @@ export function unpackContext(value,context){
 }
                                                                                                  
 const LONG_OPERATIONS=new Set(['send','selection-resolve','selection-commit','partner-profile']);
-async function processCall($,operation,context,input){
+async function processCall($,operation,context,input,deadline){
   const data=JSON.stringify({operation,...context,...(modVersion?{mod_version:modVersion}:{}),...(modRevision?{mod_revision:modRevision}:{}),...input});
+  const timeoutMs=deadline!==undefined?deadline-Date.now():LONG_OPERATIONS.has(operation)?135_000:operation==='turn-stop-check'||operation==='turn-completed'?6_000:undefined;
+  if(timeoutMs!==undefined&&timeoutMs<=0)throw Error('Stop check deadline elapsed');
                                            
-  const result=await $.process.run(['node','--no-warnings',$.plugin.root+'/bridge.cjs','mod',operation==='send'?'-':data],{...(LONG_OPERATIONS.has(operation)?{timeoutMs:135_000}:{}),...(operation==='send'?{stdin:data}:{})});
+  const result=await $.process.run(['node','--no-warnings',$.plugin.root+'/bridge.cjs','mod',operation==='send'?'-':data],{...(timeoutMs!==undefined?{timeoutMs}:{}),...(operation==='send'?{stdin:data}:{})});
   if(result.exitCode!==0){
     let detail;try{detail=JSON.parse(result.stderr.trim());}catch{}
                           
@@ -206,17 +208,26 @@ export async function call($,operation,payload={}){
     try{const value=await pending;noteOff(operation,value);return value;}
     finally{if(lifecycleCalls.get(context)===pending)lifecycleCalls.delete(context);}
   }
-  const value=await callInner($,operation,payload);noteOff(operation,value);return value;
+  const deadline=operation==='turn-stop-check'&&payload.stop_hook_active===false?payload.deadline_at:undefined;
+  let value;
+  if(deadline!==undefined){
+    const remaining=deadline-Date.now(),stop=new AbortController();
+    if(remaining<=0)throw Error('Stop check deadline elapsed');
+    try{value=await Promise.race([callInner($,operation,payload),$.clock.sleep(remaining,{signal:stop.signal}).then(()=>{throw Error('Stop check deadline elapsed');})]);}
+    finally{stop.abort();}
+  }else value=await callInner($,operation,payload);
+  noteOff(operation,value);return value;
 }
 async function callInner($,operation,payload){
   const {context:provided,...input}=payload,context=provided??await captureContext($);
-  const state=await prepareRead($,context,()=>processCall($,'control-open',context,{}));
+  const deadline=operation==='turn-stop-check'&&input.stop_hook_active===false?input.deadline_at:undefined;
+  const state=await prepareRead($,context,()=>processCall($,'control-open',context,{},deadline));
   if(operation==='send'&&(await captureContext($))!==context)throw Object.assign(new Error('origin context changed; message not sent'),{code:'session_changed',uncertain:false});
   const credential=state.credential;
   const sent=diagnostics;
   const extra={...input,...(sent?{mod_diagnostics:sent}:{}),...(credential&&(operation==='monitor'||!state.transport&&['register','context-start','status'].includes(operation))?{read_credential:credential}:{})};
   const fast=await smallWrite($,context,{operation,...context,...(modVersion?{mod_version:modVersion}:{}),...(modRevision?{mod_revision:modRevision}:{}),...extra});
-  const value=fast.handled?fast.value:await processCall($,operation,context,extra);
+  const value=fast.handled?fast.value:await processCall($,operation,context,extra,deadline);
   if(sent&&diagnostics===sent)diagnostics=undefined;
   const result=unpackContext(value,context);
   if(operation==='register'||operation==='context-start')publishing.set(context,{...publishing.get(context),owned:result?.owner==='nxbridge'});

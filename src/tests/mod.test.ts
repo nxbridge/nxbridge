@@ -4,10 +4,11 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {PACKAGE_ROOT} from '../shared/package-location.js';
 import { spawnSync } from 'node:child_process';
+import {setTimeout as sleep} from 'node:timers/promises';
 import { RUNTIME_NOTICE_SUMMARY } from '../broker/health/runtime-notice-delivery.js';
 import { fixture } from './support/broker-fixture.js';
 
-async function harness(options:{deferPrompts?:boolean;noticeTurnId?:string;noticeBody?:string}={}){
+async function harness(options:{deferPrompts?:boolean;noticeTurnId?:string;noticeBody?:string;startNoticeBeforeReceipt?:boolean}={}){
   let lastSelection:any;const timeouts=new Map<string,number|undefined>();
   const handlers:{event:string;filter:any;run:Function;recover?:Function}[]=[],checks:any[]=[],calls:any[]=[],nativeCalls:any[]=[],statuses:(string|undefined)[]=[],toasts:string[]=[],ticks:Function[]=[],prompts:any[]=[],appends:any[]=[];
   const mod=await import(pathToFileURL(path.join(PACKAGE_ROOT,'plugins/claude/hooks/register.js')).href);
@@ -16,7 +17,7 @@ async function harness(options:{deferPrompts?:boolean;noticeTurnId?:string;notic
   let failure:string|undefined,waitResult:any={status:'needs_user'},nativeResult:any={result:{answers:{问题:'用户'}}},sessionId='session',uiFailure:Error|undefined;
   const responses:Record<string,unknown>={},errors:Record<string,string>={};
   const queuedPrompts:any[]=[],commandRuns:any[]=[],deferred:Function[]=[];
-  const consumePrompt=(input:any)=>input.skipHooks?(prompts.push(input),Promise.resolve({text:input.text})):run('prompt.submit',{...input,origin:input.origin??{kind:'plugin',name:'nxbridge'}},async(e:any)=>{const stored=input.isMeta&&!input.turnId?{...e,text:input.text}:e;prompts.push(stored);return responses.prompt??{text:stored.text,context:stored.context,origin:stored.origin};});
+  const consumePrompt=(input:any)=>input.skipHooks?(prompts.push(input),Promise.resolve({text:input.text})):run('prompt.submit',{...input,origin:input.origin??{kind:'plugin',name:'nxbridge'}},async(e:any)=>{const stored=input.isMeta&&!input.turnId?{...e,text:input.text}:e;prompts.push(stored);if(options.startNoticeBeforeReceipt)await run('turn.start',{turnId:'wake',text:stored.text});return responses.prompt??{text:stored.text,context:stored.context,origin:stored.origin};});
   const $={
     settings:{read:async(args:any)=>{const all=(responses.settings??{}) as Record<string,any>;if(args?.source)return all[args.source]??{};if(args?.key)return all.merged?.[args.key];return all.merged??{};}},
     session:{id:async()=>sessionId,model:async()=>{const model=(responses as any)['session-model'];if(model instanceof Error)throw model;return model;},cwd:async()=>'/project',surfaces:async()=>(responses.surfaces as string[]|undefined)??[],usage:async()=>{const usage=(responses as any)['session-usage'];if(usage instanceof Error)throw usage;return usage??{context:{window:1000000}};},messages:async()=>responses.messages??[],append:async(input:unknown)=>{appends.push(input);return{};}},env:{get:async(name?:string)=>name==='CLAUDE_CODE_EFFORT_LEVEL'?(responses as any)['effort-env']:'/tmp/inbox'},plugin:{root:'/plugin'},
@@ -28,7 +29,7 @@ async function harness(options:{deferPrompts?:boolean;noticeTurnId?:string;notic
       if(uiFailure)throw uiFailure;
       if(result.deny)throw Error(result.deny);
       return result.result?.answers?.[question]??'';
-    }},clock:{every:(_ms:number,fn:Function)=>ticks.push(fn),after:(_ms:number,fn:Function)=>{deferred.push(fn);return{cancel:()=>{const index=deferred.indexOf(fn);if(index>=0)deferred.splice(index,1);}};}},
+    }},clock:{sleep:(ms:number,options:{signal:AbortSignal})=>sleep(ms,undefined,options),every:(_ms:number,fn:Function)=>ticks.push(fn),after:(_ms:number,fn:Function)=>{deferred.push(fn);return{cancel:()=>{const index=deferred.indexOf(fn);if(index>=0)deferred.splice(index,1);}};}},
     process:{run:async(args:string[],processOptions?:{stdin?:string;timeoutMs?:number})=>{
       const input=JSON.parse(processOptions?.stdin??args.at(-1)!);calls.push(input);timeouts.set(input.operation,processOptions?.timeoutMs);
       const stderr=errors[input.operation]??failure;
@@ -37,7 +38,7 @@ async function harness(options:{deferPrompts?:boolean;noticeTurnId?:string;notic
         const pending={text:`<cross-session-message from-name="nxbridge runtime monitor (nxbridge:claude)">\n[nxbridge system_notice source=runtime_monitor notice_id=${input.notice_id}]\n${options.noticeBody??RUNTIME_NOTICE_SUMMARY}\n</cross-session-message>`,origin:{kind:'peer'},isMeta:true,...(options.noticeTurnId?{turnId:options.noticeTurnId}:{})};
         if(options.deferPrompts)queuedPrompts.push(pending);else await consumePrompt(pending);response={queued:true};
       }
-      const value=stderr?undefined:typeof response==='function'?await response(input):response??{message_id:'saved-message',paired:true,partner:{state:'ready'}};
+      const value=stderr?undefined:typeof response==='function'?await response(input):response??(input.operation==='turn-completed'?{recorded:true}:{message_id:'saved-message',paired:true,partner:{state:'ready'}});
                                                 
       if(value?.status==='selection_required')lastSelection=value;
       return stderr?{exitCode:1,stderr}:{exitCode:0,stdout:JSON.stringify(value)};
@@ -58,6 +59,296 @@ async function harness(options:{deferPrompts?:boolean;noticeTurnId?:string;notic
                                        
   return{snapshot:(operation='status')=>control.call($,operation),timeouts,checks,calls,nativeCalls,statuses,toasts,prompts,appends,commandRuns,flush:async()=>{for(const fn of deferred.splice(0))await fn();},consumePrompt:async()=>{assert.ok(queuedPrompts.length,'没有待消费的原生提示');return consumePrompt(queuedPrompts.shift());},session:(id:string)=>{sessionId=id;},tick:async()=>{for(const fn of ticks){if(runningTicks.has(fn))continue;runningTicks.add(fn);try{await fn();}finally{runningTicks.delete(fn);}}},run,fail:(detail?:unknown)=>{failure=detail?JSON.stringify(detail):'断连';},error:(operation:string,detail:unknown)=>{errors[operation]=JSON.stringify(detail);},nativeResult:(value:unknown)=>{nativeResult=value;},uiFailure:(value:Error)=>{uiFailure=value;},response:(operation:string,value:unknown)=>{responses[operation]=value;},waitResult:(value:unknown)=>{waitResult=value;}};
 }
+
+const stopEvent=(prompt_id:string,stop_hook_active=false)=>({session_id:'session',prompt_id,stop_hook_active,background_tasks:[],session_crons:[]});
+
+test('Mod 同轮 Stop 拦截保留忙碌，退款按继续片段的动作判定',async()=>{
+  for(const continuation of ['静默','发送','服务端工具']){
+    const h=await harness();await h.run('session.start',{});
+    h.response('turn-stop-check',async()=>{
+      await h.run('turn.complete',{turnId:'native'});
+      return{block:'核实仍有可做的工作',intervention_id:'stop-credit'};
+    });
+    await h.run('turn.start',{turnId:'native'});
+    await h.run('tool.call',{tool:'Bash',tool_use_id:'previous'});
+    assert.deepEqual(await h.run('classic.Stop',stopEvent('prompt')), {block:'核实仍有可做的工作'});
+    await h.snapshot();
+    assert.equal(h.calls.at(-1).nativeBackground.tasks,undefined);
+    assert.equal(h.calls.some(c=>c.operation==='state'&&c.state==='ready'),false);
+    assert.equal(h.calls.some(c=>c.operation==='turn-completed'),false);
+    if(continuation==='发送')await h.run('tool.call',{tool:'SendMessage',to:'nxbridge:codex',message:'结果',tool_use_id:'send'});
+    if(continuation==='服务端工具'){
+      const step=h.run('turn.step',{turnId:'native',model:'native'},async function*(){
+        yield{type:'content_block_start',content_block:{type:'server_tool_use',name:'web_search',id:'server'}};
+      });
+      for await(const _ of step){}
+    }
+    await h.run('classic.Stop',stopEvent('prompt',true));
+    await h.run('turn.complete',{turnId:'native'});
+    const done=h.calls.filter(c=>c.operation==='turn-completed');
+    assert.equal(done.length,1);assert.equal(done[0].turn_id,'native');
+    assert.deepEqual(done[0].interventions,[{id:'stop-credit',inert:continuation==='静默'}]);
+    assert.equal(done[0].stats.actions,continuation==='静默'?1:2);
+    assert.equal(done[0].stats.workTools,continuation==='服务端工具'?2:1);
+    assert.deepEqual(done[0].background,{tasks:0,crons:0});
+    assert.deepEqual(h.calls.filter(c=>c.operation==='turn-stop-check').map(c=>c.stop_hook_active),[false,true]);
+  }
+});
+
+test('Mod 并行工作在进度汇报后才返回时，完成事实仍标记后续工作',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:1000000});
+  const h=await harness();await h.run('session.start',{});await h.run('turn.start',{turnId:'parallel'});
+  let release!:()=>void,started!:()=>void;
+  const ready=new Promise<void>(resolve=>{started=resolve;}),pending=new Promise<void>(resolve=>{release=resolve;});
+  const work=h.run('tool.call',{tool:'Read',tool_use_id:'parallel-read'},async()=>{started();await pending;return{result:'文件内容'};});
+  await ready;t.mock.timers.tick(10);
+  await h.run('tool.call',{tool:'SendMessage',to:'nxbridge:codex',message:'进度',tool_use_id:'parallel-send'});
+  const reportedAt=Date.now();t.mock.timers.tick(10);release();await work;
+  await h.run('classic.Stop',stopEvent('parallel'));await h.run('turn.complete',{turnId:'parallel'});
+  const completed=h.calls.find(c=>c.operation==='turn-completed');assert.ok(completed);assert.ok(completed.stats.lastWorkAt>reportedAt);
+  assert.equal(completed.stats.workTools,1);
+});
+
+test('Mod 继续片段的 Stop 立即确认已应用提示，后台任务未归零时也不等待完成事实',async()=>{
+  const h=await harness();await h.run('session.start',{});await h.run('turn.start',{turnId:'native'});
+  h.response('turn-stop-check',(input:any)=>input.stop_hook_active?{}:{block:'继续一次',intervention_id:'applied'});
+  assert.ok((await h.run('classic.Stop',stopEvent('first'))).block);
+  await h.run('classic.Stop',{...stopEvent('continued',true),background_tasks:[{id:'still-running'}],session_crons:[{id:'cron'}]});
+  const confirmations=h.calls.filter(c=>c.operation==='turn-stop-check'&&c.stop_hook_active);
+  assert.equal(confirmations.length,1);assert.equal(confirmations[0].turn_id,'native');assert.deepEqual(confirmations[0].background,{tasks:1,crons:1});
+  await h.run('turn.complete',{turnId:'native'});assert.equal(h.calls.some(c=>c.operation==='turn-completed'),false);
+});
+
+test('Mod 已应用提示的确认失败或下游 Stop 抛错后，空闲监测仍重报同一原生事实直到确认',async()=>{
+  for(const failure of ['确认失败','下游抛错']){
+    const h=await harness();await h.run('session.start',{});await h.run('turn.start',{turnId:'native'});
+    let confirmations=0;
+    h.response('turn-stop-check',(input:any)=>{
+      if(!input.stop_hook_active)return{block:'继续一次',intervention_id:'applied'};
+      confirmations++;assert.equal(input.deadline_at,undefined);
+      if(failure==='确认失败'&&confirmations===1)throw Error('确认链路暂时断开');
+      return{confirmed:true};
+    });
+    await h.run('classic.Stop',stopEvent('first'));
+    const continued={...stopEvent('continued',true),background_tasks:[{id:'job'}],session_crons:[{id:'cron'}]};
+    if(failure==='下游抛错')await assert.rejects(h.run('classic.Stop',continued,async()=>{throw Error('下游停止失败');}));
+    else await h.run('classic.Stop',continued);
+    await h.run('turn.complete',{turnId:'native'});assert.equal(h.calls.some(c=>c.operation==='turn-completed'),false);
+    const before=confirmations;await h.tick();assert.equal(confirmations,before+1);await h.tick();assert.equal(confirmations,before+1,'确认之后不继续轮询同一回执');
+  }
+});
+
+test('Mod 只结合同轮成功完成与未被拦截的明确空闲 Stop',async()=>{
+  for(const scenario of ['先完成','先停止','下游拦截','下游阻止','后台任务','中断','后台不可用','旧轮回执']){
+    const h=await harness();await h.run('session.start',{});await h.run('turn.start',{turnId:'native'});
+    const stream=h.run('turn.step',{turnId:'native',model:'native'},async function*(){yield{kind:'text',text:'结束'};});
+    for await(const _ of stream){}
+    const complete=(isAborted=false)=>h.run('turn.complete',{turnId:'native',isAborted});
+    const stop=stopEvent('prompt');
+    if(scenario==='先完成'){
+      await complete();
+      assert.equal(h.calls.filter(c=>c.operation==='state').at(-1)?.state,'ready');
+      assert.equal(h.calls.some(c=>c.operation==='turn-completed'),false,'原生完成可以更新状态，Stop 缺席时不能证明后台工作已结束');
+    }
+    if(scenario==='后台任务')stop.background_tasks.push({id:'job'} as never);
+    if(scenario==='后台不可用')h.error('turn-stop-check',{code:'unreachable'});
+    if(scenario==='旧轮回执'){
+      h.response('turn-stop-check',async()=>{await h.run('turn.start',{turnId:'new'});return{block:'过期',intervention_id:'expired'};});
+    }
+    const downstream=scenario==='下游拦截'?{block:'原生拦截'}:scenario==='下游阻止'?{preventContinuation:'原生阻止'}:{};
+    assert.deepEqual(await h.run('classic.Stop',stop,async()=>{
+      if(scenario==='下游拦截')await complete();
+      return downstream;
+    }),downstream);
+    if(!['先完成','下游拦截'].includes(scenario))await complete(scenario==='中断');
+    const completed=h.calls.filter(c=>c.operation==='turn-completed');
+    assert.equal(completed.length,['先完成','先停止','后台不可用'].includes(scenario)?1:0,scenario);
+    if(['下游拦截','旧轮回执'].includes(scenario)){
+      assert.equal(h.calls.some(c=>c.operation==='state'&&c.state==='ready'),false,scenario);
+      assert.equal(h.calls.filter(c=>c.operation==='turn-stop-check').length,scenario==='旧轮回执'?1:0,scenario);
+    }
+    if(scenario==='下游阻止')assert.equal(h.calls.filter(c=>c.operation==='state').at(-1)?.state,'ready');
+  }
+});
+
+test('Mod 已进入的 Stop 暂缓报空闲，宿主 Stop 异常退出后由原生完成收尾',async()=>{
+  const h=await harness();await h.run('session.start',{});await h.run('turn.start',{turnId:'native'});
+  const original=Error('下游 Stop 处理失败');
+  await assert.rejects(()=>h.run('classic.Stop',stopEvent('current'),async()=>{
+    await h.run('turn.complete',{turnId:'native'});
+    assert.equal(h.calls.some(c=>c.operation==='state'&&c.state==='ready'),false);
+    throw original;
+  }),error=>error===original);
+  const ready=h.calls.filter(c=>c.operation==='state').at(-1);
+  assert.equal(ready?.state,'ready');assert.equal(ready?.nativeBackground.tasks,undefined);
+  assert.equal(h.calls.some(c=>c.operation==='turn-completed'),false);
+});
+
+test('Mod 阻止停止后 API 失败不等待下一个 Stop，不确认干预或后台归零',async()=>{
+  const h=await harness();await h.run('session.start',{});await h.run('turn.start',{turnId:'failed'});
+  h.response('turn-stop-check',{block:'继续一次',intervention_id:'provisional'});
+  assert.ok((await h.run('classic.Stop',stopEvent('first'))).block);
+  await h.run('classic.StopFailure',{session_id:'session',error:'invalid_request',error_details:'400 请求失败'});
+  await h.run('turn.complete',{turnId:'failed',isAborted:false});
+  const terminal=h.calls.filter(c=>c.operation==='state').at(-1);
+  assert.equal(terminal?.state,'ready');assert.equal(terminal?.nativeHealth.state,'failed');
+  assert.equal(terminal?.nativeHealth.completion,'failed');assert.equal(terminal?.nativeBackground.tasks,undefined);
+  assert.equal(h.calls.some(c=>c.operation==='turn-completed'),false);
+});
+
+test('Mod 同轮干预后未收到第二次 Stop，原生终态仍结束忙碌但不确认干预',async()=>{
+  const h=await harness();await h.run('session.start',{});await h.run('turn.start',{turnId:'terminal'});
+  h.response('turn-stop-check',{block:'继续一次',intervention_id:'proposed'});
+  assert.ok((await h.run('classic.Stop',stopEvent('first'))).block);
+  assert.equal(h.calls.some(c=>c.operation==='state'&&c.state==='ready'),false);
+  await h.run('turn.complete',{turnId:'terminal',isAborted:false});
+  const terminal=h.calls.filter(c=>c.operation==='state').at(-1);
+  assert.equal(terminal?.state,'ready');assert.equal(terminal?.nativeBackground.tasks,undefined);
+  assert.equal(h.calls.some(c=>c.operation==='turn-completed'),false);
+});
+
+test('Mod Stop 接受宿主复用提示编号，只确认已继续的干预且超时回应不阻塞',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:2000000});
+  const h=await harness();await h.run('session.start',{});
+  await h.run('turn.start',{turnId:'first'});
+  await h.run('classic.Stop',stopEvent('reused'));await h.run('turn.complete',{turnId:'first'});
+  await h.run('turn.start',{turnId:'timely'});
+  h.response('turn-stop-check',{block:'继续一次',intervention_id:'applied'});
+  assert.ok((await h.run('classic.Stop',stopEvent('reused'))).block);
+  await h.run('classic.Stop',stopEvent('changed',true));await h.run('turn.complete',{turnId:'timely'});
+  assert.deepEqual(h.calls.find(c=>c.operation==='turn-completed'&&c.turn_id==='timely')?.interventions,[{id:'applied',inert:true}]);
+  await h.run('turn.start',{turnId:'late'});
+  h.response('turn-stop-check',(input:any)=>{assert.equal(input.deadline_at,2001500);t.mock.timers.tick(1500);return{block:'过期',intervention_id:'expired'};});
+  assert.deepEqual(await h.run('classic.Stop',stopEvent('late')),{});await h.run('turn.complete',{turnId:'late'});
+  assert.deepEqual(h.calls.find(c=>c.operation==='turn-completed'&&c.turn_id==='late')?.interventions,[]);
+});
+
+test('Mod 已知无适用配对跳过停止查询，协作工具仍计动作但不计干活',async()=>{
+  const h=await harness();await h.run('session.start',{});
+  h.response('status',{paired:false});await h.tick();
+  await h.run('turn.start',{turnId:'unpaired'});
+  await h.run('classic.Stop',stopEvent('first'));await h.run('turn.complete',{turnId:'unpaired'});
+  assert.equal(h.calls.some(c=>c.operation==='turn-stop-check'),false);
+  h.response('status',{paired:true,completion_guard:{state:'not_applicable'}});await h.tick();
+  await h.run('turn.start',{turnId:'same-role'});
+  await h.run('classic.Stop',stopEvent('same'));await h.run('turn.complete',{turnId:'same-role'});
+  assert.equal(h.calls.some(c=>c.operation==='turn-stop-check'),false);
+  h.response('status',{paired:true});await h.tick();
+  await h.run('turn.start',{turnId:'paired'});
+  for(const tool of ['ListAgents','mcp__plugin_nxbridge_codex__receive_messages','ToolSearch','sleep'])await h.run('tool.call',{tool,tool_use_id:tool});
+  await h.run('classic.Stop',stopEvent('second'));
+  const stats=h.calls.find(c=>c.operation==='turn-stop-check')?.stats;
+  assert.equal(stats?.actions,4);assert.equal(stats?.workTools,2);
+});
+
+test('Mod 仅在原生明确丢弃完成提醒时回报未提交，允许后台沿用原编号重试',async()=>{
+  for(const knownDrop of [true,false]){
+    const h=await harness({deferPrompts:true});await h.run('session.start',{});
+    const id='background-completed:fixture',notice={id,source:'background_completed',wake:true,message:'后台已做完一轮',interventionId:id};
+    h.response('monitor',{notices:[notice]});await h.tick();
+    h.response('prompt',knownDrop?{drop:'原生暂时拒绝'}:{context:[]});
+    await h.consumePrompt();
+    const ack=h.calls.find(c=>c.operation==='monitor-ack');
+    assert.equal(ack?.notice_id,id);
+    assert.equal(ack?.state,knownDrop?'not_submitted':'unknown');
+                                         
+    await h.tick();
+    assert.deepEqual(h.calls.filter(c=>c.operation==='monitor-enqueue').map(c=>c.notice_id),knownDrop?[id,id]:[id]);
+  }
+});
+
+test('Mod 真人补额绑定一条已接受的原生输入及其首次开启的根轮次',async()=>{
+  const h=await harness();await h.run('session.start',{});
+  const submit=(kind:string,text:string)=>h.run('prompt.submit',{origin:{kind},text});
+  const start=(turnId:string,text:string)=>h.run('turn.start',{turnId,text});
+  await submit('composer','取消的关联');await start('different','别的轮次');await start('replay','取消的关联');
+  await submit('composer','相同正文');await submit('peer','相同正文');await start('peer','相同正文');
+  await submit('bridge','远程输入');await start('bridge','远程输入');
+  h.response('config-model',{value:true});
+  await submit('sdk','普通 SDK');await start('script','普通 SDK');
+  h.response('surfaces',['vscode']);
+  await submit('sdk','原生界面');await start('ide','原生界面');
+  await h.run('prompt.submit',{origin:{kind:'composer'},text:'原生输入框'},async(e:any)=>{
+    await start('console',e.text);return{text:e.text};
+  });
+  const strict=h.calls.filter(c=>c.operation==='prompt'&&c.human_turn_id).map(c=>[c.human_origin,c.human_turn_id]);
+  assert.deepEqual(strict,[['vscode','ide'],['composer','console']]);
+});
+
+test('Mod 空闲监测重报同一完成事实，收到重复确认前保留原生证据',async()=>{
+  const h=await harness();await h.run('session.start',{});
+  let stored:any;
+  h.response('turn-completed',(input:any)=>{
+    const payload={turn_id:input.turn_id,completed_at:input.completed_at,stats:input.stats,background:input.background,interventions:input.interventions};
+    if(!stored){stored=payload;throw Error('后台已入库，回执连接中断');}
+    assert.deepEqual(payload,stored,'重试复用同一事实与轮次时间');
+    return{recorded:true,duplicate:true};
+  });
+  h.response('status',{paired:true,self:{id:'claude'},partner:{state:'ready'},integrationAction:{kind:'reload_plugins',attemptId:'completion-retry-reload',targetRevision:'current'}});
+  await h.run('turn.start',{turnId:'retry'});
+  await h.run('classic.Stop',stopEvent('native'));
+  await h.run('turn.complete',{turnId:'retry'});
+  const calls=()=>h.calls.filter(c=>c.operation==='turn-completed');
+  assert.equal(calls().length,1);assert.deepEqual(h.commandRuns,[]);
+  h.response('monitor',()=>{throw Error('监测连接也暂时中断');});
+  await h.tick();assert.equal(calls().length,1);assert.deepEqual(h.commandRuns,[]);
+  h.response('monitor',{notices:[]});
+  await h.tick();assert.equal(calls().length,2);assert.deepEqual(h.commandRuns,[{command:'reload-plugins'}]);
+  await h.tick();assert.equal(calls().length,2);assert.equal(h.prompts.length,0,'只重报事实，未唤醒模型');
+});
+
+test('Mod 真人提示在提交回执前已完成，仍使用根轮次实际开始时间',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:2000000});
+  const h=await harness();await h.run('session.start',{});
+  await h.run('prompt.submit',{origin:{kind:'composer'},text:'新任务'},async(e:any)=>{
+    t.mock.timers.tick(100);
+    await h.run('turn.start',{turnId:'started',text:e.text});
+    t.mock.timers.tick(800);
+    await h.run('classic.Stop',stopEvent('prompt'));
+    await h.run('turn.complete',{turnId:'started'});
+    assert.equal(h.calls.some(c=>c.operation==='prompt'),false);
+    t.mock.timers.tick(100);
+    return{text:e.text};
+  });
+  const stop=h.calls.find(c=>c.operation==='turn-stop-check');
+  const prompt=h.calls.find(c=>c.operation==='prompt');
+  assert.equal(prompt.human_origin,'composer');
+  assert.equal(prompt.human_turn_id,'started');
+  assert.equal(prompt.human_input_at,2000100);
+  assert.equal(prompt.human_input_at,stop.stats.startedAt);
+  assert.equal(h.calls.at(-1).state,'ready');
+});
+
+test('Mod 只认领实际开启根轮次的通知，涵盖合并批次和原生接收顺序',async()=>{
+  for(const scenario of ['正常','先启动','拒绝','混合','轮中','被动']){
+    const h=await harness({deferPrompts:true,startNoticeBeforeReceipt:scenario==='先启动',...(scenario==='轮中'?{noticeTurnId:'active'}:{})});
+    await h.run('session.start',{});
+    h.response('monitor',{notices:[{id:'notice',source:'runtime_monitor',message:'提示正文',wake:scenario!=='被动',interventionIds:['one','two']}]});
+    await h.tick();
+    if(scenario==='拒绝')h.response('prompt',{drop:'原生拒绝'});
+    if(scenario==='混合')await h.run('prompt.submit',{origin:{kind:'composer'},text:'混合输入'});
+    if(scenario!=='被动')await h.consumePrompt();
+    if(scenario!=='先启动')await h.run('turn.start',{turnId:'wake',text:h.prompts.at(-1)?.text});
+    await h.run('classic.Stop',stopEvent('root'));
+    await h.run('turn.complete',{turnId:'wake'});
+    assert.deepEqual(h.calls.find(c=>c.operation==='turn-completed')?.interventions,['正常','先启动'].includes(scenario)?[{id:'one',inert:true},{id:'two',inert:true}]:[],scenario);
+  }
+});
+
+test('Mod Stop 只报告经原生追加确认的搭档根轮次',async()=>{
+  for(const scenario of ['确认','伪装','轮中','未追加']){
+    const h=await harness();await h.run('session.start',{});
+    const origin={kind:scenario==='伪装'?'composer':'peer'};
+    const text='[nxbridge message_id=abc-def]\n搭档任务';
+    await h.run('prompt.submit',{origin,text,...(scenario==='轮中'?{turnId:'previous'}:{})});
+    if(scenario!=='未追加')await h.run('session.append',{origin,uuid:'row'},async()=>({uuid:'row',message:{role:'user',content:[{type:'text',text}]}}));
+    await h.run('turn.start',{turnId:'native',text});
+    await h.run('classic.Stop',stopEvent('prompt'));
+    const stats=h.calls.find(c=>c.operation==='turn-stop-check').stats;
+    assert.equal(stats.partnerDriven,scenario==='确认'?true:undefined,scenario);
+    assert.deepEqual(stats.partnerMessageIds,scenario==='确认'?['abc-def']:undefined,scenario);
+  }
+});
 
 test('Mod 原生轮次和工具提供进展快照，状态心跳不产生新进展，旧轮次不改写新轮',async t=>{
   t.mock.timers.enable({apis:['Date'],now:2000000});
@@ -288,7 +579,7 @@ test('同一空闲提醒在消费前因临时门槛撤销，恢复后沿用原�
 });
 
 test('只限空闲送达的提醒：空闲边界才声明 ready_boundary；回合中到达或忙时入队被推迟都不报失败，之后沿用原编号重送',async()=>{
-  const notice={id:'codex-final',wake:true,readyOnly:true,source:'codex_final'};
+  const notice={id:'background-completed:fixture',wake:true,readyOnly:true,source:'background_completed'};
                                                 
   const idle=await harness({deferPrompts:true});await idle.run('session.start',{});
   idle.response('monitor',{notices:[notice]});idle.response('monitor-prepare',{notices:[{...notice,message:'Codex 结束一轮的转发'}]});
@@ -298,7 +589,7 @@ test('只限空闲送达的提醒：空闲边界才声明 ready_boundary；回�
                                                 
   const busy=await harness({deferPrompts:true,noticeTurnId:'turn-1'});await busy.run('session.start',{});
   busy.response('monitor',{notices:[notice]});busy.response('monitor-prepare',{notices:[],deferred:true});
-  await busy.tick();assert.equal((await busy.consumePrompt()).drop,'nxbridge：Claude 正忙，这条提醒等空闲时再送，无需处理');
+  await busy.tick();assert.equal((await busy.consumePrompt()).drop,'nxbridge：这条提醒暂时不送，条件满足时再送，无需处理');
   assert.equal(busy.calls.find(c=>c.operation==='monitor-prepare')?.ready_boundary,undefined);
   assert.equal(busy.calls.filter(c=>c.operation==='monitor-ack').length,0);assert.equal(busy.prompts.length,0);
   await busy.tick();assert.equal(busy.calls.filter(c=>c.operation==='monitor-enqueue').length,2);
@@ -1983,4 +2274,13 @@ test('Mod 状态栏：读不到 Codex 最新一步时只说进度暂时无法观
   assert.equal(h.statuses.at(-1),'Codex 长时间没有进展，原因未知（运行 nxbridge status 查看）');
   h.response('status',status({state:'silent',turnId:'t',lastProgressAt:1,tools:[],progressEvidence:false}));await h.tick();
   assert.equal(h.statuses.at(-1),'Codex 的进度暂时无法观测，不代表卡住（运行 nxbridge status 查看）');
+});
+
+test('Mod 状态栏：后台做完一轮停下、自动提醒已用完时常驻说明（顶层 completion_guard），其他暂缓不进状态栏',async()=>{
+  const h=await harness();await h.run('session.start',{});
+  const guard=(extra:any)=>({paired:true,self:{state:'ready'},partner:{state:'ready'},completion_guard:{background_id:'x',foreground_id:'c',state:'limited',reason:'no_tools',hold:'wake_budget_exhausted',budget:{used:4,limit:4,remaining:0,awaitingProof:0},background_host:'codex',user_text:'后台 Codex 09:30 做完一轮停下了（这一轮没调用干活的工具）；自动提醒已用完（4 次），在前台窗口发条消息就会恢复',...extra}});
+  h.response('status',guard({}));await h.tick();
+  assert.equal(h.statuses.at(-1),'后台 Codex 09:30 做完一轮停下了（这一轮没调用干活的工具）；自动提醒已用完（4 次），在前台窗口发条消息就会恢复');
+  h.response('status',guard({state:'pending',hold:'foreground_busy',user_text:'后台 Codex 做完一轮停下了，等前台这一轮结束后再提醒'}));await h.tick();
+  assert.doesNotMatch(h.statuses.at(-1)??'',/后台 Codex/);
 });

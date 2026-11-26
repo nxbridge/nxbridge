@@ -64,6 +64,24 @@ test('Mod 服务端票据拒绝重放，签名绑定阶段，过长正文在准�
   await assert.rejects(write.smallWrite(sdk,context,{operation:'state',text:'中文😀'}),{uncertain:true});assert.equal(writes,2,'响应阶段替换不能报告成功或自动重放');
 });
 
+test('Stop 建议的准备和提交共用截止时间，已应用提示的确认不受旧截止时间限制',async t=>{
+  const read=await import(pathToFileURL(path.join(PACKAGE_ROOT,'plugins/claude/hooks/mod-read.js')).href),write=await import(pathToFileURL(path.join(PACKAGE_ROOT,'plugins/claude/hooks/mod-write.js')).href);
+  const temp=temporaryDirectory();let writes=0,requests=0;
+  const server=new ModReadServer(temp.directory,async()=>({}),async(_input,_actor,_receipt,_epoch,admit)=>{admit();writes++;return{confirmed:true};});
+  t.after(async()=>{await server.close();await temp.cleanup();});
+  const context={sessionId:'session',contextStart:false,binding:{key:'key',epoch:'epoch'}},actor={host:'claude' as const,sessionId:'session',callId:'call',binding:context.binding};
+  t.mock.timers.enable({apis:['Date'],now:Date.now()});
+  const sdk={env:{get:async()=>undefined},clock:{sleep:(ms:number,options:{signal:AbortSignal})=>sleep(ms,undefined,options)},http:{fetch:async(url:string,options:RequestInit)=>{
+    requests++;const response=await fetch(url,options),text=await response.text();if(requests===1)t.mock.timers.tick(100);return{status:response.status,text};
+  }}};
+  await read.prepareRead(sdk,context,async()=>({credential:{id:'a'.repeat(64),secret:'b'.repeat(64)}}));read.attachRead(context,await server.open({} as any,actor,'epoch'));
+  await assert.rejects(write.smallWrite(sdk,context,{operation:'turn-stop-check',stop_hook_active:false,deadline_at:Date.now()+50}),/deadline/);
+  assert.equal(requests,1);assert.equal(writes,0,'准备阶段耗完时间后不得发送 commit');
+  read.attachRead(context,await server.open({} as any,actor,'epoch'));
+  assert.deepEqual(await write.smallWrite(sdk,context,{operation:'turn-stop-check',stop_hook_active:true,deadline_at:Date.now()-1}),{handled:true,value:{confirmed:true}});
+  assert.equal(writes,1);
+});
+
 test('代理环境只在明确绕过目标回环地址时允许 HTTP',async()=>{
   const {loopbackAllowed}=await import(pathToFileURL(path.join(PACKAGE_ROOT,'plugins/claude/hooks/mod-proxy.js')).href),url='http://127.0.0.1:1234/mod-read';
   assert.equal(loopbackAllowed({},url),true);

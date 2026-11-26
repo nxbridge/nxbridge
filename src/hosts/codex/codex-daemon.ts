@@ -107,12 +107,12 @@ export class CodexDaemons {
     const result=await rpc.request('turn/start',{threadId:peer.sessionId,input:[],...origin},{mutation:true});
     this.wakeChecks.delete(peer.id);return result.turn.id;
   }
-  async wake(peer:Peer,endpoint:Endpoint,beforeSubmit:()=>Promise<boolean>):Promise<string|undefined>{
+  async wake(peer:Peer,endpoint:Endpoint,beforeSubmit:()=>Promise<boolean>,message:string|(()=>string)=HEALTH_WAKE_NOTICE):Promise<string|undefined>{
     const scope=this.wakeScope(peer,endpoint),rpc=await this.mutationTarget(peer,endpoint);
-    const origin=await this.turnOrigin?.(peer,'children');
+    const origin=await this.turnOrigin?.(peer,typeof message==='function'?'notice':'children');
     if(!await beforeSubmit())return;
     if(this.wakeScope(peer,endpoint)!==scope)throw new DeliveryError('daemon_wake_unavailable','共享 daemon 唤醒授权或当前上下文已改变。');
-    const result=await rpc.request('turn/start',{threadId:peer.sessionId,input:[{type:'text',text:HEALTH_WAKE_NOTICE}],...origin},{mutation:true});
+    const result=await rpc.request('turn/start',{threadId:peer.sessionId,input:[{type:'text',text:typeof message==='function'?message():message}],...origin},{mutation:true});
     this.wakeChecks.delete(peer.id);
     if(typeof result?.turn?.id!=='string'||!result.turn.id)throw new DeliveryError('wake_result_unknown','原生唤醒没有返回可核验的轮次。',true);
     return result.turn.id;

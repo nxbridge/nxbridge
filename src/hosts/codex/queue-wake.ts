@@ -18,6 +18,7 @@ export interface CodexQueueParams {threadId:string;input:[{type:'text';text:stri
 export interface CodexQueueOptions {
   clientUserMessageId:string;
   message:string;
+  completionNotice?:()=>string;
   beforeSubmit:()=>void|Promise<void>;
   requestRemote?:(params:CodexQueueParams,authorize:()=>Promise<void>)=>Promise<unknown>;
 }
@@ -147,6 +148,7 @@ export async function queueCodexWake(home:string,config:BridgeConfig,peer:Peer,e
     const stamp=embedded?embeddedSnapshot():undefined;
     if(embeddedLaunch)await verifyEmbedded(embeddedLaunch);
     await options.beforeSubmit();
+    if(options.completionNotice)params.input[0].text=message+'\n'+options.completionNotice();
     if(embedded){if(embeddedSnapshot()!==stamp)throw collision();}
     else if(endpoint.daemon?!daemonPidMatches():privateRuntime().id!==runtimeId)throw unavailable();
     attempted=true;
@@ -166,7 +168,8 @@ export async function queueCodexWake(home:string,config:BridgeConfig,peer:Peer,e
     if(typeof receipt?.id!=='string'||!receipt.id||receipt.clientUserMessageId!==clientUserMessageId)throw new BridgeError('queue_ack_unverified','Codex 队列回执未确认提交编号。');
     return{id:receipt.id,clientUserMessageId};
   }catch(error){
-    if(!attempted||error instanceof DeliveryError&&!error.uncertain)throw error;
+    if(!attempted)throw Object.assign(error instanceof Error?error:new Error(String(error)),{uncertain:false,phase:'enqueue'});
+    if(error instanceof DeliveryError&&!error.uncertain)throw error;
     throw Object.assign(new DeliveryError('queue_result_unknown','Codex 队列提交结果未知，保留原预约。',true),{cause:error});
   }finally{
                                       

@@ -96,6 +96,7 @@ export class Store {
   }
   setting<T>(key: string): T | undefined { const r=statement(this.db,'SELECT value FROM settings WHERE key=?').get(key);if(!r)return;try{return JSON.parse(r.value as string) as T;}catch{throw new BridgeError('record_invalid','状态记录无法解析：'+key);} }
   setSetting(key: string, value: unknown): void { statement(this.db,'INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at').run(key,JSON.stringify(value),Date.now()); }
+  retireFinalForwarding():void { statement(this.db,"DELETE FROM settings WHERE key LIKE 'codexFinalForward:%' OR key LIKE 'codexFinalForwardStreak:%'").run(); }
   warnHookContext(contextKey:string|undefined,sessionId:string,event:string,reason:string,peerId?:string):void{
     const key=contextKey??'session:'+sessionId,signature=JSON.stringify([sessionId,reason,peerId]),seen=this.hookContextWarnings.get(key)??new Set<string>();if(seen.has(signature))return;
     this.event('hook.context.unverified',{sessionId,event,reason,...(contextKey?{context_key:contextKey}:{}),...(peerId?{peerId}:{})});seen.add(signature);this.hookContextWarnings.set(key,seen);

@@ -1,0 +1,344 @@
+import test,{type TestContext} from 'node:test';
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import {appendFileSync,writeFileSync} from 'node:fs';
+import {randomUUID} from 'node:crypto';
+import {TurnEndCoordinator} from '../broker/turn-end.js';
+import {TurnEndEvidence,turnNativeScope,type TurnEndStats} from '../broker/turn-end-evidence.js';
+import {DeliveryHealth} from '../broker/health/delivery.js';
+import type {BrokerHealthCoordinator} from '../broker/health/coordinator.js';
+import type {CompletionHold} from '../broker/turn-end-text.js';
+import {fixture} from './support/broker-fixture.js';
+import {temporary} from './support/temporary.js';
+import {saveManagedRuntime} from '../hosts/managed-runtimes.js';
+import {managedMarker} from '../install/installation.js';
+import {MOD_REVISION} from '../mod-revision.js';
+
+function setup(t:TestContext,limit=4){
+  t.mock.timers.enable({apis:['Date'],now:1000000});
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),health=new DeliveryHealth(f.store);
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'ready'});f.store.updatePeer(f.c.id,{state:'ready'});
+  let hold:CompletionHold|undefined,owned=true;
+  const file=path.join(temporary(t),'native.jsonl');
+  const guard=new TurnEndCoordinator(f.store,health,{owned:()=>owned,source:()=>file,stats:()=>undefined,
+    gate:(background,foreground,boundary)=>hold??(f.store.pairFor(background.id)?.paused?'paused':
+      background.id!==boundary&&f.store.peer(background.id).state!=='ready'?'background_busy':
+      foreground.id!==boundary&&f.store.peer(foreground.id).state!=='ready'?'foreground_busy':undefined)},()=>limit);
+  const bg=()=>f.store.peer(f.x.id),fg=()=>f.store.peer(f.c.id);
+  const stats=(extra:Partial<TurnEndStats>={}):TurnEndStats=>({startedAt:Date.now(),covered:true,actions:0,workTools:0,...extra});
+  const finish=(id:string,value:TurnEndStats|undefined=stats())=>{guard.begin(bg(),id);guard.complete(bg(),{turnId:id,completedAt:Date.now(),stats:value});guard.refresh(pair);};
+  const pending=()=>health.peek(pair.id,f.c.id).filter(notice=>notice.source==='background_completed');
+  const admit=()=>f.store.transaction(()=>{
+    assert.ok(guard.ready(pair,true));const n=pending()[0];assert.ok(n);
+    const prepared=health.prepare(pair.id,f.c.id,n.id,n.scope,false,true,true);assert.ok(prepared);
+    guard.admitted(pair,prepared);return prepared;
+  });
+  return{...f,pair,health,guard,bg,fg,stats,finish,pending,admit,file,
+    hold:(next:CompletionHold|undefined)=>{hold=next;},owned:(next:boolean)=>{owned=next;}};
+}
+
+test('后台无工具且没有最终正文的完成事实仍提醒；不伪造搭档消息，重复回执和重建不重发',t=>{
+  const f=setup(t);f.finish('answer-without-tools');const notice=f.pending()[0]!;
+  assert.equal(notice.readyOnly,true);assert.equal(notice.wake,true);assert.match(notice.message,/no work-tool calls/);
+  assert.equal(f.health.prepare(f.pair.id,f.c.id,notice.id,notice.scope),undefined);
+  f.admit();assert.equal(f.guard.status(f.bg()).state,'completed');
+  f.guard.complete(f.bg(),{turnId:'answer-without-tools',completedAt:Date.now(),stats:f.stats()});f.guard.refresh(f.pair);
+  assert.deepEqual(f.pending(),[]);assert.equal(f.store.messages().length,0);assert.equal(f.guard.budget.status(f.c.id).used,1);
+});
+
+test('来源只接受一后台一用户的根配对；双用户、双后台和归属不明均不干预',t=>{
+  const f=setup(t);f.owned(false);f.finish('unowned');assert.deepEqual(f.pending(),[]);
+  f.owned(true);f.store.updatePeer(f.x.id,{owner:'user'});f.finish('two-users');assert.equal(f.guard.status(f.fg()).state,'not_applicable');
+  f.store.updatePeer(f.x.id,{owner:'nxbridge'});f.store.updatePeer(f.c.id,{owner:'nxbridge'});f.finish('two-backgrounds');assert.deepEqual(f.pending(),[]);
+});
+
+test('后台 Stop 每轮最多拦一次；只读工作也算工作，发信后继续工作须汇报',t=>{
+  const f=setup(t),message=f.store.accept(f.pair,f.fg(),'请接着处理','task');
+  const input={turn_id:'source',stop_hook_active:false,stats:f.stats({partnerDriven:true,partnerMessageIds:[message.id]})};
+  f.guard.begin(f.bg(),'source');const first=f.guard.checkStop(f.bg(),input);
+  assert.match(first.block!,/no work-tool calls/);assert.ok(first.intervention_id);
+  assert.deepEqual(f.guard.checkStop(f.bg(),input),{});assert.deepEqual(f.guard.checkStop(f.bg(),{...input,turn_id:'other',stop_hook_active:true}),{});
+  const sent=f.store.accept(f.pair,f.bg(),'已开始','progress');f.guard.sent(f.bg());t.mock.timers.tick(1);
+  const work=f.guard.checkStop(f.bg(),{turn_id:'read-work',stop_hook_active:false,stats:f.stats({workTools:1,actions:1,lastWorkAt:Date.now()})});
+  assert.match(work.block!,/report/);assert.equal(f.store.lastMessageFacts(f.pair.id,f.x.id)?.id,sent.id);
+});
+
+test('前台 Stop 看见后台已完成时同轮提示；未完成、忙碌、审批和暂停均不误报',t=>{
+  const f=setup(t);f.guard.begin(f.bg(),'running');
+  const stop={turn_id:'fg',stop_hook_active:false,stats:f.stats(),background:{tasks:0,crons:0}};assert.deepEqual(f.guard.checkStop(f.fg(),stop),{});
+  f.finish('done');f.guard.begin(f.fg(),'fg');f.store.updatePeer(f.c.id,{state:'busy'});f.guard.refresh(f.pair);
+  assert.equal(f.guard.ready(f.pair),false);const tip=f.guard.checkStop(f.fg(),stop);assert.ok(tip.block);assert.deepEqual(f.pending(),[]);
+  f.store.updatePeer(f.c.id,{state:'ready'});f.guard.complete(f.fg(),{turnId:'fg',completedAt:Date.now(),stats:f.stats(),interventions:[{id:tip.intervention_id!,inert:true}]});
+  assert.equal(f.guard.status(f.fg()).state,'completed');
+  for(const hold of ['pending_user','paused','runtime_unavailable','native_state_unverified'] as const){
+    f.finish('held-'+hold);f.hold(hold);assert.deepEqual(f.guard.checkStop(f.fg(),{...stop,turn_id:hold}),{});assert.equal(f.guard.ready(f.pair,true),false);
+  }
+});
+
+test('新轮次立刻撤回旧完成提醒，旧终态不能把正在运行的新轮次覆盖成完成',t=>{
+  const f=setup(t);f.finish('old');assert.equal(f.pending().length,1);f.guard.begin(f.bg(),'new');
+  f.guard.complete(f.bg(),{turnId:'old',completedAt:Date.now(),stats:f.stats()});f.guard.refresh(f.pair);
+  assert.deepEqual(f.pending(),[]);assert.equal(f.guard.status(f.bg()).state,'running');assert.equal(f.guard.status(f.bg()).turn_id,'new');
+  f.guard.native(f.bg(),{turnId:'new',state:'failed'});assert.equal(f.guard.status(f.bg()).state,'unavailable');
+});
+
+test('汇报之后直接结束不提醒，工作后未汇报和未知覆盖范围都给出中性完成事实',t=>{
+  const f=setup(t),work=Date.now();t.mock.timers.tick(1);f.store.accept(f.pair,f.bg(),'工作结果','report');
+  f.finish('reported',f.stats({workTools:1,actions:2,lastWorkAt:work}));assert.deepEqual(f.pending(),[]);assert.equal(f.guard.status(f.fg()).reason,'reported');
+  t.mock.timers.tick(1);f.finish('unreported',f.stats({workTools:1,actions:1,lastWorkAt:Date.now()}));assert.equal(f.guard.status(f.fg()).reason,'work_after_message');
+  f.guard.begin(f.bg(),'unknown');f.guard.complete(f.bg(),{turnId:'unknown',completedAt:Date.now()});f.guard.refresh(f.pair);
+  assert.equal(f.guard.status(f.fg()).reason,'unverified');assert.match(f.pending()[0]!.message,/unverified/);
+});
+
+test('后台和前台 Stop 与完成唤醒共用 K 次额度，普通消息和承诺不补额',t=>{
+  const f=setup(t);const input={stop_hook_active:false,stats:f.stats({partnerDriven:true})};
+  for(let i=0;i<4;i++){
+    const turn='turn-'+i;f.guard.begin(f.bg(),turn);assert.ok(f.guard.checkStop(f.bg(),{...input,turn_id:turn}).block);
+    f.store.accept(f.pair,f.bg(),'正在处理','promise-'+i);f.guard.sent(f.bg());
+    f.guard.complete(f.bg(),{turnId:turn,completedAt:Date.now(),stats:f.stats({actions:1})});
+  }
+  f.finish('exhausted');assert.equal(f.guard.status(f.fg()).state,'limited');assert.equal(f.guard.status(f.fg()).budget!.used,4);
+  assert.deepEqual(f.guard.checkStop(f.fg(),{...input,turn_id:'foreground'}),{});assert.deepEqual(f.pending(),[]);
+  const ordinary=f.store.accept(f.pair,f.fg(),'请继续','ordinary');assert.ok(ordinary);assert.equal(f.guard.budget.status(f.c.id).remaining,0);
+  t.mock.timers.tick(1);f.guard.human(f.fg(),'human');f.guard.refresh(f.pair);assert.equal(f.pending().length,1);
+});
+
+test('连续无动作通知回合可精确退费，发信、工具动作、未知或错误轮次不会退费',t=>{
+  const f=setup(t);
+  for(let i=0;i<12;i++){
+    f.finish('bg-'+i);const notice=f.admit();f.guard.entered(f.fg(),notice.id);f.guard.started(f.fg(),'fg-'+i,notice.id);
+    f.guard.complete(f.fg(),{turnId:'fg-'+i,completedAt:Date.now(),stats:f.stats()});assert.equal(f.guard.budget.status(f.c.id).used,0);t.mock.timers.tick(60001);
+  }
+  f.finish('effectful');const notice=f.admit();f.guard.entered(f.fg(),notice.id);f.guard.started(f.fg(),'effectful-fg',notice.id);f.guard.sent(f.fg());
+  f.guard.complete(f.fg(),{turnId:'effectful-fg',completedAt:Date.now(),stats:f.stats()});assert.equal(f.guard.budget.status(f.c.id).used,1);
+});
+
+test('明确提交前失败沿用同一预约重试，结果未知不重投；最后一份额度也允许原预约重试',t=>{
+  const f=setup(t,1);f.finish('retry');const first=f.admit();
+  f.store.transaction(()=>f.guard.notSubmitted(f.fg(),f.health.outcome(f.pair.id,f.c.id,first.id,'pending')));f.guard.refresh(f.pair);
+  assert.equal(f.guard.ready(f.pair),true);assert.deepEqual(f.pending(),[],'提交前重试也遵守现有间隔');t.mock.timers.tick(60001);
+  const second=f.admit();assert.equal(second.id,first.id);assert.equal(f.guard.budget.status(f.c.id).used,1);
+  f.health.outcome(f.pair.id,f.c.id,second.id,'unknown');f.guard.refresh(f.pair);assert.deepEqual(f.pending(),[]);assert.equal(f.guard.budget.status(f.c.id).used,1);
+});
+
+test('队列标记只允许当前事实在同一原生范围消费一次，重复 hook 只接受相同轮次',t=>{
+  const f=setup(t);f.finish('queued');const notice=f.admit();
+  assert.equal(f.guard.consumeQueued(f.fg(),notice.id,'native-fg'),true);assert.equal(f.guard.consumeQueued(f.fg(),notice.id,'native-fg'),true);
+  assert.equal(f.guard.consumeQueued(f.fg(),notice.id,'duplicate-new-turn'),false);
+  f.guard.begin(f.bg(),'new-bg');assert.equal(f.guard.consumeQueued(f.fg(),notice.id,'native-fg'),false);
+});
+
+test('关闭自动干预仍保留完成事实和可读状态，不开启模型轮次',t=>{
+  const f=setup(t,0);f.finish('disabled');assert.deepEqual(f.pending(),[]);
+  const status=f.guard.status(f.fg());assert.equal(status.state,'limited');assert.equal(status.turn_id,'disabled');assert.match(status.user_text!,/配置里关闭/);
+});
+
+test('原生完整开始到终态支持无正文完成；未结束的文件尾部不产生完成通知',async t=>{
+  const f=setup(t),row=(type:string,payload:object)=>JSON.stringify({timestamp:new Date().toISOString(),type,payload})+'\n';
+  writeFileSync(f.file,row('session_meta',{id:f.x.sessionId})+row('event_msg',{type:'task_started',turn_id:'native'}),'utf8');
+  await f.guard.scan(f.bg());f.guard.refresh(f.pair);assert.equal(f.guard.status(f.fg()).state,'running');assert.deepEqual(f.pending(),[]);
+  appendFileSync(f.file,row('event_msg',{type:'task_complete',turn_id:'native'}),'utf8');await f.guard.scan(f.bg());f.guard.refresh(f.pair);
+  assert.equal(f.guard.status(f.fg()).turn_id,'native');assert.equal(f.pending().length,1);assert.ok(!f.pending()[0]!.message.includes('final'));
+});
+
+test('Codex 无动作证明要求连续原生工具流；重连、未知条目或范围改变使证明失效',t=>{
+  const f=setup(t),tracker=new TurnEndEvidence(),peer=f.bg(),endpoint=f.store.endpoint(peer.id)!;
+  const observe=(method:string,item?:object)=>tracker.observe(peer,endpoint,{method,params:{threadId:peer.sessionId,turnId:'native',...(item?{item}:{})}});
+  observe('turn/started');tracker.partner(peer,endpoint,'native');assert.equal(tracker.get(peer,endpoint)!.covered,true);
+  observe('item/started',{id:'status',type:'mcpToolCall',server:'claude'});observe('item/completed',{id:'status',type:'mcpToolCall',server:'claude'});
+  assert.equal(tracker.get(peer,endpoint)!.actions,1);assert.equal(tracker.get(peer,endpoint)!.workTools,0);
+  observe('item/started',{id:'read',type:'commandExecution'});observe('item/completed',{id:'read',type:'commandExecution'});assert.equal(tracker.get(peer,endpoint)!.workTools,1);
+  observe('item/started',{id:'future',type:'newUnknownAction'});assert.equal(tracker.get(peer,endpoint)!.covered,false);
+  assert.equal(tracker.get(peer,{...endpoint,epoch:'other'}),undefined);assert.notEqual(turnNativeScope(peer,endpoint),turnNativeScope(peer,{...endpoint,address:'other'}));
+});
+
+test('Codex 自己的输入和 queue 来源均不补额度，真人新轮次补额后只裁剪安全的旧来源编号',async t=>{
+  const f=setup(t);f.store.updatePeer(f.c.id,{owner:'nxbridge'});f.store.updatePeer(f.x.id,{owner:'user'});
+  const foreground=f.bg(),endpoint=f.store.endpoint(f.x.id)!;
+  f.guard.budget.admit(f.x.id,'prior-effect',turnNativeScope(foreground,endpoint));
+  const own=await f.guard.origin(foreground,'queue'),row=(payload:object)=>JSON.stringify({timestamp:new Date().toISOString(),type:'event_msg',payload})+'\n';
+  for(let index=0;index<300;index++)await f.guard.origin(foreground,'queue');
+  t.mock.timers.tick(10);
+  writeFileSync(f.file,JSON.stringify({type:'session_meta',payload:{id:foreground.sessionId}})+'\n','utf8');
+  const append=(turn:string,input:string,trigger='user')=>appendFileSync(f.file,row({type:'task_started',turn_id:turn,turn_attribution:{turn_id:turn,turn_trigger:trigger}})+
+    row({type:'item_completed',turn_id:turn,thread_id:foreground.sessionId,item:{type:'UserMessage',client_id:input}})+row({type:'task_complete',turn_id:turn}),'utf8');
+  append('own-queue',own.clientUserMessageId);await f.guard.scan(foreground);assert.equal(f.guard.budget.status(f.x.id).used,1);
+  t.mock.timers.tick(10);append('unattested-queue','native-queue-id','queue');await f.guard.scan(foreground);assert.equal(f.guard.budget.status(f.x.id).used,1);
+  t.mock.timers.tick(10);append('human-input','native-composer-id');await f.guard.scan(foreground);assert.equal(f.guard.budget.status(f.x.id).used,0);
+  const retained=f.store.setting<{ids:string[]}>('turnEndOrigins:'+foreground.id)!;
+  assert.equal(retained.ids.includes(own.clientUserMessageId),false);assert.equal(retained.ids.length,300,'尚未进入原生轮次的编号仍须保留');
+  t.mock.timers.tick(10);f.guard.budget.admit(f.x.id,'after-human',turnNativeScope(foreground,endpoint));
+  await f.guard.scan(foreground);assert.equal(f.guard.budget.status(f.x.id).used,1,'裁剪后重扫旧轮次不能再补额');
+});
+
+function managedFixture(t:TestContext){
+  const f=fixture(t),home=f.broker.home,pair=f.store.pair(f.c.id,f.x.id),previous=f.store.endpoint(f.x.id)!,runtimeId=randomUUID();
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'busy'});f.store.updatePeer(f.c.id,{state:'ready'});
+  f.store.saveEndpoint({...previous,configHome:home,runtimeId});
+  f.store.saveEndpoint({...f.store.endpoint(f.c.id)!,modRevision:MOD_REVISION});f.broker.foregroundHealth.observe(f.c,'ready','foreground');
+  saveManagedRuntime(home,{id:runtimeId,owner:managedMarker(home),kind:'owned',state:'ready',dedicated:true,endpoint:previous.address,
+    peerId:f.x.id,sessionId:f.x.sessionId!,pid:previous.pid!,procStart:previous.procStart!,configHome:home,createdAt:Date.now()});
+  const native=(method:string,extra:object)=>f.codex.emit('native',{address:previous.address,message:{jsonrpc:'2.0',method,params:{threadId:f.x.sessionId,...extra}}});
+  return{...f,pair,native,previous};
+}
+
+test('Codex 真实 hook 分发在原生终态之前拦 Stop，保持工作状态且只在成功终态后登记完成',async t=>{
+  const f=managedFixture(t),{native,pair,previous}=f;
+  f.codex.emit('turnOriginObserved',f.x.id,'codex-root','partner');native('turn/started',{turn:{id:'codex-root',status:'inProgress'}});
+  await new Promise(resolve=>setImmediate(resolve));
+  const stop=(active:boolean)=>f.broker.dispatch('hook',{session_id:f.x.sessionId,hook_event_name:'Stop',turn_id:'codex-root',stop_hook_active:active}) as Promise<any>;
+  const blocked=await stop(false);assert.equal(blocked.decision,'block');assert.match(blocked.reason,/no work-tool calls/);
+  assert.equal(f.store.peer(f.x.id).state,'busy');assert.equal(f.broker.turnEnds.status(f.x).state,'running');
+  await stop(true);assert.equal(f.broker.turnEnds.status(f.x).state,'running','Stop 放行也不能代替原生成功终态');
+  native('turn/completed',{turn:{id:'codex-root',status:'completed'}});f.codex.emit('state',f.x.sessionId,'ready',previous.address);
+  await new Promise(resolve=>setImmediate(resolve));f.broker.turnEnds.refresh(pair);
+  assert.equal(f.broker.turnEnds.status(f.x).turn_id,'codex-root');assert.equal(f.broker.turnEnds.status(f.x).reason,'no_tools');
+});
+
+test('前台未应用 Stop 提示时完成事实仍待提醒，不能被暂存预约吃掉',t=>{
+  const f=setup(t);f.finish('background');f.guard.begin(f.fg(),'foreground');f.store.updatePeer(f.c.id,{state:'busy'});f.guard.refresh(f.pair);
+  const tip=f.guard.checkStop(f.fg(),{turn_id:'foreground',stop_hook_active:false,stats:f.stats(),background:{tasks:0,crons:0}});assert.ok(tip.block);
+  f.store.updatePeer(f.c.id,{state:'ready'});f.guard.complete(f.fg(),{turnId:'foreground',completedAt:Date.now(),stats:f.stats(),interventions:[]});f.guard.refresh(f.pair);
+  assert.equal(f.guard.status(f.fg()).state,'pending');assert.equal(f.guard.budget.status(f.c.id).used,0);assert.equal(f.pending().length,1);
+});
+
+test('明确未提交的提醒最多定时重试一次，持续拒绝时等下一个真实前台忙完边界',t=>{
+  const f=setup(t);f.finish('background');const first=f.admit();
+  f.health.outcome(f.pair.id,f.c.id,first.id,'pending');f.guard.refresh(f.pair);
+  t.mock.timers.tick(60001);const second=f.admit();assert.equal(second.id,first.id);
+  f.health.outcome(f.pair.id,f.c.id,second.id,'pending');f.guard.refresh(f.pair);
+  for(let index=0;index<10;index++){t.mock.timers.tick(60001);f.guard.refresh(f.pair);assert.equal(f.guard.ready(f.pair),false);}
+  assert.equal(f.guard.status(f.fg()).hold,'notice_retry_held');assert.equal(f.health.get(f.pair.id,f.c.id,first.id)?.completionRetry?.offers,2);
+  f.guard.begin(f.fg(),'independent');f.guard.complete(f.fg(),{turnId:'independent',completedAt:Date.now(),stats:f.stats()});f.guard.refresh(f.pair);
+  assert.equal(f.guard.ready(f.pair),true);f.admit();assert.equal(f.health.outcome(f.pair.id,f.c.id,first.id,'pending')[0]?.completionRetry?.offers,1);
+});
+
+test('队列在模型采样前被暂时门禁拒绝后保留事实和原预约，新轮次则释放确定未提交的旧预约',t=>{
+  const f=setup(t);f.finish('queued');const notice=f.admit();f.hold('pending_user');
+  assert.equal(f.guard.consumeQueued(f.fg(),notice.id,'declined'),false);f.guard.refresh(f.pair);assert.equal(f.guard.status(f.fg()).state,'pending');
+  f.hold(undefined);t.mock.timers.tick(60001);f.guard.refresh(f.pair);assert.equal(f.guard.ready(f.pair),true);assert.equal(f.guard.budget.status(f.c.id).used,1);
+  f.guard.begin(f.bg(),'new-background');assert.equal(f.guard.budget.status(f.c.id).used,0);
+});
+
+test('后台暂时失去端点不会吞掉真人补额，也不会保留可占用唤醒通道的旧通知',t=>{
+  const f=setup(t);f.finish('done');const endpoint=f.store.endpoint(f.x.id)!;
+  f.guard.budget.admit(f.c.id,'used',turnNativeScope(f.fg(),f.store.endpoint(f.c.id)!));
+  f.store.deactivate(f.x.id);f.guard.refresh(f.pair);assert.deepEqual(f.pending(),[]);
+  t.mock.timers.tick(1);f.guard.human(f.fg(),'during-restart');assert.equal(f.guard.budget.status(f.c.id).used,0);
+  f.store.saveEndpoint({...endpoint,active:true});f.guard.refresh(f.pair);assert.equal(f.pending().length,1);
+});
+
+test('失败轮次不能被无错误字段的文件终态覆盖，重绑也不把已汇报的旧轮次改成未确认',async t=>{
+  const f=setup(t),row=(payload:object)=>JSON.stringify({timestamp:new Date().toISOString(),type:'event_msg',payload})+'\n';
+  f.guard.begin(f.bg(),'failed');f.guard.native(f.bg(),{turnId:'failed',state:'failed'});
+  writeFileSync(f.file,JSON.stringify({type:'session_meta',payload:{id:f.x.sessionId}})+'\n'+row({type:'task_started',turn_id:'failed'})+row({type:'task_complete',turn_id:'failed'}),'utf8');
+  await f.guard.scan(f.bg());assert.equal(f.guard.status(f.fg()).state,'unavailable');assert.deepEqual(f.pending(),[]);
+  const at=Date.now();t.mock.timers.tick(1);f.store.accept(f.pair,f.bg(),'已汇报','reported');f.finish('reported',f.stats({actions:1,workTools:1,lastWorkAt:at}));
+  const previous=f.store.endpoint(f.x.id)!;f.store.deactivate(f.x.id);
+  f.store.saveEndpoint({...previous,epoch:'replacement'});f.guard.complete(f.bg(),{turnId:'reported',completedAt:Date.now()});f.guard.refresh(f.pair);
+  assert.equal(f.guard.status(f.fg()).reason,'reported');assert.equal(f.guard.status(f.fg()).state,'completed');assert.deepEqual(f.pending(),[]);
+});
+
+test('实际完成门槛：空闲前台收到后台原生完成；暂缓的完成提醒不占用其他唤醒',async t=>{
+  const f=managedFixture(t);
+  f.native('turn/started',{turn:{id:'background',status:'inProgress'}});
+  f.native('turn/completed',{turn:{id:'background',status:'completed'}});f.codex.emit('state',f.x.sessionId,'ready',f.previous.address);
+  await new Promise(resolve=>setImmediate(resolve));f.broker.turnEnds.refresh(f.pair);
+  assert.equal(f.broker.turnEnds.ready(f.pair),true);
+  const notice=f.broker.deliveryHealth.peek(f.pair.id,f.c.id).find(n=>n.source==='background_completed');assert.ok(notice);
+  f.broker.foregroundHealth.observe(f.c,'start','foreground');f.store.updatePeer(f.c.id,{state:'busy'});f.broker.turnEnds.begin(f.c,'foreground');
+  f.broker.turnEnds.refresh(f.pair);assert.equal(f.broker.turnEnds.ready(f.pair),false);
+  f.broker.deliveryHealth.enqueue(f.pair.id,f.c.id,{id:'independent-health',state:'pending',source:'turn_health',message:'Independent health fact',tier:4,wake:true});
+  const internals=f.broker as unknown as {runtimeHealth:BrokerHealthCoordinator;wakeNotices(pair:typeof f.pair,peer:typeof f.c):{id:string}[]};
+  const wakeNotices=internals.wakeNotices(f.pair,f.c);
+  assert.deepEqual(wakeNotices.map(n=>n.id),['independent-health']);
+  f.broker.foregroundHealth.observe(f.c,'ready','foreground');f.store.updatePeer(f.c.id,{state:'ready'});f.broker.turnEnds.refresh(f.pair);
+  const prepared=internals.runtimeHealth.admitNotices(f.pair,f.c,[notice],notice.scope!,true,true);
+  assert.equal(prepared.length,1);assert.equal(prepared[0]?.interventionIds?.[0],notice.id);
+  assert.equal(f.broker.turnEnds.status(f.c).state,'completed');assert.equal(f.store.messages().length,0);
+});
+
+test('实际完成门槛：后台先完成、前台后 Stop；过期或已结束的请求不扣额，应用回执才结清事实',async t=>{
+  const f=managedFixture(t),turnId='foreground',at=Date.now();
+  f.store.updatePeer(f.c.id,{state:'busy'});f.broker.foregroundHealth.observe(f.c,'start',turnId);f.broker.turnEnds.begin(f.c,turnId);
+  const health={turnId,state:'running' as const,lastEventAt:at,lastProgressAt:at,tools:[]};
+  f.store.saveEndpoint({...f.store.endpoint(f.c.id)!,nativeHealth:health});
+  f.native('turn/started',{turn:{id:'background',status:'inProgress'}});
+  f.native('turn/completed',{turn:{id:'background',status:'completed'}});f.codex.emit('state',f.x.sessionId,'ready',f.previous.address);
+  await new Promise(resolve=>setImmediate(resolve));f.broker.turnEnds.refresh(f.pair);
+  assert.equal(f.broker.turnEnds.ready(f.pair),false);
+  const stats={startedAt:at,covered:true,actions:0,workTools:0},input={actor:{host:'claude',memberId:f.c.id,sessionId:f.c.sessionId!,callId:randomUUID()},turn_id:turnId,stop_hook_active:false,stats,background:{tasks:0,crons:0},deadline_at:at+4500};
+  assert.deepEqual(await f.broker.dispatch('peer.turn.stop',{...input,deadline_at:at-1}),{});
+  assert.equal(f.broker.turnEnds.budget.status(f.c.id).used,0);
+  const tip=await f.broker.dispatch('peer.turn.stop',input) as {block?:string;intervention_id:string};assert.ok(tip.block);
+  assert.equal(f.broker.turnEnds.status(f.c).state,'pending','返回 Stop 建议还不能证明前台见到了事实');
+  f.store.saveEndpoint({...f.store.endpoint(f.c.id)!,nativeHealth:{...health,state:'ready',completion:'completed'}});
+  f.broker.turnEnds.native(f.c,{turnId,state:'ready',completion:'completed'});
+  f.broker.foregroundHealth.observe(f.c,'ready',turnId);f.store.updatePeer(f.c.id,{state:'ready'});f.broker.turnEnds.refresh(f.pair);
+  assert.equal(f.broker.turnEnds.ready(f.pair),true,'前台已经空闲但完成回执缺失时，提醒不能永久扣住');
+  assert.deepEqual(await f.broker.dispatch('peer.turn.stop',{...input,deadline_at:at-1,stop_hook_active:true,background:{tasks:1,crons:1}}),{confirmed:true});
+  assert.equal(f.broker.turnEnds.status(f.c).state,'completed','已应用提示的回执不依赖后台任务归零或完成回执');
+  f.store.saveEndpoint({...f.store.endpoint(f.c.id)!,nativeHealth:{...health,state:'ready',completion:'completed'}});
+  assert.deepEqual(await f.broker.dispatch('peer.turn.stop',{...input,turn_id:turnId}),{});
+  f.broker.turnEnds.complete(f.c,{turnId,completedAt:Date.now(),stats,interventions:[{id:tip.intervention_id,inert:true}]});
+  f.store.updatePeer(f.c.id,{state:'ready'});f.broker.foregroundHealth.observe(f.c,'ready',turnId);f.broker.turnEnds.refresh(f.pair);
+  assert.equal(f.broker.turnEnds.status(f.c).state,'completed');assert.equal(f.broker.turnEnds.budget.status(f.c.id).used,0);
+});
+
+for(const host of ['claude','codex'] as const)test(host+' 前台 Stop 已空闲但回执未结算时，不重复叫醒同一事实',t=>{
+  const f=setup(t);
+  if(host==='codex'){f.store.updatePeer(f.c.id,{owner:'nxbridge'});f.store.updatePeer(f.x.id,{owner:'user'});}
+  const foreground=()=>f.store.peer(host==='claude'?f.c.id:f.x.id),background=()=>f.store.peer(host==='claude'?f.x.id:f.c.id);
+  f.guard.begin(background(),'background');f.guard.complete(background(),{turnId:'background',completedAt:Date.now(),stats:f.stats()});
+  f.guard.begin(foreground(),'foreground');f.store.updatePeer(foreground().id,{state:'busy'});f.guard.refresh(f.pair);
+  const tip=f.guard.checkStop(foreground(),{turn_id:'foreground',stop_hook_active:false,stats:f.stats(),background:{tasks:0,crons:0}});assert.ok(tip.block);
+  assert.equal(f.guard.status(foreground()).hold,'foreground_tip_pending');
+  f.guard.confirmStop(foreground(),'foreground');
+  f.store.updatePeer(foreground().id,{state:'ready'});f.guard.native(foreground(),{turnId:'foreground',state:'ready',completion:'completed'});f.guard.refresh(f.pair);
+  assert.equal(f.guard.ready(f.pair,true),false);assert.deepEqual(f.health.peek(f.pair.id,foreground().id),[]);
+  assert.equal(f.guard.budget.status(foreground().id).used,1);
+  f.guard.confirmStop(foreground(),'foreground');f.guard.refresh(f.pair);
+  assert.equal(f.guard.status(foreground()).state,'completed');assert.equal(f.guard.ready(f.pair,true),false);
+  assert.equal(f.store.setting<{id:string}>('turnEndIntervention:'+foreground().id)?.id,tip.intervention_id);
+  f.guard.complete(foreground(),{turnId:'foreground',completedAt:Date.now(),stats:f.stats()});
+  assert.equal(f.guard.budget.status(foreground().id).used,0);assert.equal(f.guard.ready(f.pair,true),false);
+});
+
+for(const host of ['claude','codex'] as const)test(host+' 前台真正空闲后不等缺失的完成回执，迟到确认仍能撤回尚未提交的提醒',t=>{
+  const f=setup(t);
+  if(host==='codex'){f.store.updatePeer(f.c.id,{owner:'nxbridge'});f.store.updatePeer(f.x.id,{owner:'user'});}
+  const foreground=()=>f.store.peer(host==='claude'?f.c.id:f.x.id),background=()=>f.store.peer(host==='claude'?f.x.id:f.c.id);
+  f.guard.begin(background(),'background');f.guard.complete(background(),{turnId:'background',completedAt:Date.now(),stats:f.stats()});
+  f.guard.begin(foreground(),'foreground');f.store.updatePeer(foreground().id,{state:'busy'});
+  const tip=f.guard.checkStop(foreground(),{turn_id:'foreground',stop_hook_active:false,stats:f.stats(),background:{tasks:0,crons:0}});assert.ok(tip.block);
+  f.store.updatePeer(foreground().id,{state:'ready'});f.guard.stopped(foreground(),'foreground');f.guard.refresh(f.pair);
+  assert.equal(f.guard.ready(f.pair),true);assert.equal(f.guard.status(foreground()).hold,undefined);
+  assert.equal(f.guard.budget.status(foreground().id).used,1,'未确认的停止建议保持扣额');
+  assert.equal(f.guard.confirmStop(foreground(),'foreground'),true);f.guard.refresh(f.pair);
+  assert.equal(f.guard.status(foreground()).state,'completed');assert.deepEqual(f.health.peek(f.pair.id,foreground().id),[]);
+  f.guard.complete(foreground(),{turnId:'foreground',completedAt:Date.now(),stats:f.stats()});
+  assert.equal(f.guard.budget.status(foreground().id).used,0,'保留的原生元数据仍支持迟到的无动作证明');
+});
+
+test('前台 Stop 确认丢失后失败或直接开新轮次，不永久挡住提醒，也不把未知结果退费',t=>{
+  const f=setup(t);f.finish('background');
+  for(const terminal of ['failed','next-turn']){
+    f.guard.begin(f.fg(),'foreground-'+terminal);f.store.updatePeer(f.c.id,{state:'busy'});f.guard.refresh(f.pair);
+    assert.ok(f.guard.checkStop(f.fg(),{turn_id:'foreground-'+terminal,stop_hook_active:false,stats:f.stats(),background:{tasks:0,crons:0}}).block);
+    if(terminal==='failed')f.guard.native(f.fg(),{turnId:'foreground-'+terminal,state:'failed'});
+    else f.guard.begin(f.fg(),'next-real-turn');
+    f.store.updatePeer(f.c.id,{state:'ready'});f.guard.refresh(f.pair);
+    assert.equal(f.guard.ready(f.pair),true);assert.equal(f.guard.status(f.fg()).state,'pending');
+  }
+  assert.equal(f.guard.budget.status(f.c.id).used,2);
+});
+
+test('已经采样的同轮队列回执遇到门槛变化仍幂等，不能重新变成未提交预约',t=>{
+  const f=setup(t);f.finish('background');const notice=f.admit();
+  assert.equal(f.guard.consumeQueued(f.fg(),notice.id,'sampled'),true);f.hold('pending_user');
+  assert.equal(f.guard.consumeQueued(f.fg(),notice.id,'sampled'),true);assert.equal(f.guard.consumeQueued(f.fg(),notice.id,'other'),false);
+  f.guard.refresh(f.pair);f.hold(undefined);t.mock.timers.tick(60001);f.guard.refresh(f.pair);
+  assert.equal(f.guard.ready(f.pair),false);assert.deepEqual(f.pending(),[]);
+  f.guard.complete(f.fg(),{turnId:'sampled',completedAt:Date.now(),stats:f.stats({actions:1,workTools:1})});
+  assert.equal(f.guard.budget.status(f.c.id).used,1);
+});

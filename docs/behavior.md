@@ -74,6 +74,7 @@ Codex 最低要求 0.164.0，安装和更新在任何激活前拒绝更旧或无
 **任务调度与子代理**
 
 - 非简单任务开工前，两边在联系得上对方时先商定分工和可并行的部分，再各自派子代理；负责人持续推进关键路径，只在真正依赖处等待，并负责合并和发版。重型测试或构建两边同时只跑一组。这些都是默认做法，用户的直接意愿优先：消息、AGENTS.md / CLAUDE.md、任务要求，以及搭档转达的用户意愿。
+- 搭档协作时，一轮结束前：结果先发消息告诉搭档（搭档看不到最后的回复文字）；自己负责的已授权工作接着做，不只回一句确认就停；等搭档时写清下一步由谁来做，卡住时说明卡点和需要谁处理。
 - Codex 子代理：技能里的规则让 Codex 把比较独立的工作（功能实现、排查、各平台的工作、评审等）交给子代理，默认同时最多 2 个，子代理不再往下派。这个上限只写在提示里，不改 Codex 的并发配置，用户要求更多时可以照做。不写全局配置，也不在启动时注入参数，所以用着 nxbridge 插件的 Codex 不管怎么启动都适用；Codex 没读到技能时，退回它原本的行为，即用户明确要求才派子代理。
 - 子代理会带着主会话缓存下来的规则文字，第一条规则让它们不去照做，并不能把这段文字从上下文里去掉。真正的限制在 nxbridge：确认是 Codex 子代理时，拒绝它发消息、提问等面向搭档的操作。Claude 子代理收不到 Mod 注入的规则，对外发信仍按 `collaboration.subagent_send` 处理。
 - 任务说明里的 nxref 只在经过本地 hook 的原生 `spawn_agent` 调用里展开，新旧两版多代理机制都支持，引用不存在时在派生前拒绝。服务端托管的多代理调用不经过本地 hook，nxbridge 拦不到，这时模型要先取回内容、直接写进任务说明，不能把未展开的引用交给子代理。
@@ -215,15 +216,17 @@ nxbridge doctor
   - 只适用于已登记、已配对的根会话和分叉会话，沿用现有唤醒授权和闸门，不新建配对或宿主。中断暂停、暂停、禁用、上下文切换、授权和原生人工审批闸门在提交前和消费时都生效。
   - 与进行中的搭档消息或健康唤醒合并成一轮；主线程自然恢复或上下文变化时撤销待发唤醒。合并占用在提交进行中由当前协调器持有，提交返回后（或协调器重启后遗留的记录）30 秒过期：之后搭档消息照常唤醒，已提醒过的完成不再重复自动提交。
   - 传输先用现有原生唤醒（`--no-daemon` 窗口的原路径是原生排队接口 `thread/queue/add`，与 `codex queue` 命令同一接口）。原生唤醒在写入前确认不可用或被明确拒绝，并且仍能通过现有连接只读核验会话已加载且空闲时，改用一次原生排队：经已核验端点的现有原生控制连接调用 `thread/queue/add`，带持久化的不透明 `clientUserMessageId`，不新建或恢复会话（不用 `thread/start` / `thread/resume`）。连接不上、核验不了或提交结果不明时不排队、不重试。排队成功只表示已入队，不代表已读或已唤醒。
-  - 唤醒提醒要求 Codex 结束本回合前，先把结果告诉在等待的搭档，或继续已授权的任务。这只覆盖唤醒回合；普通回合未告知就结束，由下一条 `codex_final` 转发兜底。
+  - 唤醒提醒要求 Codex 结束本回合前，先把结果告诉在等待的搭档，或继续已授权的任务。这只覆盖唤醒回合；后台 Codex 的普通回合未告知就结束，由“后台做完一轮”兜底。
   - 待处理批次叫不醒或没法确认已处理（无可用通道、被闸门挡住、提交结果不明、唤醒次数用完）时，作为被动异常 `subagent_completion_held` 每批报告一次：进入 `integrationIssues`（带 `owner`，用户窗口另带名称和会话 ID）和 `status` 里成员的 `childCompletions`（`unconfirmed` 表示没法确认已处理，不代表没处理），并附加给配对的 Claude，不唤醒。主线程自然恢复或通道恢复后撤销。主线程正常干活不算。
-- Codex 结束一轮、未告知在等待的 Claude（`codex_final`）：只看已完成的原生回合，不看轮中。同时满足以下条件时，把该回合的最终回复原文作为第 4 档系统提醒（`source=codex_final`、`readyOnly:true`）转给 Claude 并唤醒一次：该回合最后一次搭档发信之后，还有原生的非发信工具调用或子代理活动（发信调用自身的返回和记账不算）；最终回复晚于最后一次发信；Claude 已读到这次发信（`contextObserved` / `responded`）且处于空闲。Codex 在本配对上下文里从未发信时，以 Codex 已读到的 Claude 最新消息为锚点，其余条件不变；正文改写为“after reading your message”，`status` 里的 `anchor_from` 为 `claude`（否则为 `codex`）。只有 Codex 真正发信才重置连续计数。正文写明回合 ID、完成时间、Claude 最后读到的消息编号，并注明“不是发给你的、不是用户批准、无需回复”。随后提示 Claude 下一步：还有已授权的工作就继续或转派；即使没有，也要回顾自用户提出要求以来的全部改动（含 Codex 的），从目标和需求、最上层的规划和设计开始反思，避免路线错误；只有少量无伤大雅的小毛病就记下来择机优化，问题较大或毛病较多就继续优化；完成或受阻时向用户汇报。末尾附 `Auto-forward k/2 in a row`（连续第几次自动转发）。发信后只补一句收尾就结束的回合不转发。
-  - 来源：只转非人工输入开始的回合。nxbridge 后台会话：已核验的自有原生代次，回合内采样到搭档收件，且回合内没有任何人工输入（附着终端里的输入也算人工）。用户窗口：唤醒经原生排队接口提交，带持久化的不透明 `clientUserMessageId`，再与原生 `turnTrigger` 和用户消息记录精确对应。混有人工输入或对不上的回合不转；来源读不到时不猜，只作为保留原因显示（`origin_unverified` / `history_unavailable` / `history_pending`）。
-  - 合并：回合结束时仍有待处理的子代理完成批次，先等那次唤醒回合结束，再合成一次转发，保留原最终回复，并把后一轮的最终回复附作补充说明；后一轮来源没有独立核验（旧版唤醒没有调用方编号，或可能是人工入队）时只注明子代理完成回合已结束、正文未核验而省略。等待期间原生历史回滚或截断、候选回合的最终回复对不上时撤销候选，保留原因为 `history_changed`。离线/就绪状态抖动不算回合结束。
-  - 只在空闲时送：协调器写入唤醒标记前确认 Claude 当前空闲，忙时返回 `deferred`，不写标记。Mod 只在原生空闲边界（唤醒标记以 meta 提示到达、不在回合中）领取时声明 `ready_boundary`。普通提交、工具结果和忙时的领取不能领取或合并这条提醒，返回 `deferred` 时保留同一编号，等下次空闲再送，不计入次数。
-  - 上限：连续自动转发 2 次、其间 Codex 没有真正发出搭档消息时保留（`cap_reached`）。Codex 真正发出一条搭档消息，或出现经核验的人工输入（Claude 窗口里的用户提交，或 Codex 窗口里的人工输入）后重新计数；Claude 的推动不重置计数。送达结果不明的不重放。同一接收方的全局 60 秒提醒间隔内保留为 `notice_cooldown`；新的 `codex_final` 事实不受同类提醒 10 分钟重复间隔限制，同一事实仍去重。
-  - 闸门：沿用暂停、禁用、中断暂停、离线、运行时、配置和原生审批闸门。Codex 有待用户回答的问题（`question_pending`）、有已记录且待处理的子代理完成唤醒（`children_pending`；只等已记录的完成批次，不等仍在运行、尚未完成的子代理）、回合仍在进行（`codex_turn_running`），或 Claude 没读到上一条消息（`partner_not_read`）时不转。Claude 窗口的插件还是不支持空闲边界的旧版本时先不送（`mod_pending`），等插件在空闲时自动重新加载后再送，旧插件不会收到这条提醒的唤醒标记。
-  - 状态：`status` / `doctor` 里成员的 `final_forward`（`pending`、`hold`、`consecutive`、`cap`、`turn_id`、`last_read_message_id`、`anchor_from`、`waiting_children`、`child_wake_pending`、`followup_turn_id`、`last_forward`）。
+- 后台做完一轮（`completion_guard`）：nxbridge 在后台根据原生状态判断，只在像是停住时给模型一句话，不转发最终回复原文，不靠模型自己标记，也不靠计时。
+  - 范围：后台指 nxbridge 启动的后台搭档（含托管的 worker 子会话），前台指与它配对的用户窗口；两个方向都适用（后台 Codex → Claude 窗口，后台 Claude → Codex 窗口）。两边都是后台、或两边都是用户窗口时不适用（`not_applicable`）。前台做完一轮不告知后台。原生子代理照旧走父会话的完成通知。
+  - 做完的判定：Codex 是原生 `task_complete`（不含出错、中断、等审批）；Claude 是这一轮成功结束，并且 Stop 时后台任务和定时任务都是 0。中途还要继续的 Stop 不算做完。
+  - 第一层，后台结束时拦一次：这一轮由搭档消息开始、整轮没用任何非 nxbridge 工具、此刻前台空闲时，拦下这次结束并附一句提示（`background_zero`）：有自己负责的工作就现在做，需要搭档做事就发要回复的消息写明下一步，否则不发消息直接结束；最后一次发信之后又做了工作、还没汇报时，提示结束前先汇报（`background_unreported`）。只看工具和发信这些事实，不看消息字面，说了“这就开始”也照样会被拦。每轮最多拦一次，同一回合继续，不开新轮；被拦下的结束不算做完，不标就绪，也不当作安全重启或迁移的空闲证明。工具和发信的记录不完整时直接放行，交给第二层。
+  - 第二层，告知前台：后台停下时这一轮没调用干活的工具、做了事没汇报或无法确认，并且前台还没看到这个状态时（不论第一层是否拦过），前台正在忙就在它自己结束时拦一次附一句话，前台空闲就叫醒一次（`foreground_completed`，`source=background_completed`）。话里有后台名称、结束时间、这一轮的情况和剩余次数，提示前台：后台负责的工作没做完就发要回复的消息写明下一步，已做完或需要用户就不发消息直接结束。其他做完的情况只更新状态，不进模型上下文。后台又开始工作时撤销还没送出的提示。提醒确定没送进前台时（例如送到时前台正忙被丢弃），保留同一次额度和同一件事，等前台下次从忙变闲再送；前台一直空闲时最多再试一次，之后只在状态里显示（`notice_retry_held`），不反复提示。
+  - 次数：上面三种 nxbridge 自己的出手共用 `collaboration.completion_wake_limit`（默认 4，设为 0 关闭出手，状态照常显示）。出手之后那一段什么都没做（没调用任何工具、没发信、没派生任何东西）就退回这一次；证据不明的照样计入。只有用户输入才补满：Claude 窗口只认本人在输入框或 Claude 桌面端、VS Code 里的提交（`hosts.claude.sdk_user_prompt` 打开的 SDK 输入不算）；Codex 窗口分不出手打和脚本送入，开始新一轮的输入里，除了 nxbridge 自己送入的内容都算；Codex 正忙时排进队列的输入（`queue`）一律不算，因为任何程序都能这样排进去。上限在用户输入时记下，之后改配置或重启都不会补；调低（包括设为 0）立即生效，按记下的和当前配置里较小的算，调高要等下一次用户输入。搭档消息、汇报、工具调用、文件改动、定时任务、重连和时间流逝都不会补。用完后不再出手：前台是 Claude 窗口时，它的状态栏显示后台停下了、提醒已用完；前台是 Codex 窗口时只在 `status` / `doctor` 里显示。在前台窗口发一条消息即恢复。
+  - 保证的范围：每次用户输入之后，nxbridge 有实际效果的出手最多为上限次数，不会自己引出无限循环。正常的搭档消息照常投递和唤醒，不受这个次数限制；两个模型自己来回发消息不在这个保证里。
+  - 暂缓：前台忙（`foreground_busy`）、后台又开始工作（`background_busy`）、有待用户回答的问题或待批准的操作（`pending_user`）、暂停（`paused`）、关闭（`disabled`）、连接中断（`runtime_unavailable`）、后台实际状态还没确认（`native_state_unverified`）、次数用完（`wake_budget_exhausted`）、没有前台窗口（`no_foreground`）、刚提醒过（`notice_cooldown`）、提醒没送进前台、等前台下次忙完再送（`notice_retry_held`）、正在确认前台是否收到了结束时的提醒、等前台这一轮收尾（`foreground_tip_pending`）、次数记录是读不懂的版本写的（`budget_unavailable`：不出手，做完的状态照常显示）。次数用完显示在 Claude 前台窗口的状态栏；其他暂缓，以及 Codex 前台窗口的次数用完，只在 `status` / `doctor` 里显示。
+  - 状态：`status` / `doctor` 里配对和成员的 `completion_guard`（`background_id`、`foreground_id`、`state`：`not_applicable` / `running` / `completed` / `pending` / `limited` / `unavailable`，`turn_id`、`completed_at`、`reason`：`no_tools` / `work_after_message` / `unverified` / `reported`，`hold`，`budget`：`used` / `limit` / `remaining` / `awaitingProof`）。
 
 ### 卡住的 Codex 轮次（`recover`）
 
@@ -786,6 +789,7 @@ max_references = 1024
 | `collaboration.implicit` | `never` 关闭自动创建后台搭档 | 敏感 |
 | `collaboration.compatibility_wake` | `strict` 不通过 user turn 唤醒 embedded 会话 | 敏感 |
 | `collaboration.subagent_send` | `deny` 要求所有外部通信由主会话完成；Codex 子代理不论此项都不能对外通信 | 敏感 |
+| `collaboration.completion_wake_limit` | 每次用户输入之后，“后台做完一轮”里 nxbridge 自己出手（后台结束时拦一次、前台结束时拦一次、叫醒前台）的最多次数，默认 4；0 关闭出手，状态照常显示 | 敏感 |
 | `hosts.{codex,claude}.command / binary / home` | 启动命令、程序路径、配置目录 | 敏感 |
 | `hosts.codex.endpoint / auth_token_env` | 现有 App Server 地址；认证 token 所在的环境变量名（只存名字，不存值） | 敏感 |
 | `partners.{codex,claude}.model / effort` | 新建后台搭档用的模型和推理强度，写明时优先于 `profile_source` 的默认值 | 敏感 |

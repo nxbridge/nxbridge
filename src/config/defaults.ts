@@ -18,6 +18,7 @@ export const DEFAULT_CONFIG: BridgeConfig = {
   syncTipMinutes: 30,
   contextTipTokens: [400000,600000,850000],
   idleNoticeMinutes: 5,
+  completionWakeLimit: 4,
   partnerProfiles: {claude:{source:'recommended'},codex:{source:'recommended'}},
   retention: DEFAULT_RETENTION,
 };

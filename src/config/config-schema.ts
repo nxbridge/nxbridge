@@ -15,6 +15,7 @@ export const CONFIG_FIELDS:ConfigField[]=[
   field('collaboration.sync_tip_minutes','syncTipMinutes',z.number().int().nonnegative().max(2147483647),'0～2147483647 的整数分钟，0 关闭',true),
   field('collaboration.context_tip_tokens','contextTipTokens',z.array(positive).max(16).refine(values=>values.every((value,index)=>index===0||value>values[index-1]!)),'最多 16 个严格递增的正整数 token 阈值，空数组关闭上下文提醒',true),
   field('collaboration.idle_notice_minutes','idleNoticeMinutes',z.number().int().nonnegative().max(2147483647),'0～2147483647 的整数分钟，0 关闭',true),
+  field('collaboration.completion_wake_limit','completionWakeLimit',z.number().int().nonnegative().max(2147483647),'0～2147483647 的整数，0 关闭自动完成干预'),
   field('questions.timeout_ms','questionTimeoutMs',duration,'1～2147483647 的整数毫秒',true),
   field('hosts.claude.sdk_user_prompt','claudeSdkUserPrompt',z.boolean(),'true 或 false（默认 false）'),
   ...(['codex','claude'] as const).flatMap(host=>[

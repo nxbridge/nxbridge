@@ -62,14 +62,18 @@ test('status 文本：子代理已做完但没法确认主线程接着处理时�
   assert.doesNotMatch(formatStatus({paired:true,self:{id:'c',host:'claude',name:'Claude',state:'ready'},partner:partner({unconfirmed:1,needsWake:0,awaitingContext:1,hold:null}),pending:0,questions:0}),/子代理/);
 });
 
-test('status 文本：Codex 结束一轮没告诉 Claude，只在达到上限或来源确认不了时提示；处理中的正常状态不显示',()=>{
-  const text=(final_forward?:any)=>formatStatus({paired:true,self:{id:'c',host:'claude',name:'Claude',state:'ready'},partner:{id:'x',host:'codex',name:'Codex',state:'ready',...(final_forward?{final_forward}:{})},pending:0,questions:0});
-  assert.match(text({pending:true,hold:'cap_reached',consecutive:2,cap:2,turn_id:'t'}),/已连续自动转给 Claude 2\/2 次，这次不再自动转/);
-  assert.match(text({pending:true,hold:'history_unavailable',consecutive:0,cap:2}),/读不到它的历史记录来核对/);
-  assert.match(text({pending:false,hold:'origin_unverified',consecutive:0,cap:2}),/确认不了这一轮是不是你自己开始的/);
-  assert.doesNotMatch(text({pending:false,hold:'history_unavailable',consecutive:0,cap:2}),/结束一轮没告诉 Claude/,'没有待转的一轮时，历史读不到不能说成 Codex 没告诉 Claude');
-  for(const hold of [null,'partner_not_read','children_pending','codex_turn_running','history_pending','question_pending','partner_reported'])assert.doesNotMatch(text({pending:hold!==null,hold,consecutive:1,cap:2}),/结束一轮没告诉 Claude/);
-  assert.doesNotMatch(text(),/结束一轮没告诉 Claude/);
+test('status 文本：后台做完一轮的状态按对去重，正常汇报和工作中不显示，用完次数写明怎么恢复',()=>{
+  const view=(extra:any)=>({background_id:'x',foreground_id:'c',state:'completed',completed_at:Date.UTC(2026,0,5,1,30),reason:'no_tools',budget:{used:1,limit:4,remaining:3,awaitingProof:0},...extra});
+  const text=(guard?:any,selfGuard?:any)=>formatStatus({paired:true,self:{id:'c',host:'claude',name:'Claude',state:'ready',...(selfGuard?{completion_guard:selfGuard}:{})},partner:{id:'x',host:'codex',name:'Codex',state:'ready',...(guard?{completion_guard:guard}:{})},pending:0,questions:0});
+  const limited=view({state:'limited',hold:'wake_budget_exhausted',budget:{used:4,limit:4,remaining:0,awaitingProof:0}});
+  assert.match(text(limited),/后台 Codex .*做完一轮停下了（这一轮没调用干活的工具）；自动提醒已用完（4 次），在前台窗口发条消息就会恢复/);
+  assert.equal(text(limited,limited).match(/自动提醒已用完/g)?.length,1,'同一对只写一次');
+  assert.match(text(view({state:'pending',hold:'foreground_busy'})),/等前台这一轮结束后再提醒/);
+  assert.match(text(view({state:'pending',hold:'native_state_unverified'})),/还没能确认后台 Codex的实际状态/);
+  assert.match(text(view({})),/做完一轮停下了（这一轮没调用干活的工具）/);
+  assert.match(text(view({state:'limited',user_text:'后端给的文字'})),/后端给的文字/);
+  for(const quiet of [view({reason:'reported'}),view({state:'running'}),{state:'not_applicable'},view({state:'pending',hold:'background_busy'})])assert.doesNotMatch(text(quiet),/后台 Codex|后台搭档/);
+  assert.doesNotMatch(text(),/后台 Codex|后台搭档/);
 });
 
 test('读不到最新一步时状态只说进度暂时无法观测，不说没有进展；有进度证据时照旧',()=>{

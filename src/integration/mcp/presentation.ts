@@ -3,6 +3,7 @@ import {delay} from '../../shared/time.js';
 import {describeError} from '../../shared/errors.js';
 import {type DeliveryState,type Message,type Peer} from '../../types.js';
 import type { PartnerQuestion } from './questions.js';
+import {completionGuardText} from '../../broker/turn-end-text.js';
 
 export const DELIVERY_LABELS:Record<DeliveryState,string>={accepted:'已持久化',sending:'正在提交',runtimeQueued:'运行时已接受',held:'等待人工放行',contextObserved:'已观察到上下文记录',responded:'已有明确关联回复',refused:'已拒收',expired:'已过期',unknown:'接受情况待核对'};
                                         
@@ -33,17 +34,19 @@ export function providerStatusText(health:any):string|undefined{
 }
 const profileText=(p:{model?:string;effort?:string|number;serviceTier?:string|null}|undefined)=>[p?.model!==undefined?'模型 '+p.model:'',p?.effort!==undefined?'推理强度 '+p.effort:'',p?.serviceTier!==undefined?'服务档位 '+(p.serviceTier??'未指定'):''].filter(Boolean).join('，');
 const profileSourceText=(p:any)=>{const view=p.partner_profile;if(view?.delivery_held||!['applied','host'].includes(view?.status))return'';const tags:Record<string,string>={recommended:'nxbridge 推荐',config:'nxbridge 配置',explicit:'此搭档单独指定',host:'宿主配置',frozen:'冻结'};const labels=[['model','模型'],['effort','强度'],['serviceTier','档位']].flatMap(([key,label])=>view.effective?.[key!]!==undefined&&tags[view.sources?.[key!]]?[label+'来自'+tags[view.sources[key!]]]:[]);return labels.length?'（'+labels.join('，')+'）':'';};
-                                                        
-                                            
-function finalForwardNotice(member:any):string[]{
-  const forward=member?.final_forward,hold=forward?.hold;
-  if(!forward||!hold)return[];
-  const next='两边都停着的话，到 Claude 窗口说一句继续';
-  if(hold==='cap_reached')return[`Codex 结束一轮没告诉 Claude，已连续自动转给 Claude ${forward.consecutive??forward.cap}/${forward.cap} 次，这次不再自动转：${next}（Codex 正常发出消息或你说话后重新计数）`];
-                                                                                            
-  if(hold==='origin_unverified')return[`Codex 结束一轮没告诉 Claude，但确认不了这一轮是不是你自己开始的，没有自动转给 Claude：${next}`];
-  if(hold==='history_unavailable'&&forward.pending===true)return[`Codex 结束一轮没告诉 Claude，但读不到它的历史记录来核对，没有自动转给 Claude：${next}`];
-  return[];
+                                                    
+                                              
+function completionGuardNotices(members:any[]):string[]{
+  const seen=new Set<string>(),lines:string[]=[];
+  for(const member of members){
+    const view=member?.completion_guard;if(!view||typeof view!=='object')continue;
+    const key=view.background_id+'>'+view.foreground_id;if(seen.has(key))continue;seen.add(key);
+    if(view.state==='completed'&&view.reason==='reported')continue;
+    const host=view.background_host??members.find(m=>m?.id===view.background_id)?.host;
+    const text=typeof view.user_text==='string'&&view.user_text.trim()?view.user_text.trim():completionGuardText({...view,...(host==='claude'||host==='codex'?{background_host:host}:{})});
+    if(text)lines.push(text);
+  }
+  return lines;
 }
                                
 function profileNotice(member:any):string[]{
@@ -68,8 +71,8 @@ export function formatStatus(status:any):string{
     ...[status.self,status.partner].flatMap(profileNotice),
                                       
     ...[status.self,status.partner].flatMap(p=>p?.childCompletions?.hold?.reason?[`Codex 的子代理已做完，尚未确认主线程接着处理：${p.childCompletions.hold.reason}。没动的话到原 Codex 窗口说一句继续，不用重跑子代理`]:[]),
-                                                                
-    ...[status.self,status.partner].flatMap(finalForwardNotice),
+                                               
+    ...completionGuardNotices([status.self,status.partner]),
     `待处理消息：${status.pending}；待处理问题：${status.questions?.length??0}`,
     ...(status.identityIssues??[]).map((issue:{message:string})=>'Codex 客户端身份：'+issue.message),
     ...(status.communicationTips?[`发送提示：长报告 ${status.communicationTips.firings.report} 次，引用复用 ${status.communicationTips.firings.reuse} 次；最近 ${status.communicationTips.window.samples} 条字符中位数 ${status.communicationTips.window.median}，P90 ${status.communicationTips.window.p90}；详细统计见 nxbridge status/doctor`]:[]),

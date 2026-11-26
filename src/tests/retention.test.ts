@@ -98,7 +98,7 @@ test('归档空配对和长期离线死会话被回收，当前配对与活进�
   assert.equal(store.currentPair()?.id,current.id);assert.equal(store.peer(live.id).id,live.id);assert.equal(store.peer(x.id).id,x.id);
   assert.throws(()=>store.peer(dead.id),/不存在/);assert.throws(()=>store.peer(c.id),/不存在/);
   assert.equal(store.setting('codexFinalForward:'+dead.id),undefined);assert.equal(store.setting('codexFinalForwardStreak:'+archived.id),undefined);
-  assert.deepEqual(store.setting('codexFinalForwardStreak:'+current.id),{used:1});
+  assert.equal(store.setting('codexFinalForwardStreak:'+current.id),undefined,'旧转发账本即使仍配对也应删除');
   assert.deepEqual(store.setting('windowRecoveryPending'),{[live.id]:{peerId:live.id}});assert.equal(store.setting('managedSessionConflict:'+live.id),undefined);assert.equal(store.setting('managedSessionConflict:'+dead.id),undefined);
 });
 

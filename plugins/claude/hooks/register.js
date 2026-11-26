@@ -2,7 +2,7 @@ import { questionSubmit, questionCall, questionStart, questionAppend, questionTu
 import { modelMessage, referenceDeny } from './errors.js';
 import { configurationStart, configurationCall, configurationCommand } from './configuration.js';
 import { call, read, captureContext, markContextEnd, setModVersion, observePermission, noteReceiptFailure, observeInbound, observeProfile, beginEffortCommand, observeEffortAppend, scheduleProfileRead, ownedProfileContext, predictedHold, isOff, markContextStarted, publishFacts, observeDecision, observeInteractive } from './mod-control.js';
-import { observeAutoDecision, observeStop, autoModeText } from './auto-mode.js';
+import { observeAutoDecision, autoModeText } from './auto-mode.js';
 import { switchStart, switchCall, switchCommand, SWITCH_COMMAND } from './switch.js';
 import { pairingStart, pairingCall, partnerProfileCall, pairingCommand, choosePartner, lostReasonText, lostPartnerName, openPartnerCall, setPairingInteractive, pickInChat, pairingModelResult, noPairOptionsText } from './pairing.js';
 import { nativeFormCall, nativeFormFailure } from './native-form.js';
@@ -14,8 +14,9 @@ import { startProgress, progress, streamProgress } from './progress.js';
 import { hostingText, hostingModel } from './hosting.js';
 import { HumanTurns } from './human-turns.js';
 import { providerText, failedText } from './provider.js';
-import { humanPrompt } from './human-origin.js';
+import { humanOrigin, humanPrompt, inputSource } from './human-origin.js';
 import { permissionText, pairPermission, admissionText } from './admission.js';
+import { TurnCompletion, checkTurnStop, closeTurnStop, turnCompletionFacts, publishStopConfirmation } from './turn-completion.js';
                                          
 const ADDRESS = 'nxbridge:codex';
                                                          
@@ -164,6 +165,9 @@ const incidentText = status => {
   const step = item.action?.owner === 'user' && typeof item.action.text === 'string' && item.action.text.trim() && !item.userText.includes(item.action.text.trim()) ? `；你需要：${item.action.text.trim()}` : '';
   return (step ? item.userText.trim().replace(/[。.]$/, '') : item.userText.trim()) + step + (item.state !== 'blocked' && item.attempts > 1 ? `（已重试 ${item.attempts} 次）` : '');
 };
+                                                                   
+                                                              
+const completionGuardStatus = status => [status?.completion_guard, status?.self?.completion_guard, status?.partner?.completion_guard].find(view => view?.state === 'limited' && typeof view.user_text === 'string' && view.user_text.trim())?.user_text.trim();
                                                                 
 const REPLY_MARK = /^\s*\[reply\]\s*/i;
                                           
@@ -207,12 +211,81 @@ async function receipt($,operation,payload,state){
     return false;
   }
 }
-async function resumePrompt($,context,state,turnId){
-  if(!await receipt($,'prompt',{context},state))return;
+async function resumePrompt($,context,state,{turnId,...human}){
+  if(await captureContext($)!==context||!await receipt($,'prompt',{context,...human},state))return;
                                                           
                                               
   const health=context.nativeHealth;
   if(health&&health.turnId===turnId&&['ready','failed','needsHuman'].includes(health.state))await receipt($,'state',{state:health.completion==='interrupted'?'paused':health.state==='needsHuman'?'needsHuman':'ready',context},state);
+}
+                                         
+async function publishTurnCompletion($,context,tracker,turn,state){
+  const pending=turn.pendingCompletion;
+  if(!pending||pending.ready===undefined||pending.inFlight)return;
+  const current=()=>tracker.current(context)===turn;
+  pending.inFlight=true;
+  try{
+    if(await captureContext($)!==context||!current())return;
+    if(!pending.ready){
+      pending.ready=await receipt($,'state',{state:'ready',context},state);
+      if(!pending.ready||await captureContext($)!==context||!current())return;
+    }
+    const response=await call($,'turn-completed',{context,...pending.facts});
+    if(response?.recorded===true||response?.stale===true){
+      turn.completionSettled=true;
+      turn.pendingCompletion=undefined;
+      turn.pendingConfirmation=undefined;
+      turn.finishedReceipts=true;
+    }
+  }catch{}finally{pending.inFlight=false;}
+}
+                                                      
+async function finishRoot($,context,tracker,turn,state){
+  const current=()=>tracker.current(context)===turn;
+  const active=await captureContext($)===context;
+  if((!active&&!turn.aborted)||!current()||turn.completed===undefined)return;
+  const failed=turn.failed||context.nativeHealth?.state==='failed';
+  if(!turn.aborted&&!failed&&turn.stopPending)return;
+  const stopped=failed||turn.aborted?undefined:turn.stop;
+  if(turn.published&&(!stopped||turn.backgroundPublished===stopped))return;
+  if(stopped){
+    context.nativeBackground={...stopped.background,observedAt:stopped.observedAt};
+    turn.backgroundPublished=stopped;
+  }
+  const first=!turn.published;
+  turn.published=true;
+  if(first&&(!failed||turn.aborted))progress(context,turn.id,turn.aborted?'paused':'ready');
+  const facts=active&&!failed&&!turn.completionSettled&&!turn.pendingCompletion&&turnCompletionFacts(turn);
+  const pending=facts?{facts}:undefined;
+  if(pending){turn.pendingCompletion=pending;turn.finishedReceipts=false;}
+  const ready=await receipt($,'state',{state:turn.aborted?'paused':'ready',context},state);
+  if(!active||await captureContext($)!==context||!current())return;
+  if(pending){
+    pending.ready=ready;
+    if(ready)await publishTurnCompletion($,context,tracker,turn,state);
+  }
+  if(!turn.pendingCompletion)turn.finishedReceipts=true;
+}
+function cleanupTurn(context,turnId,agentId,turns,turnContexts,agentProgress){
+  if(turns.get(agentId??'root')?.turnId===turnId)turns.delete(agentId??'root');
+  if(turnId)turnContexts.delete(turnId);
+                                         
+  if(agentId&&!turns.has(agentId))agentProgress.delete(agentId);
+  if(!agentId)for(const [id,value] of agentProgress)if(value.context===context&&value.turnId===turnId)agentProgress.delete(id);
+}
+async function reloadRoot($,context,tracker,turn,state){
+  if(turn.finishedReceipts&&!turn.pendingConfirmation&&turn.cleanupComplete&&!turn.reloaded&&await captureContext($)===context&&tracker.current(context)===turn&&!turn.reloaded){
+    turn.reloaded=true;
+    await reloadComplete($,{isAborted:turn.aborted},()=>receiptCause(state));
+  }
+}
+async function finishStoppedRoot($,context,tracker,turn,state,turns,turnContexts,agentProgress){
+  await finishRoot($,context,tracker,turn,state);
+  if(turn.published&&!turn.cleanupComplete){
+    cleanupTurn(context,turn.id,undefined,turns,turnContexts,agentProgress);
+    turn.cleanupComplete=true;
+  }
+  await reloadRoot($,context,tracker,turn,state);
 }
                                                    
                                                                                                                                                                      
@@ -250,6 +323,8 @@ const PROGRESS_NOTE = "codex mid-task progress = sync, not done. user needn't de
                                                                                                                                                                                                                                                               
                                                                                 
                                                                                                                               
+                                                                                                                               
+                                                                                                                                       
 const ROUTING_NOTE = [
   "nxbridge: codex=peer partner, not subagent; default = work as a pair w/ codex via nxbridge, also before pairing (first SendMessage pairs on demand); talk often (short msgs, not rare). ListAgents shows codex. msg: SendMessage to nxbridge:codex. rare nxbridge tools (config, checkpoint, read_messages, choose_partner, set_enabled, reload_plugins) are deferred: load via ToolSearch when needed",
   "task/feedback any source: dont start on reflex, pick owner per part (follow-up -> same part's owner; incidental bits inside your own part stay yours). tiny+simple -> self, fast. else by strength: frontend/product/ux/writing/aesthetics=you, backend/security/graphics modeling(consider astra first)/computer use=codex, macro design=discuss (model strengths see partner skill). if owner=codex, hand off ALL (undelivered -> still dont do it yourself; resend + restore contact)",
@@ -258,6 +333,7 @@ const ROUTING_NOTE = [
   "bar: you usually set it, once per task: tier small/medium/large by its use (not repo size). small = usable core fast, other fixes only if likely + cheap; medium = + likely issues hurting use, fair cost; large = + project norms, whatever is worth it; concrete severe failure -> fix or fail visibly at any tier; applies to review findings too. inferred -> 1 line to user in first update; only real-use evidence changes it",
   "own work: partner doesnt change your subagent rules: still use own subagents for parallel/search/ctx isolation. keep session model (switch = cache loss); work fitting other claude model -> subagent w/ model + effort (default high/xhigh)",
   "schedule (defaults; user intent overrides: msgs, CLAUDE.md/AGENTS.md/task requirements, user wishes relayed by codex): small task -> skip upfront split talk + multi-round review; parts still by strength. other nontrivial task -> before starting, agree split + parallel parts w/ codex when reachable (not agreed yet -> start parts surely yours, no idle wait), then each side delegates to own subagents where useful. owner keeps critical path moving, waits only on real dependencies, integrates/releases. git repo -> worktrees allow parallel feature edits. missing user/reporter-only info needed for the task + not findable -> ask early; continue independent work. peer review before irreversible/outward steps (outward = real external effect, eg push, publish, live servers, sending for user; not routine progress msgs; review pending -> prep + verify meanwhile, only that step waits); overlap independent implementation/docs/tests; reuse checks unless changes/new evidence invalidate them; codex says a key check can't be done -> agree only if you also find no workable way. pair: one heavy test/build group at a time. codex hands over files it can't delete w/o force -> find cause; force only if cause + scope confirmed safe; still unclear -> leave files, continue other work; ask user only per decisions",
+  "pair turn end: partner sees only your msgs, not your final text -> report results by msg before ending. you own open authorized work -> keep going, never end on a bare ack. waiting on partner -> [reply] msg naming next step + who acts; blocked -> say blocker + who must act",
   "delegate: to strong model (codex or subagent above Sonnet/Haiku class): goal + why + bar + hard constraints + known facts, not the method (even a borrowed one); no pre-listed report items (required deliverables ok); ask it to review deeply + plan fully itself within the bar (incl needed unstated work). to codex: also push it to own that outcome fully (gpt initiative weaker). small model: concrete steps ok. codex side (host + its subagents) GPT models only. default gpt-6.2-sol model xhigh effort unless user instruction",
   "send: long existing text -> nxref, dont retype (output tokens costly): nxref:msg:<message_id> (any pair msg, sent/received) / nxref:agent:<agentId> (own finished subagent final answer); nxbridge inlines it in Agent prompt or partner msg. msg needing partner reply (task/question) -> start it w/ [reply] (stripped, marks reply owed); report/FYI/ack -> no mark. incoming header w/ reply_expected = partner awaits your reply",
   "changes: info partner acts on changed -> say what's current + what it replaces (partner may have compacted); on your side newest task state wins over older prompts, never over user authority",
@@ -269,6 +345,7 @@ const ROUTING_NOTE = [
 export function register(on) {
   const turns=new Map();
   const humanTurns=new HumanTurns();
+  const completion=new TurnCompletion();
   const turnContexts=new Map();
   const agentContexts=new Map();
   const agentProgress=new Map(),activeCalls=new Map();
@@ -293,11 +370,51 @@ export function register(on) {
   on('classic.SessionStart',permissionObserved);
   on('classic.UserPromptSubmit',permissionObserved);
   on('classic.PreToolUse',permissionObserved);
-                                                                                 
   on('classic.Stop',async($,e,next)=>{
-    await observePermission($,e);
-    try{const context=await observeStop($,e),health=context?.nativeHealth;if(health&&humanTurns.current(context,health.turnId)&&['ready','failed'].includes(health.state))await receipt($,'state',{state:health.completion==='interrupted'?'paused':'ready',context},receiptState);}catch{}
-    return next(e);
+    let context,attempt;
+    try{context=await captureContext($);attempt=completion.stop(context,e);await observePermission($,e);}catch{}
+    let result;
+    try{result=await next(e);}
+    catch(error){
+      if(attempt){
+        closeTurnStop(attempt);
+        try{await finishStoppedRoot($,context,completion,attempt.turn,receiptState,turns,turnContexts,agentProgress);}catch{}
+      }
+      throw error;
+    }
+    if(!attempt)return result;
+    let checked;
+    try{
+      checked=await checkTurnStop($,completion,context,attempt,e,result,next.signal);
+    }catch{
+      closeTurnStop(attempt);
+      if(result?.block&&!result?.preventContinuation)attempt.turn.completed=undefined;
+      checked=result;
+    }
+    if(!checked?.block||checked?.preventContinuation)try{
+      await finishStoppedRoot($,context,completion,attempt.turn,receiptState,turns,turnContexts,agentProgress);
+    }catch{}
+    return checked;
+  });
+                                                     
+  on('classic.StopFailure',async($,e,next)=>{
+    let context,turn;
+    try{
+      context=await captureContext($);
+      if(!e.agent_id&&!e.agent_transcript_path&&e.session_id===context.sessionId)turn=completion.current(context);
+    }catch{}
+    try{return await next(e);}
+    finally{if(turn)try{
+      if(await captureContext($)===context&&completion.current(context)===turn&&!turn.published){
+        turn.failed=true;
+        turn.completed=Date.now();
+        turn.stopPending=turn.stop=undefined;
+        progress(context,turn.id,'failed');
+        const detail=e.error_details??e.error;
+        if(typeof detail==='string'&&context.nativeHealth?.turnId===turn.id)context.nativeHealth.error=detail.slice(0,1200);
+        await finishStoppedRoot($,context,completion,turn,receiptState,turns,turnContexts,agentProgress);
+      }
+    }catch{}}
   });
                                                                  
   on('classic.PermissionRequest',async($,e,next)=>{
@@ -324,7 +441,10 @@ export function register(on) {
   on('prompt.submit', async ($, e, next) => {
                                  
                                                               
-    const human=await humanPrompt($,e),context=human?await captureContext($):undefined;
+    const context=e.agentId?undefined:await captureContext($);
+    const input=context?completion.prompt(context):undefined;
+    const humanInput=context?humanTurns.begin(context):undefined;
+    const source=await inputSource($,e),human=await humanPrompt($,e,source);
     if (human) {
       const note=receiptNote(e);if(note)e={...e,context:[...(e.context??[]),note]};
     }
@@ -339,29 +459,36 @@ export function register(on) {
     };
     const wake=!!noticePickup(e);
     if(!wake)e=await attachHeld(e);
-    const before=human?humanTurns.turn(context):undefined;
+    const before=human?humanInput?.before:undefined;
     let result;
-    try{result=await noticePrompt($,e,async changed=>questionSubmit($,wake?await attachHeld(changed):changed,next));}
-    catch(error){if(entries.length)await settleHeld($,entries,heldContext,'unknown',String(error?.message??error));throw error;}
+    try{result=await noticePrompt($,e,async changed=>questionSubmit($,wake?await attachHeld(changed):changed,next),completion,input);}
+    catch(error){if(context)completion.dropped(context,input);if(entries.length)await settleHeld($,entries,heldContext,'unknown',String(error?.message??error));throw error;}
+    if(context&&result?.drop!==undefined)completion.dropped(context,input);
     if(entries.length){
                                         
       const entered=!result?.drop&&entries.every(entry=>result?.context?.includes(entry.text));
       await settleHeld($,entries,heldContext,result?.drop?'requeue':entered?'submitted':'unknown',result?.drop||entered?undefined:'通知正文未出现在宿主上下文回执中');
     }
-    const accepted=human&&humanTurns.submit(context,e,result,before);
-    if(accepted)await resumePrompt($,context,receiptState,accepted.turnId);
+    const accepted=human&&await captureContext($)===context&&humanTurns.submit(context,e,result,before,humanInput,humanOrigin(e,source));
+    if(accepted)await resumePrompt($,context,receiptState,accepted);
     return result;
   }).catch(noticeFailure);
-  on('tool.call', {tool:'AskUserQuestion'}, nativeFormCall).catch(nativeFormFailure);
+  on('tool.call', {tool:'AskUserQuestion'}, async ($,e,next)=>{
+    const health=await healthFor($,e,turns,agentProgress);
+    if(health?.turnId)completion.action(completion.current(health.context,health.turnId),e.tool,e.tool_use_id);
+    return nativeFormCall($,e,next);
+  }).catch(nativeFormFailure);
   on('tool.call',async($,e,next)=>{
     const health=await healthFor($,e,turns,agentProgress),context=health?.context,turnId=health?.turnId,work=!/receive_messages$/.test(e.tool??'');
     const value=health&&(e.agentId?health:{context,turnId,toolId:e.tool_use_id});
+    const bridgeSend=e.tool==='SendMessage'&&typeof e.to==='string'&&e.to.trim().toLowerCase()===ADDRESS;
+    if(context&&turnId)completion.action(completion.current(context,turnId),e.tool,e.tool_use_id,bridgeSend);
     if(value&&e.tool_use_id)activeCalls.set(e.tool_use_id,{...value,delegation:['Agent','Task'].includes(e.tool)});
     if(context)progress(context,turnId,e.agentId?'progress':'tool_start',e.agentId?undefined:e.tool_use_id,work);
     if(context&&e.tool==='AskUserQuestion')progress(context,turnId,'human',undefined,false);
     if(context&&syncContext!==context){syncContext=context;syncCheckedAt=Date.now();}
     let result;
-    try{result=await questionCall($,e,next);}finally{if(e.tool_use_id)activeCalls.delete(e.tool_use_id);if(context&&(!e.agentId||currentProgress(health,turns)))progress(context,turnId,e.agentId?'progress':'tool_end',e.agentId?undefined:e.tool_use_id,work);}
+    try{result=await questionCall($,e,next);}finally{if(e.tool_use_id)activeCalls.delete(e.tool_use_id);if(context&&turnId&&!e.agentId)completion.finished(completion.current(context,turnId),e.tool,bridgeSend);if(context&&(!e.agentId||currentProgress(health,turns)))progress(context,turnId,e.agentId?'progress':'tool_end',e.agentId?undefined:e.tool_use_id,work);}
     if(!result?.deny){const note=receiptNote(e);if(note)result={...result,context:[...(result?.context??[]),note]};}
                                                
     if(!e.agentId&&!result?.deny&&hasHeld()){
@@ -445,9 +572,18 @@ export function register(on) {
       $.clock.every(15_000, async () => {
         if(monitoring)return;monitoring=true;
         try{
-                                             
+                                                   
           const health=await read($,'monitor');
           const noticeContext=await captureContext($);
+          const turn=completion.current(noticeContext);
+          if(turn?.pendingConfirmation){
+            await publishStopConfirmation($,completion,noticeContext,turn);
+            await reloadRoot($,noticeContext,completion,turn,receiptState);
+          }
+          if(turn?.pendingCompletion){
+            await publishTurnCompletion($,noticeContext,completion,turn,receiptState);
+            await reloadRoot($,noticeContext,completion,turn,receiptState);
+          }
                                                
           const pendingIds=new Set((health.notices??[]).map(notice=>notice.id));
           if(failedNotice&&!pendingIds.has(failedNotice)){failedNotice=undefined;noticeFailureText=undefined;}
@@ -483,13 +619,18 @@ export function register(on) {
                                               
         if(++inboundTicks>=8){inboundTicks=0;try{await observeInbound($);await observeProfile($);await observeDecision($);await publishFacts($,await captureContext($));}catch{}}
         let status;
-        try { status = await read($, 'status'); } catch {}
+        try {
+          const context=await captureContext($);
+          status=await read($, 'status');
+          if(await captureContext($)===context)completion.status(context,status);
+        } catch {}
         const state = status?.paired ? status.partner?.state : undefined;
         strikes = !status || state === 'offline' ? strikes + 1 : 0;
                                                     
         if(status?.disabled===true){$.ui.status('本窗口的 nxbridge 已关闭（输入 /nxbridge on 打开）');return;}
                                                            
-        if(status?.integrationAction)await autoReload($,status.integrationAction,async action=>call($,'reload-attempt',{attempt_id:action.attemptId,target_revision:action.targetRevision,context:await captureContext($)}));
+        const currentTurn=completion.current(await captureContext($));
+        if(status?.integrationAction&&!currentTurn?.pendingCompletion&&!currentTurn?.pendingConfirmation)await autoReload($,status.integrationAction,async action=>call($,'reload-attempt',{attempt_id:action.attemptId,target_revision:action.targetRevision,context:await captureContext($)}));
         $.ui.status(noticeFailureText??receiptState.text??(!status ? (strikes >= 2 ? '获取不到 nxbridge 状态，后台服务可能停了：持续 2 分钟会自动请一个 AI 处理（也可自己运行 nxbridge bootstrap）' : undefined)
           : !status.paired && status.pair_lost ? lostStatusText(status.pair_lost)
           : status.partner?.enabled === false ? 'Codex 的 nxbridge 已关闭，不会向它投递或拉起它（输入 /nxbridge on codex 打开）'
@@ -514,6 +655,7 @@ export function register(on) {
           : incidentText(status) ? incidentText(status)
                                                                    
           : providerText(status.partner?.health) ? providerText(status.partner.health)
+          : completionGuardStatus(status) ? completionGuardStatus(status)
                                              
           : admissionText(status.delivery_admission, status.permission_guidance ?? status.partner?.permission_guidance) ? admissionText(status.delivery_admission, status.permission_guidance ?? status.partner?.permission_guidance)
           : permissionText(status.permission_guidance ?? status.partner?.permission_guidance) ? permissionText(status.permission_guidance ?? status.partner.permission_guidance)
@@ -658,6 +800,8 @@ export function register(on) {
     observeEffortAppend($,e,result,context);
     const evidence=await questionAppend($, e, result,context);
     if (evidence) {
+      const turn=completion.current(context);
+      if(turn&&turnSource(undefined,context)?.id===evidence.id)turn.partnerMessageId=evidence.id;
       linksFor(context).observed.push(evidence);
       await receipt($, 'observe', { message_id: evidence.id, state: 'contextObserved',context },receiptState);
     }
@@ -690,6 +834,8 @@ export function register(on) {
 
   on('turn.step', async function* ($, e, next) {
     const health=await healthFor($,e,turns,agentProgress),context=health?.context,turnId=health?.turnId;
+    const turn=context&&turnId?completion.current(context,turnId):undefined;
+    const inputChunks=new Map();
     if(context&&!context.nativeHealth)startProgress(context,turnId);
     if (!e.agentId) {
       const session = await $.session.id(), profile = { model: e.model, effort: e.effort ?? null };
@@ -698,18 +844,25 @@ export function register(on) {
         if (await receipt($, 'state', { state: 'busy', ...profile },receiptState)) profiles.set(session, profile);
       }
     }
-    try{for await(const chunk of next(e)){if(context&&(!e.agentId||currentProgress(health,turns)))streamProgress(context,turnId,chunk);yield chunk;}}
+    try{for await(const chunk of next(e)){if(context&&(!e.agentId||currentProgress(health,turns))){streamProgress(context,turnId,chunk);completion.step(turn,chunk,inputChunks);}yield chunk;}}
     catch(error){if(context&&!e.agentId){progress(context,turnId,'failed');if(context.nativeHealth?.turnId===turnId)context.nativeHealth.error=String(error).slice(0,1200);}throw error;}
+    finally{if(turn&&[...inputChunks.values()].includes(false))turn.covered=false;}
   });
 
   on('turn.start', async ($, e, next) => {
+    const startedAt=Date.now();
     const context=await captureContext($);
+    const previous=!e.agentId?completion.current(context):undefined;
+    if(previous?.completed!==undefined&&!previous.cleanupComplete&&previous.id!==e.turnId)cleanupTurn(context,previous.id,undefined,turns,turnContexts,agentProgress);
     if(e.turnId){turns.set(e.agentId??'root',{turnId:e.turnId,context});turnContexts.set(e.turnId,context);}
     questionTurn(e);
     if (!e.agentId){
-      const human=humanTurns.start(context,e);
+      completion.start(context,e,startedAt);
+      const turn=completion.current(context,e.turnId),partner=turnSource(undefined,context);
+      if(turn&&partner)turn.partnerMessageId=partner.id;
+      const human=humanTurns.start(context,e,startedAt);
       permissionWaits.delete(context);startProgress(context,e.turnId);
-      if(human)await receipt($,'prompt',{context},receiptState);
+      if(human)await receipt($,'prompt',{context,...human},receiptState);
       await receipt($, 'state', { state: 'busy',context },receiptState);
     }
     return next(e);
@@ -718,6 +871,7 @@ export function register(on) {
     const context=e.turnId?turnContexts.get(e.turnId)??(e.agentId?agentContexts.get(e.agentId):undefined):await captureContext($);
     const result = await next(e);
     if(!context)return result;
+    const turn=!e.agentId&&e.turnId?completion.current(context,e.turnId):undefined;
     await questionComplete($, e,context);
     if (e.agentId && !e.isAborted) try {
       const rows = await $.session.messages({ agentId: e.agentId });
@@ -725,20 +879,22 @@ export function register(on) {
       const text = e.answer ?? final?.text;
       if (text?.trim() && (e.answer !== undefined || !final.toolUses?.length)) await call($, 'ref-capture', { agent_id: e.agentId, text, agents: await $.agent.list(),context });
     } catch {}
-    if (!e.agentId&&humanTurns.current(context,e.turnId)){progress(context,e.turnId,e.isAborted?'paused':'ready');await receipt($, 'state', { state: e.isAborted ? 'paused' : 'ready',context },receiptState);}
-    if(turns.get(e.agentId??'root')?.turnId===e.turnId)turns.delete(e.agentId??'root');
-    if(e.turnId)turnContexts.delete(e.turnId);
-                                                                 
-    if(e.agentId&&!turns.has(e.agentId))agentProgress.delete(e.agentId);
-    if(!e.agentId)for(const [id,value] of agentProgress)if(value.context===context&&value.turnId===e.turnId)agentProgress.delete(id);
-                                       
-    await reloadComplete($, e, () => receiptCause(receiptState));
+    if(turn){
+      turn.completed=Date.now();turn.aborted=e.isAborted===true;
+      await finishRoot($,context,completion,turn,receiptState);
+    }else if (!e.agentId&&humanTurns.current(context,e.turnId)&&await captureContext($)===context){progress(context,e.turnId,e.isAborted?'paused':'ready');await receipt($, 'state', { state: e.isAborted ? 'paused' : 'ready',context },receiptState);}
+                                           
+    if(!turn||turn.published){
+      cleanupTurn(context,e.turnId,e.agentId,turns,turnContexts,agentProgress);
+      if(turn){turn.cleanupComplete=true;await reloadRoot($,context,completion,turn,receiptState);}
+      else if(humanTurns.current(context,e.turnId)&&await captureContext($)===context)await reloadComplete($, e, () => receiptCause(receiptState));
+    }
     return result;
   });
   on('session.end', async ($, e, next) => {
     const context=await captureContext($);
     const ending=(!e.sessionId||e.sessionId===context.sessionId)&&markContextEnd(context,e.reason);
-    if(ending){humanTurns.clear(context);questionReset();try { await call($, 'context-end',{context,reason:ending}); } catch {}}
+    if(ending){humanTurns.clear(context);completion.clear(context);questionReset();try { await call($, 'context-end',{context,reason:ending}); } catch {}}
     const result=await next(e);
     if(ending&&await $.session.id()!==context.sessionId)try{await call($,'context-start');const fresh=await captureContext($);markContextStarted(fresh);await observeInbound($);await observeProfile($);await observeDecision($);await publishFacts($,fresh);}catch{}
     return result;

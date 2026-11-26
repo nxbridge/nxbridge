@@ -192,6 +192,7 @@ export interface BridgeConfig {
   syncTipMinutes: number;
   contextTipTokens: number[];
   idleNoticeMinutes: number;
+  completionWakeLimit: number;
   retention?: Partial<RetentionConfig>;
 }
 
@@ -215,7 +216,8 @@ export interface RetentionConfig {
 export const WAKE_NOTICE = 'nxbridge pickup notice (not user msg): claude msg pending -> claude.receive_messages()';
                                       
 export const HEALTH_WAKE_NOTICE = 'nxbridge: runtime health notice pending; current hook provides verified facts; no partner message pickup required';
-export const isEmbeddedWake=(prompt:unknown):boolean=>prompt===WAKE_NOTICE||prompt==='nxbridge: claude msg pending -> claude.receive_messages()'||prompt===HEALTH_WAKE_NOTICE;
+export const completionWakeId=(prompt:unknown):string|undefined=>typeof prompt==='string'&&prompt.startsWith(HEALTH_WAKE_NOTICE+'\n')?/^\[nxbridge completion_notice=([^\]\s]+)\]/.exec(prompt.slice(HEALTH_WAKE_NOTICE.length+1))?.[1]:undefined;
+export const isEmbeddedWake=(prompt:unknown):boolean=>prompt===WAKE_NOTICE||prompt==='nxbridge: claude msg pending -> claude.receive_messages()'||prompt===HEALTH_WAKE_NOTICE||completionWakeId(prompt)!==undefined;
 
 export function otherHost(host: Host): Host { return host === 'claude' ? 'codex' : 'claude'; }
 

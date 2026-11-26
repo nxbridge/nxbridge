@@ -80,7 +80,8 @@ export async function collectRuntimeNotices(home:string,host:Host,sessionId:stri
     return options.admit===false?fresh.map(n=>noticeSignal(n) as RuntimeNotice):fresh.flatMap(n=>{const prepared=health.prepare(current.pair.id,current.sender.id,n.id,current.scope,true);return prepared?[prepared]:[];});
   },native,timeout(3000))??[];
 }
-export async function acknowledgeRuntimeNotice(home:string,host:Host,sessionId:string,native:Native,id:string,state:'submitted'|'denied'|'unknown',error?:string,contextKey?:string,timeoutMs=3000):Promise<void>{
+export async function acknowledgeRuntimeNotice(home:string,host:Host,sessionId:string,native:Native,id:string,state:'submitted'|'denied'|'unknown'|'not_submitted',error?:string,contextKey?:string,timeoutMs=3000):Promise<void>{
+  if(state==='not_submitted'&&!id.startsWith('background-completed:'))return;
   if(isBrokerOutageNotice(id)){
     if(state==='denied'){const value=readHealthSnapshot(home,host,sessionId,contextKey,native);if(value&&sameNative(value,native)){if(host==='claude')assertClaudeSession(value.senderEndpoint?.configHome,sessionId,native);releaseBrokerOutageClaim(home,{host,peerId:value.sender.id,sessionId,...native},id);}}
     return;
@@ -89,7 +90,8 @@ export async function acknowledgeRuntimeNotice(home:string,host:Host,sessionId:s
   if(state==='submitted')acknowledgeContextSnapshot(home,host,sessionId,native,id,contextKey,remaining());
   updateHealthSnapshot(home,host,sessionId,contextKey,(health,value,storage)=>{
     if(!sameNative(value,native))return;
-    if(value.change?.id===id){if(value.change.admitted)storage.setSetting(pairChangeKey(value.sender.id),{...value.change,state,...(error?{error:error.slice(0,1200)}:{})});}
+    if(state==='not_submitted')health.outcome(value.pair.id,value.sender.id,id,'pending',error?.slice(0,1200));
+    else if(value.change?.id===id){if(value.change.admitted)storage.setSetting(pairChangeKey(value.sender.id),{...value.change,state,...(error?{error:error.slice(0,1200)}:{})});}
     else if(value.loss?.id===id){if(value.loss.admitted)storage.setSetting(pairLossKey(value.sender.id),{...value.loss,state,...(error?{error:error.slice(0,1200)}:{})});}
     else health.outcome(value.pair.id,value.sender.id,id,state,error?.slice(0,1200));
   },native,remaining());

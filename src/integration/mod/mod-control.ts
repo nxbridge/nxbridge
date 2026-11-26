@@ -9,7 +9,7 @@ import { currentLaunchCapture } from '../../hosts/launch-profiles.js';
 import { collectRuntimeNotices, acknowledgeRuntimeNotice } from '../../broker/health/runtime-monitor.js';
 import { configurationArguments } from '../../config/config-in-host.js';
 import { formatStatus } from '../mcp/presentation.js';
-import { modContextSchema, modMonitorAdmission, modResponse } from './mod-protocol.js';
+import { claudeHumanPromptSchema, claudeTurnCompletedSchema, claudeTurnStopSchema, modContextSchema, modMonitorAdmission, modResponse } from './mod-protocol.js';
 import { openModReadReceipt, readModReadReceipt } from './mod-read-receipt.js';
 import { queueRuntimeNotice } from '../../broker/health/runtime-notice-delivery.js';
 import { claudeObservedPermission } from '../../hosts/claude/claude-inbound.js';
@@ -32,6 +32,8 @@ export async function mod(input:any,execution?:ModExecution):Promise<unknown>{
   catch(error){if(['monitor','monitor-prepare'].includes(input?.operation))throw preSubmitError(error,input.operation,'prepare');throw error;}
 }
 async function modNow(input:any,execution?:ModExecution):Promise<unknown>{
+  const stop=input.operation==='turn-stop-check'?claudeTurnStopSchema.parse({turn_id:input.turn_id,stop_hook_active:input.stop_hook_active,stats:input.stats,background:input.background,deadline_at:input.deadline_at}):undefined;
+  if(stop&&!stop.stop_hook_active&&(stop.deadline_at===undefined||stop.deadline_at<=Date.now()))return{};
   const home=execution?.home??bridgeHome(),configHome=execution?.configHome??claudeHome(),rawRequest=execution?.request??brokerCall;
   if(input.operation==='monitor'&&input.read_credential){
     let receipt;try{receipt=readModReadReceipt(bridgeHome(),input.read_credential);}catch{                      }
@@ -70,8 +72,8 @@ async function modNow(input:any,execution?:ModExecution):Promise<unknown>{
   const binding=modContextSchema.shape.binding.parse(input.binding);
   if(input.operation==='monitor-enqueue')return queueRuntimeNotice(bridgeHome(),identity.record.sessionId,native,z.object({key:z.string(),epoch:z.string()}).parse(binding),z.string().min(1).parse(input.inbox),z.string().min(1).max(128).parse(input.notice_id),z.string().regex(/^[a-f0-9]{16}$/).parse(input.mod_revision),observation||decision?permission:undefined);
                                                      
-  const passive=['register','prompt','state','observe','tip-agent','tip-sync','ref-capture','context-end'].includes(input.operation);
-  const request=<T=any>(method:string,params:any,options:Parameters<typeof brokerCall>[2]={})=>rawRequest<T>(method,params,{...options,...(passive?{start:false,timeout:2000}:{})});
+  const passive=['register','prompt','state','observe','tip-agent','tip-sync','ref-capture','context-end','turn-stop-check','turn-completed'].includes(input.operation);
+  const request=<T=any>(method:string,params:any,options:Parameters<typeof brokerCall>[2]={})=>rawRequest<T>(method,params,{...options,...(passive?{start:false,timeout:options?.timeout??2000}:{})});
                                   
   if(input.operation==='monitor'||input.operation==='monitor-prepare'){
     let deferred=false;
@@ -79,7 +81,7 @@ async function modNow(input:any,execution?:ModExecution):Promise<unknown>{
     return{notices,...(deferred?{deferred:true}:{})};
   }
   if(input.operation==='monitor-ack'){
-    await acknowledgeRuntimeNotice(bridgeHome(),'claude',identity.record.sessionId,native,z.string().parse(input.notice_id),z.enum(['submitted','denied','unknown']).parse(input.state),typeof input.error==='string'?input.error:undefined);return{recorded:true};
+    await acknowledgeRuntimeNotice(bridgeHome(),'claude',identity.record.sessionId,native,z.string().parse(input.notice_id),z.enum(['submitted','denied','unknown','not_submitted']).parse(input.state),typeof input.error==='string'?input.error:undefined);return{recorded:true};
   }
   registration.contextStart=input.operation==='context-start'||input.contextStart===true;
   if(binding)registration.expectedBinding=binding;
@@ -113,7 +115,16 @@ async function modNow(input:any,execution?:ModExecution):Promise<unknown>{
     case'status-human':return{text:formatStatus(await request('status',{actor}))};
     case'observe':return request('observe',{actor,message_id:input.message_id,state:input.state,admission:input.admission});
     case'state':return request('peer.state',{actor,state:input.state,model:input.model,effort:input.effort});
-    case'prompt':return request('peer.prompt',{actor},{mutation:true});
+    case'prompt':{
+      const {human_origin,human_turn_id,human_input_at}=input;
+      const human=human_origin!==undefined||human_turn_id!==undefined||human_input_at!==undefined?claudeHumanPromptSchema.parse({human_origin,human_turn_id,human_input_at}):{};
+      return request('peer.prompt',{actor,...human},{mutation:true});
+    }
+    case'turn-stop-check':return request('peer.turn.stop',{actor,...stop},{mutation:true,timeout:1500,start:false});
+    case'turn-completed':{
+      const facts=claudeTurnCompletedSchema.parse({turn_id:input.turn_id,completed_at:input.completed_at,stats:input.stats,background:input.background,interventions:input.interventions});
+      return request('peer.turn.completed',{actor,...facts},{mutation:true,timeout:2000,start:false});
+    }
     case'config':{
       if(input.origin!=='composer'||input.agentId)throw new BridgeError('config_human_origin_required','配置命令必须由本窗口用户在 Claude 原生输入框提交。');
       const args=configurationArguments(z.string().parse(input.args));

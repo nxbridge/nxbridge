@@ -51,7 +51,7 @@ import { resumeSession, readSessionProfile, sessionFile, verifyResumedSession } 
 import { codexParent, codexSubagent, codexUserWindow } from './codex-lineage.js';
 import { codexThreadState } from './codex-thread-state.js';
 import { queueCodexWake } from './queue-wake.js';
-import type { CodexTurnOriginProvider } from './codex-turn-origin.js';
+import type { CodexTurnCause,CodexTurnOriginProvider } from './codex-turn-origin.js';
 
 interface PreparedRuntimeLaunch {launch:HostLaunch;authenticatedLoopback:boolean}
 export interface CodexRestartOptions {
@@ -441,16 +441,18 @@ export class CodexAdapter extends EventEmitter {
     })();
     this.attaching.set(key,work);try{return await work;}finally{if(this.attaching.get(key)===work)this.attaching.delete(key);}
   }
-  async wake(peer:Peer,endpoint:Endpoint,signal?:AbortSignal,beforeSubmit?:()=>Promise<boolean>,message=WAKE_NOTICE):Promise<void>{
+  async wake(peer:Peer,endpoint:Endpoint,signal?:AbortSignal,beforeSubmit?:()=>Promise<boolean>,message:string|(()=>string)=WAKE_NOTICE,started?:(turnId:string)=>void):Promise<void>{
     let submitted=false;
     await deliveryStep(()=>this.threadOperation(peer,endpoint,async()=>{
       if(signal?.aborted)return;
       let rpc:RpcClient;
       try{rpc=await this.attachThread(peer,endpoint);}catch(error){if(error instanceof BridgeError&&error.code.startsWith('codex_identity_'))throw error;throw new DeliveryError('attach_failed',describeError(error));}
-      const origin=await this.turnOrigin?.(peer,message===HEALTH_WAKE_NOTICE?'notice':'partner');
+      const cause=typeof message==='function'||message===HEALTH_WAKE_NOTICE?'notice':'partner';
+      const origin=await this.turnOrigin?.(peer,cause);
       if(signal?.aborted||beforeSubmit&&!await beforeSubmit()||signal?.aborted)return;
       this.requireMember(peer.id);submitted=true;
-      await rpc.request('turn/start',{threadId:peer.sessionId,input:[{type:'text',text:message}],...origin},{mutation:true});
+      const result=await rpc.request<any>('turn/start',{threadId:peer.sessionId,input:[{type:'text',text:typeof message==='function'?message():message}],...origin},{mutation:true});
+      if(typeof result?.turn?.id==='string'){this.emit('turnOriginObserved',peer.id,result.turn.id,cause);started?.(result.turn.id);}
       if(!this.attached.has(endpoint.address+'|'+peer.sessionId)){
         try{await this.attachThread(peer,endpoint);}catch(error){this.emit('diagnostic','唤醒已提交，后续线程订阅需要重连；正文仍等待正常取件。');}
       }
@@ -493,11 +495,11 @@ export class CodexAdapter extends EventEmitter {
       return result.turn.id;
     });
   }
-  async queueWake(peer:Peer,endpoint:Endpoint,beforeSpawn:()=>void|Promise<void>,onSpawn:()=>void,message=HEALTH_WAKE_NOTICE):Promise<void>{
+  async queueWake(peer:Peer,endpoint:Endpoint,beforeSpawn:()=>void|Promise<void>,onSpawn:()=>void,message=HEALTH_WAKE_NOTICE,completionNotice?:()=>string):Promise<void>{
     return this.threadOperation(peer,endpoint,async()=>{
       this.requireMember(peer.id);
       const origin=await this.turnOrigin?.(peer,'queue');
-      await queueCodexWake(this.home,this.config,peer,endpoint,{clientUserMessageId:origin?.clientUserMessageId??randomUUID(),message,
+      await queueCodexWake(this.home,this.config,peer,endpoint,{clientUserMessageId:origin?.clientUserMessageId??randomUUID(),message,completionNotice,
         beforeSubmit:async()=>{await beforeSpawn();this.requireMember(peer.id);},
         ...(endpoint.mode==='app-server'||endpoint.daemon?{requestRemote:async(params:any,authorize:()=>Promise<void>)=>{
           const rpc=await this.connect(endpoint.address);await authorize();onSpawn();
@@ -540,17 +542,17 @@ export class CodexAdapter extends EventEmitter {
       await rpc.request('thread/inject_items',{threadId:peer.sessionId,items:[{type:'function_call',call_id:callId,name:'receive_messages',namespace:'claude',arguments:'{}'},{type:'function_call_output',call_id:callId,name:'receive_messages',namespace:'claude',output}]},{mutation:true});
     });
   }
-  async continueInjected(peer:Peer,endpoint:Endpoint):Promise<string>{
-    return this.threadOperation(peer,endpoint,()=>this.continueThread(peer,endpoint));
+  async continueInjected(peer:Peer,endpoint:Endpoint,cause:CodexTurnCause='partner'):Promise<string>{
+    return this.threadOperation(peer,endpoint,()=>this.continueThread(peer,endpoint,cause));
   }
-  private async continueThread(peer:Peer,endpoint:Endpoint):Promise<string>{
+  private async continueThread(peer:Peer,endpoint:Endpoint,cause:CodexTurnCause='partner'):Promise<string>{
     this.requireMember(peer.id);
     const rpc=await this.attachThread(peer,endpoint);this.requireMember(peer.id);
-    const origin=await this.turnOrigin?.(peer,'partner');this.requireMember(peer.id);
+    const origin=await this.turnOrigin?.(peer,cause);this.requireMember(peer.id);
     const result=await rpc.request('turn/start',{threadId:peer.sessionId,input:[],...origin},{mutation:true});
                                              
     if(!this.attached.has(endpoint.address+'|'+peer.sessionId))try{await this.attachThread(peer,endpoint);}catch(error){this.emit('diagnostic','续跑已提交，线程通知订阅需要重连：'+describeError(error));}
-    return result.turn.id;
+    this.emit('turnOriginObserved',peer.id,result.turn.id,cause);return result.turn.id;
   }
   async ensureEndpoint(cwd=process.cwd(),peerId?:string,requesterSession?:string,sessionId?:string,configHome?:string,beforeLaunch?:()=>void|Promise<void>,affinity?:Pick<ManagedRuntime,'executable'|'profileId'>):Promise<string>{
     this.requireMember(peerId);

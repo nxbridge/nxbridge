@@ -21,7 +21,7 @@ import {liveProcess} from '../process/process.js';
 import {peerAddress} from '../hosts/claude/claude-inbox.js';
 import {BridgeError,DeliveryError,describeError} from '../shared/errors.js';
 import {DEFAULT_RETENTION} from '../config/defaults.js';
-import {WAKE_NOTICE,HEALTH_WAKE_NOTICE,isEmbeddedWake,otherHost,type Actor,type BridgeConfig,type Endpoint,type Message,type Peer,type Pair,type PeerState,type RegisterInput,type Host} from '../types.js';
+import {WAKE_NOTICE,HEALTH_WAKE_NOTICE,completionWakeId,isEmbeddedWake,otherHost,type Actor,type BridgeConfig,type Endpoint,type Message,type Peer,type Pair,type PeerState,type RegisterInput,type Host} from '../types.js';
 import {delay} from '../shared/time.js';
 import {runCli} from '../process/host-command.js';
 import {sameDirectory} from '../shared/files.js';
@@ -32,7 +32,9 @@ import { Questions } from '../integration/mcp/questions.js';
 import { fileHintFields } from './delivery/file-references.js';
 import { References } from './delivery/references.js';
 import { SubagentCompletions } from './subagent-completions.js';
-import { CodexFinalForwards } from './codex-final-forwards.js';
+import { TurnEndCoordinator } from './turn-end.js';
+import {TurnEndEvidence} from './turn-end-evidence.js';
+import type {CompletionHold} from './turn-end-text.js';
 import { runtimeProfile } from './profiles/runtime-profile.js';
 import { type PartnerProfiles, codexProfileSchema, hasProfile } from './profiles/partner-profile.js';
 import { PartnerProfileCoordination } from './profiles/coordination.js';
@@ -94,7 +96,7 @@ import type { SendIntent } from './pairing/pair-selection.js';
 import { EmbeddedWakeSignals } from '../ipc/embedded-wake.js';
 import { CodexWakeSignals } from '../hosts/codex/codex-wake.js';
 import { readMessages, readMessagesSchema } from './delivery/message-history.js';
-import { nativeInboundSchema, nativeDecisionSchema, nativeProfileSchema } from '../integration/mod/mod-protocol.js';
+import { nativeInboundSchema, nativeDecisionSchema, nativeProfileSchema,claudeTurnStopSchema,claudeTurnCompletedSchema,claudeHumanPromptSchema } from '../integration/mod/mod-protocol.js';
 import { DeletedSessions, sessionPresence } from './deleted-sessions.js';
 import { nativeAutoModeSchema, nativeBackgroundSchema, observeClaudeAuto, claudeAutoKey, claudeAutoStatus, claudeAutoHolds, type ClaudeAutoFallback } from '../hosts/claude/claude-auto-mode.js';
 import {ClaudeInbound,inboundAdmission,inboundWarning} from '../hosts/claude/claude-inbound.js';
@@ -129,7 +131,8 @@ export class Broker {
   readonly questions:Questions;
   readonly references:References;
   readonly subagentCompletions:SubagentCompletions;
-  readonly finalForwards:CodexFinalForwards;
+  readonly turnEnds:TurnEndCoordinator;
+  private readonly turnEndEvidence=new TurnEndEvidence();
   readonly recovery:Recovery;
   readonly managedRecovery:ManagedRecovery;
   private takeovers:Takeovers;
@@ -236,8 +239,7 @@ export class Broker {
     store.onRotation=rotation=>{this.questions.rotate(rotation);this.recovery.rotated(rotation.peerId);store.onCooperationChange?.([rotation.peerId]);};
     store.onContextEnd=peerId=>{this.questions.endContext(peerId);store.onCooperationChange?.([peerId]);};
     this.deliveryHealth=new DeliveryHealth(store);
-    this.finalForwards=new CodexFinalForwards(store,this.deliveryHealth,{
-      source:peer=>{
+    const codexSource=(peer:Peer)=>{
         const endpoint=store.endpoint(peer.id),known=store.setting<{sessionId:string;file:string}>('codexTranscript:'+peer.id);
         const file=endpoint?.nativeSession?.transcriptPath??(known?.sessionId===peer.sessionId?known.file:undefined)??(endpoint?.configHome&&peer.sessionId?sessionFile(endpoint.configHome,peer.sessionId):undefined);
         const runtime=endpoint?runtimeFor(home,{endpoint:endpoint.address})?.value:undefined;
@@ -247,13 +249,22 @@ export class Broker {
           &&!!runtime.configHome&&!!endpoint?.configHome&&sameDirectory(runtime.configHome,endpoint.configHome)&&runtime.pid===endpoint.pid&&runtime.procStart===endpoint.procStart
           &&(endpoint.address.startsWith('unix://')||runtime.authenticatedLoopback===true&&/^ws:\/\/127\.0\.0\.1:\d+$/.test(endpoint.address));
         return{file,owned};
+    };
+    this.turnEnds=new TurnEndCoordinator(store,this.deliveryHealth,{
+      source:peer=>codexSource(peer).file,
+      owned:peer=>{
+        if(peer.host==='codex')return codexSource(peer).owned;
+        const endpoint=store.endpoint(peer.id);if(!endpoint||peer.owner!=='nxbridge')return false;
+        const child=claudeChild(home,peer.id),native=nativeOwnership(home,peer.id);
+        return child?.phase==='active'&&child.sessionId===peer.sessionId&&child.native?.pid===endpoint.pid&&child.native.startedAt===endpoint.procStart
+          ||native?.phase==='bound'&&!native.releasedToUser&&native.sessionId===peer.sessionId&&native.native?.pid===endpoint.pid&&native.native.startedAt===endpoint.procStart;
       },
-      children:peer=>this.subagentCompletions.forwardChildren(peer),
-      gate:(codex,claude)=>this.finalForwardGate(codex,claude),
-    });
+      stats:(peer,turnId,completed)=>{const endpoint=store.endpoint(peer.id);return endpoint?this.turnEndEvidence.get(peer,endpoint,turnId,completed):undefined;},
+      gate:(background,foreground,boundary)=>this.completionGate(background,foreground,boundary),
+    },()=>this.config.completionWakeLimit);
     const turnOrigin:NonNullable<CodexAdapter['turnOrigin']>=async(peer,cause)=>{
       const pair=store.pairFor(peer.id),endpoint=store.endpoint(peer.id);if(!pair||!endpoint)return;
-      const mark=await this.finalForwards.origin(peer,cause);
+      const mark=await this.turnEnds.origin(peer,cause);
       if(!this.codexWakeAllowed(peer,endpoint,pair.id))throw new DeliveryError('wake_unavailable','原生轮次准备期间配对或运行状态已改变。');
       return mark;
     };
@@ -274,7 +285,7 @@ export class Broker {
     });
     store.onCooperationChange=ids=>{for(const id of ids)store.faults.sync('cooperation_clock:'+id,()=>this.communicationTips.cooperation.changed(store.peer(id)));};
     this.configurationReload=new ConfigurationReload(home);this.configuration=new InHostConfiguration(home,Date.now,()=>this.applyConfiguration(),(name,data)=>this.store.event(name,data));
-    this.runtimeHealth=new BrokerHealthCoordinator({store,config,adapters,home,resources},{incidents:this.incidents,deliveryHealth:this.deliveryHealth,communicationTips:this.communicationTips,pairAnomalies:this.pairAnomalies,idleNotices:this.idleNotices,profiles:this.profiles,foregroundHealth:this.foregroundHealth,managedRecovery:this.managedRecovery,health:this.health,codexDirect:this.codexDirect,daemons:this.daemons,questions:this.questions,finalForwards:this.finalForwards},{stopped:()=>this.stopped,actor:(...args)=>this.actor(...args),enabled:(...args)=>this.enabled(...args),requireEnabled:(...args)=>this.requireEnabled(...args),ownedClaudeLaunchReady:(...args)=>this.memberLifecycle.ownedClaudeLaunchReady(...args),ownedClaudeLaunchFailure:(...args)=>this.memberLifecycle.ownedClaudeLaunchFailure(...args),signalCodexWake:(...args)=>this.signalCodexWake(...args),signalEmbeddedWake:(...args)=>this.signalEmbeddedWake(...args),refreshHookTrust:(...args)=>this.refreshHookTrust(...args),pumpStage:(...args)=>this.pumpStage(...args)});
+    this.runtimeHealth=new BrokerHealthCoordinator({store,config,adapters,home,resources},{incidents:this.incidents,deliveryHealth:this.deliveryHealth,communicationTips:this.communicationTips,pairAnomalies:this.pairAnomalies,idleNotices:this.idleNotices,profiles:this.profiles,foregroundHealth:this.foregroundHealth,managedRecovery:this.managedRecovery,health:this.health,codexDirect:this.codexDirect,daemons:this.daemons,questions:this.questions,turnEnds:this.turnEnds},{stopped:()=>this.stopped,actor:(...args)=>this.actor(...args),enabled:(...args)=>this.enabled(...args),requireEnabled:(...args)=>this.requireEnabled(...args),ownedClaudeLaunchReady:(...args)=>this.memberLifecycle.ownedClaudeLaunchReady(...args),ownedClaudeLaunchFailure:(...args)=>this.memberLifecycle.ownedClaudeLaunchFailure(...args),signalCodexWake:(...args)=>this.signalCodexWake(...args),signalEmbeddedWake:(...args)=>this.signalEmbeddedWake(...args),refreshHookTrust:(...args)=>this.refreshHookTrust(...args),pumpStage:(...args)=>this.pumpStage(...args)});
     this.memberLifecycle=new BrokerLifecycleCoordinator({store,config,adapters,home},{profileCoordination:this.profileCoordination,deletedSessions:this.deletedSessions,takeovers:this.takeovers,managedRecovery:this.managedRecovery,transfers:this.transfers,runtimeHealth:this.runtimeHealth,deliveryHealth:this.deliveryHealth,daemons:this.daemons,codexDirect:this.codexDirect},{
       stopped:()=>this.stopped,
       migrateCodexIdentity:(...args)=>this.migrateCodexIdentity(...args),
@@ -296,6 +307,12 @@ export class Broker {
       const lifecycle=['turn/started','turn/completed','hook/completed','item/started','item/completed','thread/tokenUsage/updated','error'].includes(message.method);
       const owner=lifecycle?this.runtimePeer(message.params?.threadId??message.params?.thread?.id,address):undefined;if(owner&&!this.enabled(owner.id))return;
       this.health.observe(address,message);if(message.method==='error'||message.method==='turn/completed')this.runtimeHealth.resetTurnCheck();
+      const observedEndpoint=owner?this.store.endpoint(owner.id):undefined;
+      if(owner&&observedEndpoint){
+        this.turnEndEvidence.observe(owner,observedEndpoint,message);
+        if(message.method==='turn/started'&&typeof message.params?.turn?.id==='string')this.turnEnds.begin(owner,message.params.turn.id);
+        if(message.method==='turn/completed'&&message.params?.turn?.status!=='completed')this.turnEnds.native(owner,{turnId:message.params.turn.id,state:'failed'});
+      }
       if(owner&&message.method==='thread/tokenUsage/updated'){
         const tokens=message.params?.tokenUsage?.last?.inputTokens;
         if(Number.isSafeInteger(tokens)&&tokens>=0)this.communicationTips.cooperation.usage(owner,{tokens,at:Date.now()});
@@ -311,7 +328,13 @@ export class Broker {
       }
       if(message.method==='turn/completed'){
         const peer=owner;if(peer&&this.store.reconcilable(peer.id).length)queueMicrotask(()=>this.background('reconcile:'+peer.id,()=>this.reconcile(peer.id)));
-        if(peer)this.background('codex_final:'+peer.id,async()=>{await this.finalForwards.scan(this.store.peer(peer.id));const pair=this.store.pairFor(peer.id);if(pair)this.finalForwards.refresh(pair);});
+        if(peer&&message.params?.turn?.status==='completed'){
+          const turnId=message.params.turn.id;
+          this.turnEnds.complete(peer,{turnId,completedAt:Date.now(),stats:observedEndpoint?this.turnEndEvidence.get(peer,observedEndpoint,turnId):undefined});
+          const known=this.store.setting<{sessionId:string;file:string}>('codexTranscript:'+peer.id);
+          if(known?.sessionId===peer.sessionId)this.subagentCompletions.settle(peer,known.file,turnId);
+        }
+        if(peer)this.background('turn_end:'+peer.id,async()=>{await this.turnEnds.scan(this.store.peer(peer.id));const pair=this.store.pairFor(peer.id);if(pair)this.turnEnds.refresh(pair);});
                                                                   
         if(peer&&message.params?.turn?.status==='failed'&&typeof message.params.turn.id==='string')this.pairAnomalies.integration(peer,{turnFailed:true,turnId:message.params.turn.id});
       }
@@ -369,7 +392,11 @@ export class Broker {
     on(adapters.codex,'interrupted',(id:string,address?:string,turnId?:string)=>{const p=this.runtimePeer(id,address);if(p&&this.enabled(p.id)&&!this.recoveredCodexInterrupt(p,turnId)){this.questions.cancelPeer(p.id);this.store.updatePeer(p.id,{state:'paused'});}});
     on(adapters.codex,'turnStarted',(id:string,address?:string)=>{const p=this.runtimePeer(id,address);if(p&&this.enabled(p.id)&&(p.state!=='paused'||p.kind==='subagent'))this.store.updatePeer(p.id,{state:'busy'});});
     on(adapters.codex,'runtimeStopped',(runtime:Endpoint)=>this.retireCodexRuntime(runtime));
-    on(adapters.codex,'disconnected',(address:string)=>this.disconnected(address));
+    on(adapters.codex,'disconnected',(address:string)=>{this.turnEndEvidence.disconnected(address,this.store.peers(),peer=>this.store.endpoint(peer.id));this.disconnected(address);});
+    on(adapters.codex,'turnOriginObserved',(peerId:string,turnId:string,cause:string)=>{
+      const peer=this.store.getPeer(peerId),endpoint=peer?this.store.endpoint(peer.id):undefined;
+      if(peer&&endpoint&&cause==='partner')this.turnEndEvidence.partner(peer,endpoint,turnId);
+    });
     on(adapters.codex,'diagnostic',(message:string)=>this.store.event('diagnostic',{message}));
     on(adapters.codex,'contextObserved',(receipt:CodexContextReceipt&{sessionId:string;address:string})=>{
       if(this.stopped)return;
@@ -976,6 +1003,7 @@ export class Broker {
       }
       const expanded=this.references.expand(sender,input.message);
       const accepted=this.store.accept(pair,sender,input.message,callId,replyTo,input.actor.via??(sender.sessionId!==input.actor.sessionId?input.actor.sessionId:undefined),source,input.reply_expected??false);
+      this.turnEnds.sent(sender);const endpoint=this.store.endpoint(sender.id);if(endpoint)this.turnEndEvidence.sent(sender,endpoint);
       this.references.snapshot(accepted,expanded);this.communicationTips.partnerSent(sender,accepted);return accepted;
     });
     if(schedule)queueMicrotask(()=>void this.pump());
@@ -1077,20 +1105,20 @@ export class Broker {
     if(p.admit!==false&&requestedNotice?.readyOnly&&!p.ready_boundary)return{notices:[],deferred:true};
     const scope=this.runtimeHealth.noticeScope(pair,sender),offered=await this.runtimeHealth.prepareNotices(p.actor,p.notice_id?[p.notice_id]:undefined,false);
                                                
-    if(p.admit!==false&&p.ready_boundary&&sender.host==='claude')await this.finalForwards.scan(this.store.peer(pair.codex));
+    if(p.admit!==false&&p.ready_boundary&&sender.host==='claude')await this.turnEnds.scan(this.store.peer(pair.codex));
     return this.store.transaction(()=>{
     const current=this.actor(p.actor),currentPair=this.store.pairFor(current.id);
     if(!currentPair||currentPair.id!==pair.id||currentPair.paused||this.runtimeHealth.noticeScope(currentPair,current)!==scope)return{notices:[]};
     if(p.admit!==false)this.runtimeHealth.assertClaudeNoticeSession(current);
-    if(p.admit!==false&&p.ready_boundary&&current.host==='claude')this.finalForwards.refresh(currentPair,true);
-    if(p.admit!==false&&requestedNotice?.readyOnly&&!this.finalForwards.ready(currentPair,true))return{notices:[],deferred:true};
+    if(p.admit!==false&&p.ready_boundary)this.turnEnds.refresh(currentPair);
+    if(p.admit!==false&&requestedNotice?.readyOnly&&!this.turnEnds.ready(currentPair,true))return{notices:[],deferred:true};
     const notices=p.admit===false?offered:this.runtimeHealth.admitNotices(currentPair,current,offered,scope,false,p.ready_boundary===true);
     const rotations:RuntimeNotice[]=this.store.contextNotices(sender.id).map(rotation=>({id:rotation.id,message:contextNotice(rotation,this.store.peer(rotation.peerId)),state:'pending',source:'context_rotation',wake:false}));
     const selected=[...rotations.filter(n=>(!p.notice_id||n.id===p.notice_id)&&(p.admit===false||this.store.admitContextNotice(sender.id,n.id))),...notices];
                                             
     const recovery=this.runtimeHealth.outageRecovery(sender,p.admit!==false,p.notice_id);if(recovery)selected.push(recovery);
                                                  
-    return{notices:p.admit===false?selected.filter(n=>!n.readyOnly||this.store.endpoint(current.id)?.modRevision===MOD_REVISION).map(noticeSignal):selected};
+    return{notices:p.admit===false?selected.filter(n=>!n.readyOnly||this.store.endpoint(current.id)?.modRevision===MOD_REVISION&&this.turnEnds.ready(currentPair)).map(noticeSignal):selected};
     });
   }
   private async register(input:RegisterInput,options:{managedCodexChecked?:boolean}={}):Promise<Peer & {binding?:Actor['binding']}>{
@@ -1140,7 +1168,9 @@ export class Broker {
     if(!this.enabled(peer.id))return operation==='monitor'?{...this.offResult(peer),notices:[]}:this.offResult(peer);
                                         
     return this.store.transaction(()=>{
-    if(nativeHealth&&(!ownEndpoint.nativeHealth||nativeHealth.lastEventAt>ownEndpoint.nativeHealth.lastEventAt))this.store.saveEndpoint({...ownEndpoint,nativeHealth:{...nativeHealth,source:'native-mod'}});
+    if(nativeHealth&&(!ownEndpoint.nativeHealth||nativeHealth.lastEventAt>ownEndpoint.nativeHealth.lastEventAt)){
+      this.store.saveEndpoint({...ownEndpoint,nativeHealth:{...nativeHealth,source:'native-mod'}});this.turnEnds.native(peer,nativeHealth);
+    }
     this.pairAnomalies.integration(peer,{mod:true,modRevision:receipt.revision});
     if(operation==='monitor'){
       const changed=changeNotices(this.store,peer,{admit:false});if(changed.length)return{notices:changed};
@@ -1149,13 +1179,13 @@ export class Broker {
                                                         
       this.runtimeHealth.refreshNoticeConditions(pair,'mod_monitor');
       const recovery=this.runtimeHealth.outageRecovery(peer,false);
-      return{notices:[...this.store.contextNotices(peer.id).map(n=>({id:n.id,source:'context_rotation',wake:false})),...this.deliveryHealth.peek(pair.id,peer.id).map(noticeSignal),...(recovery?[noticeSignal(recovery)]:[])]};
+      return{notices:[...this.store.contextNotices(peer.id).map(n=>({id:n.id,source:'context_rotation',wake:false})),...this.deliveryHealth.peek(pair.id,peer.id).filter(n=>!n.readyOnly||this.turnEnds.ready(pair)).map(noticeSignal),...(recovery?[noticeSignal(recovery)]:[])]};
     }
     const partner=pair?this.store.peer(pair.codex):undefined,endpoint=partner?this.store.endpoint(partner.id):undefined,loss=!pair?pairLossView(this.store,peer,this.config):undefined;
     const health=partner?this.runtimeHealth.peerHealth(partner):undefined;
     if(health?.nativeIssue?.kind==='tool_failed')delete health.nativeIssue;
     const permission=pair?permissionGuidance(partner!,peer,ownEndpoint):undefined;
-    return{incidents:this.runtimeHealth.incidentViews([peer.id,...(partner?[partner.id]:[])]),notes:this.runtimeHealth.incidentNotes(partner?[partner.id]:[]),paired:!!pair,self:{id:peer.id,state:peer.state,enabled:this.enabled(peer.id)},...(loss?{pair_lost:loss}:{}),...(permission?{permission_guidance:permission}:{}),...(pair?{paused:pair.paused,waiting_context:(this.store.bindings.current(partner!.id)?.transitioning===true||endpoint?.pendingContext===true)&&this.store.pendingCount(partner!.id)>0,partner:{state:partner!.state,enabled:this.enabled(partner!.id),...this.runtimeHealth.deliveryGuidance(partner!),...(health?.nativeIssue?{native_issue:health.nativeIssue}:{}),...(health?{health:{state:health.state,progressEvidence:health.progressEvidence,...(health.retry?{retry:health.retry}:{}),...(health.modelRequest?{modelRequest:health.modelRequest}:{})}}:{})}}:{}),
+    return{completion_guard:this.turnEnds.status(peer),incidents:this.runtimeHealth.incidentViews([peer.id,...(partner?[partner.id]:[])]),notes:this.runtimeHealth.incidentNotes(partner?[partner.id]:[]),paired:!!pair,self:{id:peer.id,state:peer.state,enabled:this.enabled(peer.id)},...(loss?{pair_lost:loss}:{}),...(permission?{permission_guidance:permission}:{}),...(pair?{paused:pair.paused,waiting_context:(this.store.bindings.current(partner!.id)?.transitioning===true||endpoint?.pendingContext===true)&&this.store.pendingCount(partner!.id)>0,partner:{state:partner!.state,enabled:this.enabled(partner!.id),...this.runtimeHealth.deliveryGuidance(partner!),...(health?.nativeIssue?{native_issue:health.nativeIssue}:{}),...(health?{health:{state:health.state,progressEvidence:health.progressEvidence,...(health.retry?{retry:health.retry}:{}),...(health.modelRequest?{modelRequest:health.modelRequest}:{})}}:{})}}:{}),
       ...(pair?{delivery_admission:this.runtimeHealth.deliveryAdmission(peer,pair)}:{}),
       integrationIssues:[peer.id,...(partner?[partner.id]:[])].flatMap(peerId=>this.runtimeHealth.integrationIssues(peerId)),
                                                            
@@ -1177,7 +1207,7 @@ export class Broker {
     };
     const withHealth=(peer:Peer)=>{
       let result:unknown={...peer,diagnosticUnavailable:true};
-      this.store.faults.sync('status:'+peer.id,()=>{const children=this.subagentCompletions.status(peer),forward=this.finalForwards.status(peer),transport=this.memberLifecycle.transportStatus(peer);result={...describePeer(peer),partner_profile:this.profiles.view(peer),...(transport?{transport_migration:transport}:{}),...(children?{childCompletions:{...children,hold:this.pairAnomalies.evidence(peer).subagentHold??null}}:{}),...(forward?{final_forward:forward}:{})};});return result;
+      this.store.faults.sync('status:'+peer.id,()=>{const children=this.subagentCompletions.status(peer),completion=this.turnEnds.status(peer),transport=this.memberLifecycle.transportStatus(peer);result={...describePeer(peer),partner_profile:this.profiles.view(peer),...(transport?{transport_migration:transport}:{}),...(children?{childCompletions:{...children,hold:this.pairAnomalies.evidence(peer).subagentHold??null}}:{}),completion_guard:completion};});return result;
     };
     if(!actor){const pairs=this.store.pairs();return{pairs,...(pairs.length<=1?{pair:pairs[0]??null}:{}),peers:this.store.peers().map(withHealth),lostPairs:this.store.faults.map('status_loss',this.store.peers(),peer=>peer.id,peer=>{const loss=pairLossView(this.store,peer,this.config);return loss?[{...loss,member_id:peer.id,member_name:peer.name}]:[];}).flat(),bindings:this.store.bindings.all(),endpoints:this.store.endpoints(),messages:this.store.messages(100),questions:this.store.questions(),degraded:this.store.faults.status(),communicationTips:this.store.faults.map('status_tips',this.store.peers(),peer=>peer.id,p=>{const stats=this.communicationTips.summary(p.id);return stats?[{peerId:p.id,host:p.host,...stats}]:[];}).flat(),capabilities:{compatibilityWake:this.config.compatibilityWake,hookObserved:this.store.setting('lastHook')??null,...capability}};}
     const peer=this.actor(actor),pair=this.store.pairFor(peer.id);
@@ -1334,7 +1364,7 @@ export class Broker {
       const identitiesReady=await this.pumpStage('codex_identities',()=>this.checkCodexIdentities());
       if(this.stopped)return;
       await this.pumpStage('claude_inbound',()=>this.claudeInbound.sweep());
-      for(const pair of this.store.pairs())await this.pumpStage('codex_final:'+pair.codex,()=>this.finalForwards.scan(this.store.peer(pair.codex)));
+      for(const pair of this.store.pairs())await this.pumpStage('turn_end:'+pair.codex,()=>this.turnEnds.scan(this.store.peer(pair.codex)));
       for(const pair of this.store.pairs())await this.pumpStage('notice_conditions:'+pair.id,()=>{this.refreshSubagentHold(this.store.peer(pair.codex));this.runtimeHealth.refreshNoticeConditions(pair,'periodic_pump');});
       for(const peer of this.store.peers())if(!this.store.pairFor(peer.id)&&['root','fork'].includes(peer.kind))await this.pumpStage('cooperation_unpaired:'+peer.id,()=>this.communicationTips.cooperation.observe(peer));
       await this.pumpStage('delivery_health',()=>this.runtimeHealth.checkDeliveryHealth());
@@ -1505,23 +1535,26 @@ export class Broker {
       &&!!active?.active&&active.epoch===endpoint.epoch&&active.address===endpoint.address&&active.bindingEpoch===endpoint.bindingEpoch
       &&!active.pendingContext&&!this.store.bindings.current(peer.id)?.transitioning;
   }
-  private finalForwardGate(codex:Peer,claude:Peer):string|undefined{
-    const pair=this.store.pairFor(codex.id);if(this.stopped||!pair)return'context_changed';
+  private completionGate(background:Peer,foreground:Peer,boundaryPeerId?:string):CompletionHold|undefined{
+    const pair=this.store.pairFor(background.id);if(this.stopped||!pair)return'runtime_unavailable';
     if(pair.paused)return'paused';
-    if(!this.enabled(codex.id)||!this.enabled(claude.id))return'disabled';
-    for(const peer of [codex,claude]){
+    if(!this.enabled(background.id)||!this.enabled(foreground.id))return'disabled';
+    if(this.store.questions(true).some(question=>question.pairId===pair.id))return'pending_user';
+    const children=background.host==='codex'?this.subagentCompletions.forwardChildren(background):undefined;
+    if(children&&(children.pending.length||children.wakePending))return'background_busy';
+    for(const peer of [background,foreground]){
       const endpoint=this.store.endpoint(peer.id);
-      if(!endpoint?.active||endpoint.pendingContext||this.store.bindings.current(peer.id)?.transitioning)return'context_changed';
-      if(peer.state==='paused')return'interrupted';
+      if(!endpoint?.active||endpoint.pendingContext||this.store.bindings.current(peer.id)?.transitioning)return'native_state_unverified';
+      if(peer.state==='paused')return'paused';
       const health=this.runtimeHealth.peerHealth(peer);
-      if(peer.state==='needsHuman'||health?.state==='needsHuman'||health?.humanRequests?.length)return'needs_human';
-      if(hostingGate(this.store,peer))return'hosting_pending';
-      if(this.profiles.blocks(peer))return'profile_pending';
-      if(this.memberLifecycle.isRestarting(peer.id)||this.memberLifecycle.isRetiring(peer.id)||this.store.setting('managedSessionConflict:'+peer.id))return'runtime_pending';
-      if(peer.state!=='ready')return peer.host==='claude'?'claude_busy':'codex_busy';
+      if(peer.state==='needsHuman'||health?.state==='needsHuman'||health?.humanRequests?.length)return'pending_user';
+      if(hostingGate(this.store,peer)||this.profiles.blocks(peer)||this.incidents.current(peer,endpoint)||providerBlocked(health)||health?.state==='failed')return'runtime_unavailable';
+      if(this.memberLifecycle.isRestarting(peer.id)||this.memberLifecycle.isRetiring(peer.id)||this.store.setting('managedSessionConflict:'+peer.id))return'runtime_unavailable';
+      if(peer.id!==boundaryPeerId&&(peer.state!=='ready'||health&&health.state!=='ready'))return peer.id===foreground.id?'foreground_busy':'background_busy';
+      if(peer.id===boundaryPeerId&&!['ready','busy'].includes(peer.state))return'runtime_unavailable';
+      if(!health&&peer.id!==boundaryPeerId)return'native_state_unverified';
+      if(peer.host==='claude'&&(endpoint.modRevision!==MOD_REVISION||claudeAutoHolds(this.store,peer)||!this.memberLifecycle.ownedClaudeLaunchReady(peer)))return'native_state_unverified';
     }
-    if(this.store.endpoint(claude.id)?.modRevision!==MOD_REVISION)return'mod_pending';
-    if(claudeAutoHolds(this.store,claude)||!this.memberLifecycle.ownedClaudeLaunchReady(claude))return'native_policy';
     return;
   }
   private subagentContextAllowed(peer:Peer,synthetic:boolean):boolean{
@@ -1591,14 +1624,18 @@ export class Broker {
   private async signalEmbeddedWake(peer:Peer,endpoint:Endpoint):Promise<void>{
     try{await this.serialCodexWake(peer,()=>this.signalEmbeddedWakeInner(peer,endpoint));}finally{this.refreshSubagentHold(this.store.peer(peer.id));}
   }
+  private wakeNotices(pair:Pair,peer:Peer):RuntimeNotice[]{return this.deliveryHealth.peek(pair.id,peer.id).filter(notice=>notice.wake===true&&(!notice.readyOnly||this.turnEnds.ready(pair)));}
   private async signalEmbeddedWakeInner(peer:Peer,endpoint:Endpoint):Promise<void>{
     this.requireEnabled(peer);
     const pair=this.store.pairFor(peer.id),current=this.store.peer(peer.id);
     if(!pair||endpoint.mode!=='embedded'||endpoint.daemon||!peer.sessionId||!this.codexWakeAllowed(peer,endpoint,pair.id)||this.subagentCompletions.blocked(peer))return;
     const config={...this.config,...(endpoint.configHome?{codexHome:endpoint.configHome}:{})},home=config.codexHome;
     if(!home)return;
-    const needed=()=>this.store.pendingCount(peer.id)>0||this.deliveryHealth.peek(pair.id,peer.id).some(n=>n.wake===true)||this.subagentCompletions.pending(peer);
+    const needed=()=>this.store.pendingCount(peer.id)>0||this.wakeNotices(pair,peer).length>0||this.subagentCompletions.pending(peer);
     if(!needed())return;
+    if(!this.store.pendingCount(peer.id)&&!this.subagentCompletions.pending(peer)&&this.wakeNotices(pair,peer).some(n=>n.source==='background_completed')){
+      await this.signalCompletionNotice(peer,endpoint,pair,true);return;
+    }
     const scope=JSON.stringify([pair.id,peer.sessionId,endpoint.epoch,endpoint.bindingEpoch]);
     const error=await this.wakeSignals.signal(peer.id,scope,home,peer.sessionId,async()=>{
       if(!this.codexWakeAllowed(peer,endpoint,pair.id)||this.subagentCompletions.blocked(peer)||!needed())return;
@@ -1623,21 +1660,51 @@ export class Broker {
     if(this.subagentCompletions.pending(peer)&&!this.codexDirect.status(peer.id)?.continuation?.uncertain)return this.signalSubagentWake(peer,endpoint,pair);
     if(localCodexEndpoint(this.home,endpoint.address)){
       const actor:Actor={host:'codex',memberId:peer.id,sessionId:peer.sessionId,callId:randomUUID()};
-      const notices=this.deliveryHealth.peek(pair.id,peer.id).filter(n=>n.wake===true).map(notice=>({id:notice.id,pairId:pair.id,from:pair.claude,to:peer.id,body:notice.message,callId:notice.id,state:'accepted' as const,createdAt:Date.now(),updatedAt:Date.now(),attempts:0,inReplyTo:null,via:null,evidence:null,error:null,notice:true}));
+      const notices=this.wakeNotices(pair,peer).map(notice=>({id:notice.id,pairId:pair.id,from:pair.claude,to:peer.id,body:notice.message,callId:notice.id,state:'accepted' as const,createdAt:Date.now(),updatedAt:Date.now(),attempts:0,inReplyTo:null,via:null,evidence:null,error:null,notice:true}));
       const guard=()=>{const fresh=this.store.pairFor(peer.id),active=this.store.endpoint(peer.id);return !hostingGate(this.store,this.store.peer(peer.id))&&!this.profiles.blocks(this.store.peer(peer.id))&&this.enabled(peer.id)&&!this.stopped&&!this.memberLifecycle.isRestarting(peer.id)&&fresh?.id===pair.id&&!fresh.paused&&this.store.peer(peer.id).sessionId===peer.sessionId&&this.store.peer(peer.id).state==='ready'&&active?.epoch===endpoint.epoch&&!this.store.bindings.current(peer.id)?.transitioning;};
       await this.codexDirect.deliver(peer,endpoint,[...this.store.pending(peer.id),...notices],async message=>{
-        if(message.notice){const notice=(await this.runtimeHealth.prepareNotices(actor,[message.id],true,true))[0];return notice?JSON.stringify({messages:[],notices:[{notice_id:notice.id,source:notice.source??'runtime_monitor',message:notice.message}]}):undefined;}
+        if(message.notice){const notice=(await this.runtimeHealth.prepareNotices(actor,[message.id],true,true,true))[0];return notice?JSON.stringify({messages:[],notices:[{notice_id:notice.id,source:notice.source??'runtime_monitor',message:notice.message}]}):undefined;}
         const body=this.deliveryBody(message);return body===undefined?undefined:JSON.stringify({messages:[{message_id:message.id,from:modelPeerName(this.store.peer(message.from)),message:body,...(message.replyExpected?{reply_expected:true}:{}),...(message.inReplyTo?{in_reply_to:message.inReplyTo}:{}),...(message.via?{via:message.via}:{}),...fileHintFields(body,peer.cwd)}],status:'received'});
-      },guard,receipt=>{this.observeCodexContext(peer,receipt,'原生持久历史');this.deliveryHealth.outcome(pair.id,peer.id,receipt.messageId,'submitted');},id=>this.deliveryHealth.recordedCanWake(pair.id,peer.id,id));
+      },guard,receipt=>{this.observeCodexContext(peer,receipt,'原生持久历史');for(const notice of this.deliveryHealth.outcome(pair.id,peer.id,receipt.messageId,'submitted'))this.turnEnds.entered(peer,notice.id);},id=>this.deliveryHealth.recordedCanWake(pair.id,peer.id,id),turnId=>this.turnEnds.started(peer,turnId),id=>this.store.transaction(()=>this.turnEnds.notSubmitted(peer,this.deliveryHealth.outcome(pair.id,peer.id,id,'pending'))));
       if(this.subagentCompletions.pending(peer)&&!this.subagentCompletions.blocked(peer)&&!this.codexDirect.status(peer.id)?.continuation?.uncertain)await this.signalSubagentWake(peer,endpoint,pair);
       return;
     }
-    const anchor=this.store.firstPendingId(peer.id)??this.deliveryHealth.peek(pair.id,peer.id).find(n=>n.wake===true)?.id;
+    if(!this.store.pendingCount(peer.id)&&this.wakeNotices(pair,peer).some(n=>n.source==='background_completed')){
+      await this.signalCompletionNotice(peer,endpoint,pair,false);return;
+    }
+    const anchor=this.store.firstPendingId(peer.id)??this.wakeNotices(pair,peer)[0]?.id;
     if(!anchor){this.codexWake.clear(peer.id);return;}
     const scope=JSON.stringify([pair.id,peer.sessionId,endpoint.epoch,endpoint.bindingEpoch]);
-    await this.codexWake.signal(peer.id,scope,anchor,async()=>{await this.submitCodexSignal(peer,'native_existing',()=>this.codexWakeAllowed(peer,endpoint,pair.id)&&(this.store.pendingCount(peer.id)>0||this.deliveryHealth.peek(pair.id,peer.id).some(n=>n.wake===true)),authorize=>this.adapters.codex.wake(peer,endpoint,this.runtimeHealth.abortSignal,authorize));});
+    await this.codexWake.signal(peer.id,scope,anchor,async()=>{await this.submitCodexSignal(peer,'native_existing',()=>this.codexWakeAllowed(peer,endpoint,pair.id)&&(this.store.pendingCount(peer.id)>0||this.wakeNotices(pair,peer).length>0),authorize=>this.adapters.codex.wake(peer,endpoint,this.runtimeHealth.abortSignal,authorize));});
     const reservation=this.codexWake.status(peer.id);
-    if(this.store.pendingCount(peer.id)||this.deliveryHealth.peek(pair.id,peer.id).some(n=>n.wake===true))this.pairAnomalies.integration(current,{pickup:reservation??null});
+    if(this.store.pendingCount(peer.id)||this.wakeNotices(pair,peer).length)this.pairAnomalies.integration(current,{pickup:reservation??null});
+  }
+  private async signalCompletionNotice(peer:Peer,endpoint:Endpoint,pair:Pair,queued:boolean):Promise<void>{
+    const candidate=this.deliveryHealth.peek(pair.id,peer.id).find(notice=>notice.source==='background_completed');if(!candidate)return;
+    const actor:Actor={host:peer.host,memberId:peer.id,sessionId:peer.sessionId!,callId:randomUUID()};
+    let prepared:RuntimeNotice|undefined,closed=false;
+    const unsubmitted=(notice:RuntimeNotice)=>this.store.transaction(()=>this.turnEnds.notSubmitted(peer,this.deliveryHealth.outcome(pair.id,peer.id,notice.id,'pending')));
+    const authorize=async()=>{
+      if(!this.codexWakeAllowed(peer,endpoint,pair.id)||!this.turnEnds.ready(pair))return false;
+      const fresh=(await this.runtimeHealth.prepareNotices(actor,[candidate.id],true,true,true))[0];
+      if(fresh&&(closed||this.runtimeHealth.abortSignal.aborted||!this.codexWakeAllowed(peer,endpoint,pair.id)||!this.turnEnds.reservedReady(pair,candidate.id))){unsubmitted(fresh);return false;}
+      prepared=fresh;return !!prepared;
+    };
+    const context=()=>`[nxbridge completion_notice=${prepared!.interventionIds?.[0]??prepared!.interventionId??prepared!.id}]\n${runtimeNoticeText(prepared!)}`;
+    const started=(turnId:string)=>{const id=prepared?.interventionIds?.[0]??prepared?.interventionId;if(id){this.turnEnds.entered(peer,id);this.turnEnds.started(peer,turnId,id);}};
+    try{
+      if(queued)await this.adapters.codex.queueWake(peer,endpoint,async()=>{if(!await authorize())throw new DeliveryError('wake_unavailable','完成提醒条件已变化，未入队。');},()=>{},HEALTH_WAKE_NOTICE,context);
+      else if(endpoint.daemon){const turnId=await this.daemons.wake(peer,endpoint,authorize,()=>HEALTH_WAKE_NOTICE+'\n'+context());if(turnId)started(turnId);}
+      else await this.adapters.codex.wake(peer,endpoint,this.runtimeHealth.abortSignal,authorize,()=>HEALTH_WAKE_NOTICE+'\n'+context(),started);
+      if(prepared)this.deliveryHealth.outcome(pair.id,peer.id,prepared.id,'submitted');
+    }catch(error){
+      if(prepared)this.store.transaction(()=>{
+        const known=(error as {uncertain?:boolean}).uncertain===false;
+        const notices=this.deliveryHealth.outcome(pair.id,peer.id,prepared!.id,known?'pending':'unknown');
+        if(known)this.turnEnds.notSubmitted(peer,notices);
+      });
+      throw error;
+    }finally{closed=true;}
   }
   private recoveredCodexInterrupt(peer:Peer,turnId:unknown):boolean{
     const fence=this.store.setting<{sessionId:string;endpointEpoch:string;pairId:string;turnId:string}>('codexRecoveryFence:'+peer.id);
@@ -2011,9 +2078,36 @@ export class Broker {
       }
       case'peer.state':return this.peerState(z.object({actor:actorSchema,state:z.enum(['ready','busy','needsHuman','offline','paused'])}).extend(profileSchema.shape).parse(raw));
       case'peer.prompt':{
-        const p=z.object({actor:actorSchema}).parse(raw),peer=this.actor(p.actor);
+        const p=z.object({actor:actorSchema}).extend(claudeHumanPromptSchema.partial().shape).parse(raw),peer=this.actor(p.actor);
         if(p.actor.sessionId!==peer.sessionId)throw new BridgeError('subagent_denied','子代理不能恢复根会话。');
-        this.finalForwards.human(peer);this.store.updatePeer(peer.id,{state:'busy',activityAt:Date.now()});queueMicrotask(()=>void this.pump());return{resumed:true};
+        if(p.human_origin&&p.human_turn_id&&p.human_input_at!==undefined&&peer.host==='claude')this.turnEnds.human(peer,p.human_turn_id,p.human_input_at);
+        this.store.updatePeer(peer.id,{state:'busy',activityAt:Date.now()});queueMicrotask(()=>void this.pump());return{resumed:true};
+      }
+      case'peer.turn.stop':{
+        const p=claudeTurnStopSchema.extend({actor:actorSchema}).parse(raw),peer=this.actor(p.actor);
+        if(peer.host!=='claude'||p.actor.sessionId!==peer.sessionId||p.actor.via)throw new BridgeError('subagent_denied','停止判断只接受当前 Claude 根轮次。');
+        const health=this.store.endpoint(peer.id)?.nativeHealth;
+        if(p.stop_hook_active){
+          const confirmed=(!health||health.turnId===p.turn_id)&&this.turnEnds.confirmStop(peer,p.turn_id);
+          return{confirmed,...(!confirmed?{stale:true}:{})};
+        }
+        if(!health||health.turnId!==p.turn_id||['ready','failed'].includes(health.state)||p.deadline_at===undefined)return{};
+        const result=this.turnEnds.checkStop(peer,p);
+        if(result.block){
+          this.store.updatePeer(peer.id,{state:'busy'});
+          const endpoint=this.store.endpoint(peer.id);if(endpoint)this.store.saveEndpoint({...endpoint,nativeBackground:{observedAt:Date.now()}});
+        }
+        return result;
+      }
+      case'peer.turn.completed':{
+        const p=claudeTurnCompletedSchema.extend({actor:actorSchema}).parse(raw),peer=this.actor(p.actor);
+        if(peer.host!=='claude'||p.actor.sessionId!==peer.sessionId||p.actor.via)throw new BridgeError('subagent_denied','完成事实只接受当前 Claude 根轮次。');
+        const endpoint=this.store.endpoint(peer.id);
+        const health=endpoint?.nativeHealth;
+        if(health?.turnId!==p.turn_id||health.state!=='ready'||health.completion!=='completed'||p.background.tasks!==0||p.background.crons!==0)
+          return{recorded:false,...(health&&health.lastEventAt>=p.completed_at&&(health.turnId!==p.turn_id||health.state==='failed'||['failed','interrupted'].includes(health.completion??''))?{stale:true}:{})};
+        this.turnEnds.complete(peer,{turnId:p.turn_id,completedAt:p.completed_at,stats:p.stats,interventions:p.interventions});
+        queueMicrotask(()=>void this.pump());return{recorded:true};
       }
       case'ref.expand':{const p=z.object({actor:actorSchema,text}).parse(raw);return{text:this.references.expand(this.actor(p.actor),p.text)};}
       case'tip.agent':{const p=z.object({actor:actorSchema,text}).parse(raw),peer=this.actor(p.actor);return{tip:this.runtimeHealth.communicationTip(peer,p.text,'agent',p.actor)};}
@@ -2256,6 +2350,7 @@ export class Broker {
   private peerState(p:{actor:Actor;state:PeerState;model?:string|null;effort?:string|number|null}):Peer{
     const peer=this.actor(p.actor);
     if(p.actor.sessionId!==peer.sessionId)throw new BridgeError('subagent_denied','子代理不能改写根会话状态。');
+    if(peer.host==='claude')this.turnEnds.native(peer,this.store.endpoint(peer.id)?.nativeHealth);
     if(peer.host==='claude'&&p.state==='busy'&&(!['busy','needsHuman'].includes(peer.state)||!this.store.setting('claudeTurnStart:'+peer.id)))this.store.setSetting('claudeTurnStart:'+peer.id,Date.now());
     if(p.state==='offline'||p.state==='paused')this.questions.cancelPeer(peer.id);
     if(p.state==='offline'){
@@ -2387,7 +2482,11 @@ export class Broker {
     const completionContext=event==='UserPromptSubmit'?this.subagentCompletions.context(peer):undefined;
     if(event==='SessionStart'&&p.source!=='compact'||event==='UserPromptSubmit'&&typeof p.prompt==='string'&&p.prompt.trim()&&!isEmbeddedWake(p.prompt))this.daemons.nativeInteraction(peer);
     const wakeContexts:string[]=[];
+    const completionNotice=event==='UserPromptSubmit'?completionWakeId(p.prompt):undefined;
+    if(completionNotice&&!this.turnEnds.consumeQueued(peer,completionNotice,typeof p.turn_id==='string'?p.turn_id:undefined))return{continue:false};
     if(event==='UserPromptSubmit'&&isEmbeddedWake(p.prompt)){
+      const endpoint=this.store.endpoint(peer.id);
+      if(endpoint&&typeof p.turn_id==='string'&&this.store.pendingCount(peer.id))this.turnEndEvidence.partner(peer,endpoint,p.turn_id,this.store.pendingFacts(peer.id).map(message=>message.id));
       this.wakeSignals.consumed(peer.id);
       this.subagentCompletions.started(peer,true);
       const pair=this.store.pairFor(peer.id);
@@ -2395,10 +2494,13 @@ export class Broker {
       if(!this.subagentContextAllowed(peer,true))return discard();
                                                  
       if(this.subagentCompletions.available(peer))this.store.updatePeer(peer.id,{state:'busy'});
-      if(!this.store.pendingCount(peer.id)){
-        const notices=await this.runtimeHealth.prepareNotices(actor,undefined,true,true);
+      if(!completionNotice&&!this.store.pendingCount(peer.id)){
+        const notices=await this.runtimeHealth.prepareNotices(actor,undefined,true,true,true);
         if(!this.subagentContextAllowed(peer,true)||!notices.length&&!this.subagentCompletions.available(peer))return discard();
-        if(notices.length)wakeContexts.push('nxbridge: runtime health facts only; no partner message pickup required',...notices.map(runtimeNoticeText));
+        if(notices.length){
+          for(const notice of notices)for(const id of notice.interventionIds??(notice.interventionId?[notice.interventionId]:[])){this.turnEnds.entered(peer,id);if(typeof p.turn_id==='string')this.turnEnds.started(peer,p.turn_id,id);}
+          wakeContexts.push('nxbridge: runtime health facts only; no partner message pickup required',...notices.map(runtimeNoticeText));
+        }
       }
     }
     const timing=z.object({identityMs:z.number().nonnegative(),registrationMs:z.number().nonnegative(),elapsedBeforeBrokerMs:z.number().nonnegative()}).safeParse(p.nxbridge_timing);
@@ -2411,6 +2513,7 @@ export class Broker {
     if(event==='UserPromptSubmit'){
       this.store.setSetting('communicationTurn:'+peer.id,randomUUID());
       this.foregroundHealth.observe(peer,'start',typeof p.turn_id==='string'?p.turn_id:undefined);
+      if(typeof p.turn_id==='string')this.turnEnds.begin(peer,p.turn_id);
       this.store.updatePeer(peer.id,{state:'busy',...(!isEmbeddedWake(p.prompt)&&typeof p.prompt==='string'&&p.prompt.trim()?{activityAt:Date.now()}:{})});queueMicrotask(()=>void this.pump());
     }
     const nativeTurnId=typeof p.turn_id==='string'?p.turn_id:undefined,toolId=typeof p.tool_use_id==='string'?p.tool_use_id:undefined;
@@ -2424,6 +2527,15 @@ export class Broker {
     if(event==='PermissionRequest')this.foregroundHealth.observe(peer,'human',nativeTurnId,toolId);
     if(event==='Interrupt'&&!recoveredInterrupt)this.foregroundHealth.observe(peer,'paused',nativeTurnId);
     if(event==='Stop'){
+      const health=this.runtimeHealth.peerHealth(peer);
+      const endpoint=this.store.endpoint(peer.id);
+      if(endpoint&&nativeTurnId&&(!health||health.turnId===nativeTurnId)){
+        if(p.stop_hook_active===true)this.turnEnds.confirmStop(peer,nativeTurnId);
+        const stats=this.turnEndEvidence.get(peer,endpoint,nativeTurnId)??{startedAt:Date.now(),covered:false,actions:0,workTools:0};
+        const result=this.turnEnds.checkStop(peer,{turn_id:nativeTurnId,stop_hook_active:p.stop_hook_active===true,stats});
+        if(result.block){this.store.updatePeer(peer.id,{state:'busy'});return{decision:'block',reason:result.block};}
+        this.turnEnds.stopped(peer,nativeTurnId);
+      }
       this.subagentCompletions.settle(peer,p.transcript_path,nativeTurnId);
       this.foregroundHealth.observe(peer,'ready',nativeTurnId);
       queueMicrotask(()=>void this.pump());

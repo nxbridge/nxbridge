@@ -67,8 +67,19 @@ test('等待原连接期间的代次、端点及授权变化均阻止入队',asy
   }),{code:'queue_route_unverified'});
   saveManagedRuntime(f.home,f.runtime);
   const submit=async(_params:CodexQueueParams,authorize:()=>Promise<void>)=>{await authorize();assert.fail('授权更新后不得写入');};
-  await assert.rejects(f.request(submit,()=>{throw denied;}),error=>error===denied);
+  await assert.rejects(f.request(submit,()=>{throw denied;}),error=>error===denied&&(error as BridgeError&{uncertain?:boolean}).uncertain===false);
   await assert.rejects(f.request(submit,()=>{saveManagedRuntime(f.home,{...f.runtime,pid:f.native.pid+1});}),{code:'queue_route_unverified'});
+});
+
+test('完成提醒正文在最终授权后生成，授权后原生代次再变化仍明确记作未提交',async t=>{
+  const f=fixture(t);let admitted=false,built=0;
+  const result=await queueCodexWake(f.home,DEFAULT_CONFIG,f.peer,f.endpoint,{...options,
+    beforeSubmit:()=>{admitted=true;},completionNotice:()=>{assert.equal(admitted,true);built++;return'[nxbridge completion_notice=reserved] 完成事实';},
+    requestRemote:async(params,authorize)=>{assert.equal(built,0);await authorize();assert.equal(built,1);assert.match(params.input[0].text,/completion_notice=reserved/);return confirmation(params);}},f.io);
+  assert.equal(result.id,'native-queue-id');
+  await assert.rejects(queueCodexWake(f.home,DEFAULT_CONFIG,f.peer,f.endpoint,{...options,
+    beforeSubmit:()=>{saveManagedRuntime(f.home,{...f.runtime,pid:f.native.pid+1});},requestRemote:async(_params,authorize)=>{await authorize();assert.fail('代次改变后不得写入');}},f.io),
+  error=>(error as {code?:string;uncertain?:boolean}).code==='queue_route_unverified'&&(error as {uncertain?:boolean}).uncertain===false);
 });
 
 test('共享 daemon 必须使用已登记的控制 socket 及精确线程编号',async t=>{
@@ -124,7 +135,7 @@ test('嵌入式入队在启动及提交前排除共享 daemon，碰撞后回收�
   const state=path.join(f.configHome,'app-server-daemon');
   await assert.rejects(queueCodexWake(f.home,DEFAULT_CONFIG,f.peer,endpoint,{...options,beforeSubmit:()=>{
     mkdirSync(state);writeFileSync(path.join(state,'app-server.pid'),JSON.stringify({pid:701}),'utf8');f.io.live=pid=>pid===701;
-  }},f.io),{code:'queue_daemon_collision'});
+  }},f.io),{code:'queue_daemon_collision',uncertain:false});
   assert.equal(closed,1);
 });
 

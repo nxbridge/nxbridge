@@ -52,6 +52,22 @@ test('Mod 等待读取凭据时切换对话会取消旧发送，长正文证据�
   assert.equal(sent.input.sessionId,'after');assert.equal(calls.filter(c=>c.operation==='send').length,1);
 });
 
+test('Stop 建议的总截止时间涵盖凭据准备；准备晚到后不会再启动提交进程',async()=>{
+  const native=await import(pathToFileURL(path.join(PACKAGE_ROOT,'plugins/claude/hooks/mod-control.js')).href);native.setModVersion(undefined);
+  let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;}),calls:{operation:string;timeout?:number}[]=[];
+  const sdk={session:{id:async()=>'deadline-session',cwd:async()=>'/project'},env:{get:async()=>undefined},plugin:{root:'/plugin'},
+    clock:{sleep:(ms:number,options:{signal:AbortSignal})=>sleep(ms,undefined,options)},process:{run:async(args:string[],options:any)=>{
+      const input=JSON.parse(args.at(-1)!);calls.push({operation:input.operation,timeout:options?.timeoutMs});
+      if(input.operation==='control-open')await gate;
+      return{exitCode:0,stdout:JSON.stringify({credential:{id:'a'.repeat(64),secret:'b'.repeat(64)}})};
+    }}};
+  const started=performance.now();
+  await assert.rejects(native.call(sdk,'turn-stop-check',{turn_id:'turn',stop_hook_active:false,deadline_at:Date.now()+80}),/deadline/);
+  assert.ok(performance.now()-started<1000);assert.equal(calls.length,1);assert.equal(calls[0]?.operation,'control-open');
+  assert.ok(calls[0]!.timeout!>0&&calls[0]!.timeout!<=80);
+  release();await new Promise(resolve=>setImmediate(resolve));assert.equal(calls.length,1,'准备的迟到结果不能转为业务提交');
+});
+
 test('去重与事务合并保持同序列状态和通知等价，每次响应前保存精确进展，重启不变',async t=>{
   t.mock.timers.enable({apis:['Date'],now:2000000});
   const start=Date.now();

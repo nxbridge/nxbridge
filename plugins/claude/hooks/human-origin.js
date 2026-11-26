@@ -16,8 +16,12 @@ export function attestedHuman(e,source,{bridge=false}={}){
   return source.kind==='composer'||bridge&&source.kind==='bridge'||source.kind==='sdk'&&source.surfaces.some(value=>APP_SURFACES.has(value));
 }
                                                  
-export async function humanPrompt($,e){
-  const source=await inputSource($,e);
+export function humanOrigin(e,source){
+  if(!attestedHuman(e,source))return;
+  return source.kind==='composer'?'composer':source.surfaces.find(value=>APP_SURFACES.has(value));
+}
+export async function humanPrompt($,e,source){
+  source??=await inputSource($,e);
   if(attestedHuman(e,source,{bridge:true}))return true;
   if(e.agentId||source.kind!=='sdk')return false;
   try{

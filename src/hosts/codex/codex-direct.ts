@@ -21,7 +21,7 @@ export class CodexDirectDelivery {
   pending(peerId:string):boolean{const value=this.store.setting<Reservation>(key(peerId));return !!value&&(value.attempts.length>0||!!value.continuation&&(value.continuation.attempts<3||!!value.continuation.uncertain));}
   status(peerId:string):Reservation|undefined{return this.store.setting(key(peerId));}
   continued(peerId:string,turnId:string):void{const value=this.status(peerId);if(value?.continuation&&turnId!==value.continuation.baseline){delete value.continuation;this.store.setSetting(key(peerId),value);}}
-  async deliver(peer:Peer,endpoint:Endpoint,messages:(Message&{notice?:boolean})[],output:(message:Message&{notice?:boolean})=>Promise<string|undefined>,guard:()=>boolean,observed:(receipt:CodexContextReceipt)=>void,noticeCanContinue:(id:string)=>boolean=()=>true):Promise<void>{
+  async deliver(peer:Peer,endpoint:Endpoint,messages:(Message&{notice?:boolean})[],output:(message:Message&{notice?:boolean})=>Promise<string|undefined>,guard:()=>boolean,observed:(receipt:CodexContextReceipt)=>void,noticeCanContinue:(id:string)=>boolean=()=>true,continued?:(turnId:string)=>void,notSubmitted?:(id:string)=>void):Promise<void>{
     if(hostingGate(this.store,peer))return;
     const enabled=()=>memberEnabled(this.store,this.store.peer(peer.id));if(!enabled())return;
     if(this.active.has(peer.id))return;this.active.add(peer.id);
@@ -80,14 +80,15 @@ export class CodexDirectDelivery {
       let submitted=false;
       for(const message of messages){
         if(reservation.attempts.some(value=>value.id===message.id)||!message.notice&&this.store.message(message.id).state!=='accepted')continue;
-        const body=await output(message);if(body===undefined||!guard())continue;
+        const body=await output(message);if(body===undefined)continue;
+        if(!guard()){if(message.notice)notSubmitted?.(message.id);continue;}
                                         
         const attempt:Attempt={id:message.id,callId:'nxbridge-'+message.id,at:Date.now(),...(state.history.cursor?{historyCursor:state.history.cursor}:{}),...(message.notice?{notice:true}:{})};
         const claimed=this.store.transaction(()=>{if(!message.notice&&!this.store.claim(message.id))return false;reservation.attempts.push(attempt);save();return true;});if(!claimed)continue;
         submitted=true;try{await this.adapter.inject(peer,endpoint,attempt.callId,body);}
         catch(error){
           if(!enabled())return;
-          if((error as {uncertain?:boolean}).uncertain===false){reservation.attempts=reservation.attempts.filter(value=>value!==attempt);save();if(!message.notice)this.store.transition(message.id,'accepted',undefined,describeError(error));throw error;}
+          if((error as {uncertain?:boolean}).uncertain===false){reservation.attempts=reservation.attempts.filter(value=>value!==attempt);save();if(message.notice)notSubmitted?.(message.id);else this.store.transition(message.id,'accepted',undefined,describeError(error));throw error;}
           if(!message.notice)this.store.transition(message.id,'unknown',undefined,describeError(error));
         }
       }
@@ -98,7 +99,7 @@ export class CodexDirectDelivery {
       }
       const start=reservation.continuation;if(!start||!guard()||start.uncertain||start.attempts>=3||Date.now()-start.at<30000&&start.attempts>0)return;
       start.attempts++;start.at=Date.now();start.baseline=latest()?.id;start.uncertain=true;save();
-      try{await this.adapter.continueInjected(peer,endpoint);if(!enabled())return;delete reservation.continuation;save();}
+      try{const turnId=await this.adapter.continueInjected(peer,endpoint,start.notice?'notice':'partner');if(!enabled())return;continued?.(turnId);delete reservation.continuation;save();}
       catch(error){if(!enabled())return;start.error=describeError(error).slice(0,1200);start.uncertain=(error as {uncertain?:boolean}).uncertain!==false;save();this.store.event('codex.continuation.failed',{peerId:peer.id,error:start.error,uncertain:start.uncertain});}
     }finally{this.active.delete(peer.id);}
   }

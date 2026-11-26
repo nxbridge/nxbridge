@@ -23,8 +23,9 @@ const pickup=noticePickup;
 const STALE_DROP='nxbridge：这条提醒送达前问题已消失，已自动丢弃，无需处理';
                                                           
 const DELIVERED_DROP='nxbridge：这条提醒已随前面的对话附上，无需处理';
-                                                                 
-const DEFERRED_DROP='nxbridge：Claude 正忙，这条提醒等空闲时再送，无需处理';
+                                                                                     
+                             
+const DEFERRED_DROP='nxbridge：这条提醒暂时不送，条件满足时再送，无需处理';
                                                
 const delivered=new Set();
 function remember(notice){
@@ -90,7 +91,7 @@ export async function settleHeld($,entries,context,state,error){
 }
                                                        
 const PASSIVE_DROP='nxbridge：这条提醒只需告知，会在下次对话时附上，未打扰 AI';
-export async function noticePrompt($,e,next){
+export async function noticePrompt($,e,next,tracker,input){
   const id=pickup(e);if(!id)return next(e);
   const lease=queued.get(id);
   if(!lease){
@@ -116,11 +117,16 @@ export async function noticePrompt($,e,next){
     if(notice.wake!==true&&!e.turnId){hold(id,context,report,notice);return{drop:PASSIVE_DROP};}
                                                       
     const entry=text(notice),attached=e.isMeta&&!e.turnId;
-    const result=await next(attached?{...e,context:[...(e.context??[]),entry]}:{...e,text:entry});
+    const wake=tracker?.prepareWake(context,e,notice,input);
+    let result;
+    try{result=await next(attached?{...e,context:[...(e.context??[]),entry]}:{...e,text:entry});}
+    catch(error){tracker?.settleWake(context,wake,false);throw error;}
     const missing=attached&&!result?.drop&&!result?.context?.includes(entry),error=result?.drop??(missing?'通知正文未出现在宿主上下文回执中':undefined);
-    const state=result?.drop?'denied':missing?'unknown':'submitted';
+                                               
+    const state=result?.drop?(notice.source==='background_completed'?'not_submitted':'denied'):missing?'unknown':'submitted';
+    if(wake)tracker.settleWake(context,wake,state==='submitted'&&await captureContext($)===context);
     await ack($,notice,context,state,error);
-    report(state,error);
+    report(state==='not_submitted'?'cancelled':state,error);
     if(state==='submitted')remember(notice);
     return result;
   }catch(error){

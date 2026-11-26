@@ -12,7 +12,7 @@ export type ModReadOperation='status'|'monitor';
 export interface ModReadTransport {url:string;id:string;secret:string;bindingEpoch:string;write?:ModReadTransport}
 interface Capability {transport:ModReadTransport;receipt:ModReadReceipt;actor:Actor;endpointEpoch:string;inflight:Set<ModReadOperation>;prepared:Map<string,{until:number;nonce:string;operation:string}>}
 const requestSchema=z.object({operation:z.enum(['status','monitor']),nativeHealth:nativeHealthSchema.optional()}).strict();
-export const MOD_WRITE_OPERATIONS=['state','prompt','register','recovery','observe','tip-agent','tip-sync','ref-capture'] as const;
+export const MOD_WRITE_OPERATIONS=['state','prompt','register','recovery','observe','tip-agent','tip-sync','ref-capture','turn-stop-check','turn-completed'] as const;
 const writeSchema=z.object({operation:z.enum(MOD_WRITE_OPERATIONS)}).passthrough();
 const token=z.string().regex(/^[a-f0-9]{64}$/);
 const writeEnvelope=z.discriminatedUnion('phase',[z.object({phase:z.literal('prepare'),nonce:token,operation:z.enum(MOD_WRITE_OPERATIONS),bytes:z.number().int().nonnegative().max(2*1024*1024-256)}).strict(),z.object({phase:z.literal('commit'),nonce:token,ticket:token,input:writeSchema}).strict()]);
