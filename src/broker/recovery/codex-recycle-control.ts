@@ -68,6 +68,11 @@ export class CodexRecycleControl {
     catch(error){this.services.store.event('codex.recycle.profile_cleanup_pending',{peerId:incident.peerId,error:String(error)});}
   }
 
+  private hasRegistrationConflict(peerId:string):boolean{
+    const {store}=this.services;
+    return !!(store.setting('managedSessionConflict:'+peerId)||store.setting('managedRuntimeConflict:'+peerId));
+  }
+
   reconcileFinishedProfile(peerId:string):void{
     const incident=this.services.recovery.get(peerId);
     if(incident)this.finalizeProfile(incident);
@@ -79,7 +84,7 @@ export class CodexRecycleControl {
     if(!memberEnabled(store,peer))return 'member_disabled';
     if(store.pairFor(peer.id)?.id!==incident.pairId)return 'unpaired';
     if(peer.owner!=='nxbridge'||peer.sessionId!==incident.sessionId||store.bindings.current(peer.id)||store.setting('takeover:'+peer.id))return 'adopted';
-    if(store.setting('managedSessionConflict:'+peer.id)||store.setting('managedRuntimeConflict:'+peer.id))return 'foreign_holder';
+    if(this.hasRegistrationConflict(peer.id))return 'foreign_holder';
   }
 
   private notifyAuthorityLost(peer:Peer,incident:ManagedIncident,loss:AuthorityLoss):void{
@@ -100,6 +105,7 @@ export class CodexRecycleControl {
     const {store,home}=this.services,pair=store.pairFor(peer.id),endpoint=store.endpoint(peer.id);
     if(this.services.recovery.get(peer.id)?.recycle?.phase==='handback')return false;
     if(peer.host!=='codex'||peer.owner!=='nxbridge'||!peer.sessionId||!pair||!endpoint?.runtimeId||endpoint.daemon)return false;
+    if(this.hasRegistrationConflict(peer.id))return false;
     const runtime=runtimeFor(home,{id:endpoint.runtimeId})?.value;
     if(!runtime?.dedicated||runtime.kind!=='owned'||runtime.peerId!==peer.id||runtime.sessionId!==peer.sessionId||!runtime.pid||!runtime.procStart)return false;
     const wait=error as {code?:string;recycleEvidence?:string},cold=runtime.coldResumeUnconfirmed;
@@ -138,6 +144,11 @@ export class CodexRecycleControl {
   async advance(peer:Peer,acceptance?:CodexRecycleAcceptance):Promise<boolean> {
     const {store,home,codex,recovery,delivery}=this.services,pair=store.pairFor(peer.id);
     this.reconcileAuthority(peer);
+                                                
+    if(this.hasRegistrationConflict(peer.id)){
+      if(store.setting(marker(peer.id)))store.setSetting(marker(peer.id),null);
+      this.due.delete(peer.id);this.observationBackoff.delete(peer.id);return false;
+    }
     if(!pair||peer.host!=='codex'||!peer.sessionId||!codex.recycleHost)return false;
     let incident=recovery.get(peer.id);
     const candidate=store.setting<Candidate>(marker(peer.id));

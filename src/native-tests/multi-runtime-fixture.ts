@@ -16,13 +16,13 @@ import { setupPublish } from './publish-fixture.js';
 import { configClient } from '../hosts/codex/stdio-codex.js';
 import { connectAppServer } from '../hosts/codex/adapter.js';
 
-export async function multiRuntimeFixture(t:TestContext,installed=false){
+export async function multiRuntimeFixture(t:TestContext,installed=false,routeCount=2){
   const temp=temporaryDirectory(),root=temp.directory,home=path.join(root,'bridge'),codexhome=path.join(root,'codex'),claudehome=path.join(root,'claude');for(const d of [home,codexhome,claudehome])mkdirSync(d,{recursive:true});
   const requests:any[]=[],held=new Map<number,()=>void>(),holding=new Set<number>(),errors:string[]=[];
   const model=http.createServer(async(req,res)=>{try{
     const raw=await readModelBody(req);
     if(!req.url?.includes('/responses')){res.writeHead(200,{'content-type':'application/json'});res.end('{"data":[]}');return;}
-    const body=JSON.parse(raw.toString());requests.push(body);const busy=/MULTI_BUSY_(\d)/.exec(JSON.stringify(body.input)),index=busy?Number(busy[1]):-1;
+    const body=JSON.parse(raw.toString());requests.push(body);const busy=/MULTI_BUSY_(\d+)/.exec(JSON.stringify(body.input)),index=busy?Number(busy[1]):-1;
     if(holding.has(index))await new Promise<void>(r=>held.set(index,r));
     const id='multi-'+requests.length,item={type:'message',id:'msg-'+id,role:'assistant',status:'completed',content:[{type:'output_text',text:'MULTI_NATIVE_DONE'}]};res.writeHead(200,{'content-type':'text/event-stream'});
     for(const event of [{type:'response.created',response:{id,status:'in_progress',output:[]}},{type:'response.output_item.added',output_index:0,item},{type:'response.output_item.done',output_index:0,item},{type:'response.completed',response:{id,status:'completed',output:[item],usage:{input_tokens:20,output_tokens:5,total_tokens:25}}}])res.write('data: '+JSON.stringify(event)+'\n\n');res.end();
@@ -41,12 +41,14 @@ export async function multiRuntimeFixture(t:TestContext,installed=false){
     await delay(50);
   }};
   const identity=await processIdentity(process.pid),sources:any[]=[];
-  for(let i=0;i<2;i++){const cwd=path.join(root,'project-'+i);mkdirSync(cwd);sources.push(await call('register',{host:'claude',sessionId:'multi-source-'+i,cwd,name:'原生运行时搭档 '+i,kind:'root',permission:'prompting',endpoint:{mode:'embedded',address:'',epoch:'source-'+i,pid:process.pid,procStart:identity.startedAt}}));}
+  for(let i=0;i<routeCount;i++){const cwd=path.join(root,'project-'+i);mkdirSync(cwd);sources.push(await call('register',{host:'claude',sessionId:'multi-source-'+i,cwd,name:'原生运行时搭档 '+i,kind:'root',permission:'prompting',endpoint:{mode:'embedded',address:'',epoch:'source-'+i,pid:process.pid,procStart:identity.startedAt}}));}
   const actor=(p:any,id:string)=>({host:p.host,memberId:p.id,sessionId:p.sessionId,callId:id});
   await Promise.all(sources.map((p,i)=>call('send',{actor:actor(p,'initial-'+i),message:'MULTI_INITIAL_'+i})));
-  await wait(async()=>{const s=await status();if(s.peers.some((p:any)=>p.launchFailure))assert.fail('原生后台启动失败；'+JSON.stringify({status:s,logs:Object.fromEntries(readdirSync(path.join(home,'run')).filter(name=>/^codex-.*\.log$/.test(name)).map(name=>[name,readFileSync(path.join(home,'run',name),'utf8').slice(-5000)]))}));return s.pairs.length===2&&s.pairs.every((p:any)=>s.peers.some((x:any)=>x.id===p.codex&&x.sessionId&&x.state==='ready'));},'两组独立原生运行时未完成初始轮次',80000);
+  await wait(async()=>{const s=await status();if(s.peers.some((p:any)=>p.launchFailure))assert.fail('原生后台启动失败；'+JSON.stringify({status:s,logs:Object.fromEntries(readdirSync(path.join(home,'run')).filter(name=>/^codex-.*\.log$/.test(name)).map(name=>[name,readFileSync(path.join(home,'run',name),'utf8').slice(-5000)]))}));return s.pairs.length===routeCount&&s.pairs.every((p:any)=>s.peers.some((x:any)=>x.id===p.codex&&x.sessionId&&x.state==='ready'));},'独立原生运行时未完成初始轮次',80000);
   const s=await status(),pairs=sources.map(c=>s.pairs.find((p:any)=>p.claude===c.id)),targets=pairs.map(p=>s.peers.find((x:any)=>x.id===p.codex)),endpoints=targets.map(x=>s.endpoints.find((e:any)=>e.peerId===x.id&&e.active&&e.mode==='app-server'));
-  assert.notEqual(endpoints[0].address,endpoints[1].address);assert.notEqual(endpoints[0].pid,endpoints[1].pid);assert.ok(endpoints.every(e=>e.pid&&e.procStart));
+  assert.ok(endpoints.every(e=>e?.pid&&e.procStart));
+  assert.equal(new Set(endpoints.map(e=>e.address)).size,routeCount);
+  assert.equal(new Set(endpoints.map(e=>e.pid)).size,routeCount);
   const inspectors=await Promise.all(endpoints.map(endpoint=>connectAppServer(endpoint.address,config,undefined,home,{readOnly:true})));
   try{await wait(async()=>{
     const current=await status();

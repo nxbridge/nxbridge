@@ -36,8 +36,8 @@ const send=(transport:ModReadTransport,input:ReturnType<typeof request>)=>fetch(
 
 test('HTTP 禁用端口表与当前 Node Fetch 一致，核验不发出网络请求',async()=>{
   const noNetwork=new Error('只核对端口，不建立连接'),blocked:number[]=[];
-  const options:RequestInit&{dispatcher:{dispatch(options:unknown,handler:{onError(error:Error):void}):boolean}}={
-    dispatcher:{dispatch(_options,handler){handler.onError(noNetwork);return true;}}
+  const options:RequestInit&{dispatcher:{dispatch():never}}={
+    dispatcher:{dispatch(){throw noNetwork;}}
   };
   for(let port=1;port<=65535;port++){
     try{await fetch('http://127.0.0.1:'+port+'/',options);assert.fail('核验请求不能建立连接');}

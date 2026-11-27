@@ -180,9 +180,10 @@ test('旧版修复扫描检查点保留跨批调用配对，缓存被释放后�
   assert.equal(result.complete,true);assert.equal(result.receipts[0]?.messageId,'repaired');assert.equal(result.checkpoint,undefined);
 });
 
-test('持久历史仅认可同一线程内完整、唯一、有序的 receive_messages 调用与结果',async t=>{
+for(const name of ['receive_messages','mcp__claude__receive_messages','read_messages','mcp__claude__read_messages'])test('持久历史仅认可同一线程内完整、唯一、有序的 '+name+' 调用与结果',async t=>{
   const file=path.join(temporary(t),'history.jsonl'),meta={type:'session_meta',payload:{id:'thread'}},call={type:'response_item',payload:{type:'function_call',call_id:'call',name:'receive_messages',namespace:'claude',arguments:'{}'}},output={type:'response_item',payload:{type:'function_call_output',call_id:'call',output:JSON.stringify({messages:[{message_id:'message',message:'原文'}]})}};
   let sequence=0;const read=async(rows:unknown[],id='thread')=>{const filename=file+sequence++;writeFileSync(filename,rows.map(row=>JSON.stringify(row)).join('\n')+'\n','utf8');return readCodexHistory(filename,id);};
+  call.payload.name=name;
   const good=await read([meta,call,output]);assert.equal(good.status,'supported');assert.deepEqual(good.receipts.map(item=>[item.callId,item.messageId]),[['call','message']]);
   for(const rows of [[meta,call],[meta,output],[meta,output,call],[meta,call,call,output],[meta,call,output,output],[meta,{...call,payload:{...call.payload,name:'send_message'}},output],[meta,call,{...output,payload:{...output.payload,call_id:'other'}}]])assert.equal((await read(rows)).receipts.length,0);
   assert.equal((await read([meta,call,output],'other')).status,'unsupported');

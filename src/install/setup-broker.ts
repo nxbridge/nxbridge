@@ -45,14 +45,22 @@ async function waitForLegacyQuestions(home:string,reservation:StartupReservation
 
 export async function updateBroker(home:string,{buildId,files}:RuntimeManifest,broker:typeof brokerCall,backgroundPreflight?:()=>Promise<void>,progress?:(message:string)=>void):Promise<BrokerUpdate>{
   const result:BrokerUpdate={restarted:false,servingGeneration:null,handoff:{supported:null,...emptyCustodyResult()}};
+  const began=performance.now();
+  let phase='preflight';
+  const checkpoint=(next:string,details:Record<string,unknown>={})=>{
+    phase=next;
+    progress?.('协调器更新进度 '+JSON.stringify({phase,at:new Date().toISOString(),elapsedMs:Math.round(performance.now()-began),buildId,...details}));
+  };
   let reservation:StartupReservation|undefined,descriptor:CustodyDescriptor|undefined;
   let started=false;
   const read=()=>broker<Ping>('ping',{}, {home,start:false});
   const recordServing=(value:Ping)=>{result.servingGeneration=generation(value);result.windowsIndependent=value.runtime?.windowsIndependent;};
   try{
+    checkpoint('preflight',{updaterPid:process.pid});
     await backgroundPreflight?.();
     const updater=await processIdentity(process.pid);
     reservation=await reserveBrokerStartup(home,updater);
+    checkpoint('reserved',{updaterPid:updater.pid,updaterGeneration:updater.startedAt});
     const before=await read().catch(error=>{if(!absent(error))throw error;});
     let launch:CustodyDescriptor|undefined,deadline:number|undefined;
     if(before){
@@ -62,11 +70,13 @@ export async function updateBroker(home:string,{buildId,files}:RuntimeManifest,b
       if(before.handoff?.protocol===CUSTODY_PROTOCOL){
         result.handoff.supported=true;
         if(!files[CUSTODY_MANIFEST_ENTRY])throw new BridgeError('handoff_candidate_unsupported','候选版本不支持协调器交接，已保留正在服务的协调器。');
+        checkpoint('prepare',{old:result.servingGeneration});
         descriptor=parseCustodyDescriptor(await broker('broker.handoff.prepare',{protocol:CUSTODY_PROTOCOL,expected:old,updater,buildId,startupToken:reservation.token},{home,start:false,timeout:5000}));
         if(!sameGeneration(descriptor.expected,old)||!sameGeneration(descriptor.updater,updater)||descriptor.buildId!==buildId)
           throw new BridgeError('handoff_descriptor_invalid','交接凭据与本次安装不匹配。');
         const cutover=custodyDeadlines(descriptor.expiresAt);
         deadline=cutover.deadline;
+        checkpoint('seal',{old:result.servingGeneration,expiresAt:descriptor.expiresAt});
         let readiness:{phase:string;offered:number}|undefined;
         try{readiness=await custodyCall(home,descriptor,'seal',cutover.acquisitionDeadline,45000);}
         catch(error){
@@ -84,6 +94,7 @@ export async function updateBroker(home:string,{buildId,files}:RuntimeManifest,b
         }
       }else if(before.handoff===undefined&&before.runtime?.buildId&&knownPreHandoff.has(before.runtime.buildId)){
         result.handoff.supported=false;
+        checkpoint('legacy_drain',{old:result.servingGeneration});
         await waitForLegacyQuestions(home,reservation,updater,progress);
         await broker('shutdown',{releaseOwned:false,startupToken:reservation.token,expectedBroker:{pid:old.pid,generation:old.startedAt}},{home,start:false,mutation:true,timeout:60000});
         const confirmation=performance.now()+15000;
@@ -92,6 +103,7 @@ export async function updateBroker(home:string,{buildId,files}:RuntimeManifest,b
     }
     await reservation.assertCurrent();
     started=true;
+    checkpoint('wait_ready',{old:result.servingGeneration,offered:result.handoff.held,withCustody:!!launch});
     const after=await broker<Ping>('ping',{}, {home,reserved:true,custody:launch,deadline});
     recordServing(after);
     if(after.runtime?.buildId!==buildId||!after.runtime.generation||before&&after.runtime.generation===before.runtime?.generation&&after.pid===before.pid)
@@ -102,8 +114,10 @@ export async function updateBroker(home:string,{buildId,files}:RuntimeManifest,b
       result.handoff.used=after.handoff.used;result.handoff.transferred=after.handoff.transferred;
       result.handoff.held=Math.max(result.handoff.held-result.handoff.transferred,after.handoff.held);
     }
+    checkpoint('ready',{serving:result.servingGeneration,handoff:result.handoff});
   }catch(error){
     result.error=error;
+    checkpoint('failed',{failedAt:phase,code:(error as {code?:string})?.code,observed:result.servingGeneration,handoff:result.handoff});
     if(error instanceof BridgeError&&['handoff_legacy_wait','handoff_legacy_unverified'].includes(error.code))result.retryCommand='nxbridge update';
     if(descriptor&&!started){
       const {deadline}=custodyDeadlines(descriptor.expiresAt);

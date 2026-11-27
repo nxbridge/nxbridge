@@ -105,7 +105,7 @@ test('专用后台 MCP 在端点激活前登记仍使用 starting 启动证明�
   store.updatePeer(x.id,{state:'busy'});
   const joined=await managedCodexRegistration(store,home,input);assert.equal(joined?.id,x.id);assert.equal(store.peer(x.id).owner,'nxbridge');assert.equal(store.peer(x.id).state,'busy');assert.equal(store.peers().length,2);assert.equal(store.bindings.current(x.id),undefined);
   await managedCodexRegistration(store,home,{...input,state:'ready',endpoint:{...input.endpoint,mode:'app-server'}});assert.equal(store.peer(x.id).state,'ready');
-  await assert.rejects(managedCodexRegistration(store,home,{...input,sessionId:'other'}),{code:'session_conflict'});assert.equal(store.peer(x.id).sessionId,'same');
+  await assert.rejects(managedCodexRegistration(store,home,{...input,sessionId:'other'}),{code:'managed_proof_unverified'});assert.equal(store.peer(x.id).sessionId,'same');assert.equal(hostingGate(store,store.peer(x.id)),false);
 });
 
 test('托管参数拒绝歧义，版本比较处理正式版和预发布数字',()=>{

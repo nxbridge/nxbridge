@@ -81,7 +81,15 @@ export class BrokerHealthCoordinator {
     return value;
   });}
 
-  incidentNotes(ids:string[],viewerId?:string){return[...this.incidentViews(ids).filter(value=>value.state!=='recovering').map(value=>({incidentId:value.id,text:value.code==='claude_inbox_missing'?missingClaudeInboxModelText(this.environment.store.peer(value.peerId),value.peerId===viewerId):value.code==='codex_socket_target_missing'?missingCodexSocketModelText(this.environment.store.peer(value.peerId),value.peerId===viewerId):`Delivery unconfirmed since ${new Date(value.since).toISOString().slice(11,16)} UTC (${value.attempts} attempts, ${value.code}); messages kept, ${value.state==='blocked'?'same request held; inspect status action':'auto-retrying'}; do not resend.`})),...ids.flatMap(id=>{const pair=this.environment.store.pairFor(id);return pair?this.services.deliveryHealth.notes(pair.id,id):[];})].slice(0,3);}
+  incidentNotes(ids:string[],viewerId?:string){
+    const notes:{incidentId?:string;text:string}[]=this.incidentViews(ids).filter(value=>value.state!=='recovering').map(value=>({incidentId:value.id,text:value.code==='claude_inbox_missing'?missingClaudeInboxModelText(this.environment.store.peer(value.peerId),value.peerId===viewerId):value.code==='codex_socket_target_missing'?missingCodexSocketModelText(this.environment.store.peer(value.peerId),value.peerId===viewerId):`Delivery unconfirmed since ${new Date(value.since).toISOString().slice(11,16)} UTC (${value.attempts} attempts, ${value.code}); messages kept, ${value.state==='blocked'?'same request held; inspect status action':'auto-retrying'}; do not resend.`})).slice(0,3);
+    for(const id of ids){
+      if(notes.length===3)break;
+      const pair=this.environment.store.pairFor(id);
+      if(pair)notes.push(...this.services.deliveryHealth.notes(pair.id,id,viewerId,3-notes.length));
+    }
+    return notes;
+  }
 
   deliveryGuidance(peer:Peer,pending?:number){
     const {store}=this.environment;

@@ -57,6 +57,18 @@ test('遗留外来根线程的元数据已不可读时，仍按原生卸载证�
   await lifecycle(broker).observeManagedExits();assert.equal(f.store.setting(key),null);assert.equal(hostingGate(f.store,f.x),false);assert.equal(codex.ensured,0);
 });
 
+for(const failed of [false,true])test('遗留子代理父链'+(failed?'读取失败时保留复核记录':'未闭合时不再阻塞原根'),async t=>{
+  const f=await setup(t);t.after(()=>f.store.close());const key='managedRuntimeConflict:'+f.x.id,conflict={runtimeId:f.runtime.id,sessionId:'child',at:1};
+  f.store.setSetting(key,conflict);
+  await reconcileManagedCodexConflict(f.store,f.home,f.x,async(_runtime,id)=>{
+    if(id==='child')return{id,parentThreadId:'missing-parent'};
+    if(failed)throw Error('原生父节点暂时不可读');
+    return;
+  });
+  assert.equal(hostingGate(f.store,f.x),failed);assert.deepEqual(f.store.setting(key),failed?conflict:null);
+  assert.equal(f.store.find('codex','child'),undefined);
+});
+
 test('深层子代理沿原生父链核验，登记声明不能伪装另一根线程',async t=>{
   const f=await setup(t);t.after(()=>f.store.close());
   const read=async(_runtime:ManagedRuntime,id:string)=>({id,source:id==='foreign'?'cli':{subAgent:{thread_spawn:{parent_thread_id:id==='child'?'parent':'root'}}}});
@@ -131,20 +143,56 @@ test('已加载后台核验抛错时，巡检和显式接手均保留暂存并�
   assert.equal(await transfers.reconcileOwned(f.x),false);assert.equal((await transfers.adopt(f.x) as any).status,'held');assert.equal(hostingGate(f.store,f.x),true);assert.equal(hostingRecord(f.store,f.x)?.attempts,1);
 });
 
-for(const unavailable of ['抛错','缺失','身份不符'] as const)test('外来线程核验'+unavailable+'时先保存冲突，未登记成主窗口',async t=>{
+for(const unavailable of ['抛错','缺失','身份不符','无读取能力'] as const)test('其他线程核验'+unavailable+'时拒绝登记，不阻塞已核验的根会话',async t=>{
   const f=await setup(t);t.after(()=>f.store.close());
   const read=async()=>{if(unavailable==='抛错')throw Error('读取超时');return unavailable==='身份不符'?{id:'other'}:undefined;};
-  await assert.rejects(managedCodexRegistration(f.store,f.home,f.input('foreign','subagent','root'),read),{code:'managed_proof_unverified'});
-  assert.equal(hostingGate(f.store,f.x),true);assert.equal(f.store.setting<any>('managedRuntimeConflict:'+f.x.id).sessionId,'foreign');assert.equal(f.store.find('codex','foreign'),undefined);
+  await assert.rejects(managedCodexRegistration(f.store,f.home,f.input('foreign','subagent','root'),unavailable==='无读取能力'?undefined:read),{code:'managed_proof_unverified'});
+  assert.equal(hostingGate(f.store,f.x),false);assert.equal(f.store.setting('managedRuntimeConflict:'+f.x.id),undefined);assert.equal(f.store.find('codex','foreign'),undefined);
+  assert.equal(f.store.peer(f.x.id).sessionId,'root');assert.equal(f.store.peer(f.x.id).state,'busy');
 });
 
-for(const mode of ['starting','legacy'] as const)test(mode+' 后台无法原生核验时不信任 MCP 子代理声明，保留冲突',async t=>{
+for(const mode of ['starting','legacy'] as const)test(mode+' 后台无法原生核验时不信任 MCP 子代理声明，也不改变根会话门禁',async t=>{
   const f=await setup(t);t.after(()=>f.store.close());
   if(mode==='starting')saveManagedRuntime(f.home,{...f.runtime,state:'starting'});
   else{removeManagedRuntime(runtimeFor(f.home,{id:f.runtime.id})!);writeFileSync(path.join(f.home,'run','codex-runtime.json'),JSON.stringify(f.runtime),'utf8');}
   const adapter=new CodexAdapter(DEFAULT_CONFIG,f.home);t.after(()=>adapter.close());
   await assert.rejects(managedCodexRegistration(f.store,f.home,f.input('child','subagent','root'),(runtime,id)=>adapter.inspectThread(runtime,id)),{code:'managed_proof_unverified'});
-  assert.equal(hostingGate(f.store,f.x),true);assert.equal(f.store.find('codex','child'),undefined);assert.equal(f.store.peer(f.x.id).sessionId,'root');
+  assert.equal(hostingGate(f.store,f.x),false);assert.equal(f.store.find('codex','child'),undefined);assert.equal(f.store.peer(f.x.id).sessionId,'root');
+});
+
+for(const incomplete of ['缺失父线程','父线程身份不符','父链成环','超过深度预算'] as const)test('原生子代理'+incomplete+'只使当前登记待核验，不证明是外来根',async t=>{
+  const f=await setup(t);t.after(()=>f.store.close());let reads=0;
+  const read=async(_runtime:ManagedRuntime,id:string)=>{
+    reads++;
+    if(id==='child')return{id,parentThreadId:'parent'};
+    if(incomplete==='缺失父线程')return;
+    if(incomplete==='父线程身份不符')return{id:'other',source:'cli'};
+    return{id,parentThreadId:incomplete==='父链成环'?'child':id+'-next'};
+  };
+  await assert.rejects(managedCodexRegistration(f.store,f.home,f.input('child'),read),{code:'managed_proof_unverified'});
+  assert.equal(hostingGate(f.store,f.x),false);assert.equal(f.store.find('codex','child'),undefined);assert.ok(reads<=33);
+});
+
+test('已证明属于另一个根的深层子代理仍阻塞原根，不能信任登记中的父声明',async t=>{
+  const f=await setup(t);t.after(()=>f.store.close());
+  const read=async(_runtime:ManagedRuntime,id:string)=>id==='child'?{id,parentThreadId:'foreign-root'}:{id,source:'cli'};
+  await assert.rejects(managedCodexRegistration(f.store,f.home,f.input('child','subagent','root'),read),{code:'session_conflict'});
+  assert.equal(hostingGate(f.store,f.x),true);assert.equal(f.store.find('codex','child'),undefined);
+});
+
+test('子代理元数据超时后根会话仍可领取原消息一次，重试登记后保留同一根和消息状态',async t=>{
+  let broker:Broker|undefined;t.after(async()=>{if(broker)await broker.stop();});const f=await setup(t);t.after(()=>f.store.close());
+  let unavailable=true;const codex=new FakeAdapter();
+  Object.assign(codex,{inspectThread:async(_runtime:ManagedRuntime,id:string)=>{if(unavailable)throw Error('大历史目录暂不可读');return{id,parentThreadId:'root'};}});
+  broker=new Broker(f.store,DEFAULT_CONFIG,{codex,claude:new FakeAdapter()} as unknown as Adapters,f.home);
+  const pending=f.store.accept(f.pair,f.c,'目录取证不应阻塞根消息','lineage-timeout');
+  await assert.rejects(broker.dispatch('mcp.register',f.input('child')),{code:'managed_proof_unverified'});
+  const actor={host:'codex' as const,memberId:f.x.id,sessionId:'root',callId:'root-read'};
+  assert.deepEqual((broker.receive(actor) as any).messages.map((row:any)=>row.message_id),[pending.id]);
+  unavailable=false;const child=await broker.dispatch('mcp.register',f.input('child')) as any;
+  assert.equal(child.rootPeerId,f.x.id);assert.equal(hostingGate(f.store,f.x),false);
+  assert.deepEqual((broker.receive({...actor,callId:'after-registration'}) as any).messages,[]);assert.equal(f.store.message(pending.id).attempts,1);
+  assert.equal(f.store.peer(f.x.id).state,'busy');assert.equal(codex.ensured,0);assert.equal(codex.woken.length,0);
 });
 
 test('核验期间新代次取代旧代次，失败的旧登记不会污染新运行时',async t=>{
@@ -181,6 +229,7 @@ test('无订阅时仅核查子代理父链，不向托管根线程发送串行�
   const runtime={...f.runtime,endpoint:`ws://127.0.0.1:${(server.address() as {port:number}).port}`,authenticatedLoopback:true};saveManagedRuntime(f.home,runtime);createRuntimeToken(f.home,runtime);
   let rootState='active';server.on('connection',socket=>socket.on('message',raw=>{const request=JSON.parse(raw.toString());if(request.id===undefined)return;
     assert.ok(['initialize','thread/list'].includes(request.method),'不能读取无订阅的线程控制队列');calls.push(request.method);
+    if(request.method==='thread/list')assert.equal(request.params.useStateDbOnly,true,'父链取证不能触发大历史的 JSONL 修补');
     socket.send(JSON.stringify({id:request.id,result:request.method==='initialize'?codexInitializeResult:{data:[{id:'child',cwd:f.home,status:{type:rootState},source:{subAgent:{spawn:{parentThreadId:'root'}}}}]}}));
   }));
   await adapter.inspectThread(runtime,'child');await adapter.inspectThread(runtime,'child');assert.equal(calls.filter(call=>call==='thread/list').length,1);
@@ -188,6 +237,26 @@ test('无订阅时仅核查子代理父链，不向托管根线程发送串行�
   assert.equal(await adapter.inspectThread(runtime,'root'),undefined);assert.equal(calls.filter(call=>call==='thread/list').length,1);
   const changed={...runtime,configHome:path.join(f.home,'other')};saveManagedRuntime(f.home,changed);await adapter.inspectThread(changed,'child');assert.equal(calls.filter(call=>call==='thread/list').length,2);
   const restarted={...changed,procStart:'new-generation'};saveManagedRuntime(f.home,restarted);await assert.rejects(adapter.inspectThread(restarted,'child'),{code:'runtime_endpoint_unverified'});assert.equal(calls.filter(call=>call==='thread/list').length,2);
+});
+
+for(const mode of ['加载巡检','原生状态发现','子代理观察'] as const)test(mode+' 在根订阅丢失时只用独立状态库目录核验子代理',async t=>{
+  const f=await setup(t);t.after(()=>f.store.close());const server=new WebSocketServer({host:'127.0.0.1',port:0}),adapter=new CodexAdapter(DEFAULT_CONFIG,f.home);
+  adapter.bindOwnedRoutes(()=>undefined,id=>f.store.getPeer(id)?.sessionId??undefined);
+  t.after(async()=>{adapter.close();for(const socket of server.clients)socket.terminate();await new Promise<void>(resolve=>server.close(()=>resolve()));});await once(server,'listening');
+  const runtime={...f.runtime,endpoint:'ws://127.0.0.1:'+(server.address() as {port:number}).port,authenticatedLoopback:true};saveManagedRuntime(f.home,runtime);createRuntimeToken(f.home,runtime);
+  let catalogs=0;const registered:RegisterInput[]=[];adapter.on('register',input=>registered.push(input));
+  server.on('connection',socket=>socket.on('message',raw=>{
+    const request=JSON.parse(raw.toString());if(request.id===undefined)return;
+    assert.ok(['initialize','config/read','thread/loaded/list','thread/list'].includes(request.method),'不能进入根线程的串行读取队列：'+request.method);
+    if(request.method==='thread/list'){assert.equal(request.params.useStateDbOnly,true);catalogs++;}
+    const result=request.method==='initialize'?codexInitializeResult:request.method==='config/read'?{config:{}}:request.method==='thread/loaded/list'?{data:['root','child']}:{data:[{id:'child',cwd:f.home,status:{type:'active'},parentThreadId:'root'}]};
+    socket.send(JSON.stringify({id:request.id,result}));
+  }));
+  const rpc=await(adapter as any).connect(runtime.endpoint);
+  if(mode==='加载巡检')await adapter.discoverLoaded(runtime.endpoint,rpc);
+  else if(mode==='原生状态发现')await(adapter as any).discoverThread(runtime.endpoint,'child',rpc);
+  else await adapter.observe({...f.x,id:'child-peer',kind:'subagent',sessionId:'child'},{...f.store.endpoint(f.x.id)!,address:runtime.endpoint});
+  assert.ok(catalogs>0);assert.ok(registered.some(row=>row.sessionId==='child'&&row.kind==='subagent'&&row.parentId==='root'));
 });
 
 test('旧冲突卸载核验等待期间新增外来根线程，不会清除新冲突',async t=>{
@@ -204,7 +273,7 @@ test('旧冲突卸载核验等待期间新增外来根线程，不会清除新�
 test('子代理瞬时核验失败不覆盖外来根冲突，已核验子代理只解除自身记录',async t=>{
   const f=await setup(t);t.after(()=>f.store.close());const key='managedRuntimeConflict:'+f.x.id;addManagedConflict(f.store,f.x.id,f.runtime.id,'foreign');
   await assert.rejects(managedCodexRegistration(f.store,f.home,f.input('child'),async()=>{throw Error('读取超时');}),{code:'managed_proof_unverified'});
-  assert.equal(f.store.setting<any>(key).sessionId,'foreign');assert.equal(f.store.setting<any>(key).pending[0].sessionId,'child');
+  assert.equal(f.store.setting<any>(key).sessionId,'foreign');assert.equal(f.store.setting<any>(key).pending,undefined);
   await managedCodexRegistration(f.store,f.home,f.input('child'),async()=>({id:'child',parentThreadId:'root'}));assert.equal(f.store.setting<any>(key).sessionId,'foreign');assert.equal(f.store.setting<any>(key).pending,undefined);assert.equal(hostingGate(f.store,f.x),true);
 });
 

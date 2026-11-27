@@ -17,14 +17,15 @@ export type ManagedThreadLookup=(runtime:ManagedRuntime,sessionId:string)=>Promi
 function sameRuntime(a:ManagedRuntime,b:ManagedRuntime|undefined):boolean{
   return !!b&&a.id===b.id&&a.kind===b.kind&&a.peerId===b.peerId&&a.endpoint===b.endpoint&&a.pid===b.pid&&a.procStart===b.procStart&&a.configHome===b.configHome&&a.sessionId===b.sessionId&&a.state===b.state;
 }
-                                         
-async function nativeDescendant(peer:Peer,runtime:ManagedRuntime,thread:ThreadIdentity,read:ManagedThreadLookup):Promise<boolean>{
+                                        
+async function nativeRelation(peer:Peer,runtime:ManagedRuntime,thread:ThreadIdentity,read:ManagedThreadLookup):Promise<'descendant'|'foreign'|'unverified'>{
   const seen=new Set<string>([thread.id]);let current=thread;
-  for(let depth=0;depth<32&&codexSubagent(current);depth++){
-    const parent=codexParent(current);if(!parent||seen.has(parent))return false;if(parent===peer.sessionId)return true;
-    seen.add(parent);const next=await read(runtime,parent);if(next?.id!==parent)return false;current=next;
+  for(let depth=0;depth<32;depth++){
+    if(!codexSubagent(current))return 'foreign';
+    const parent=codexParent(current);if(!parent||seen.has(parent))return 'unverified';if(parent===peer.sessionId)return 'descendant';
+    seen.add(parent);const next=await read(runtime,parent);if(next?.id!==parent)return 'unverified';current=next;
   }
-  return false;
+  return 'unverified';
 }
 export function managedDescendant(store:Store,peer:Peer,input:{kind?:string;parentId?:string}):boolean{
   let parent=input.parentId;const seen=new Set<string>();
@@ -48,11 +49,19 @@ export async function reconcileManagedCodexConflict(store:Store,home:string,peer
   }
   if(JSON.stringify(store.setting(key))!==JSON.stringify(conflict))return;
   const runtime=runtimeFor(home,{peerId:peer.id,id:conflict.runtimeId})?.value;if(!runtime)return;
-  const pairId=store.pairFor(peer.id)?.id;let thread:ThreadIdentity|undefined,clear:boolean;
-  try{thread=await read(runtime,conflict.sessionId);if(thread?.id!==conflict.sessionId)return;clear=thread.status?.type==='notLoaded'||codexSubagent(thread)&&!codexParent(thread)||await nativeDescendant(peer,runtime,thread,read);}
+  const pairId=store.pairFor(peer.id)?.id;let thread:ThreadIdentity|undefined,reason:'unloaded'|'native_descendant'|'legacy_unverified';
+  try{
+    thread=await read(runtime,conflict.sessionId);if(thread?.id!==conflict.sessionId)return;
+    if(thread.status?.type==='notLoaded')reason='unloaded';
+    else{
+      const relation=codexSubagent(thread)&&!codexParent(thread)?'descendant':await nativeRelation(peer,runtime,thread,read);
+      if(relation==='foreign')return;
+      reason=relation==='descendant'?'native_descendant':'legacy_unverified';
+    }
+  }
   catch{return;}                                
-  if(!clear||JSON.stringify(store.setting(key))!==JSON.stringify(conflict)||store.peer(peer.id).sessionId!==peer.sessionId||store.pairFor(peer.id)?.id!==pairId||!sameRuntime(runtime,runtimeFor(home,{peerId:peer.id,id:runtime.id})?.value))return;
-  clearManagedConflict(store,peer.id,runtime.id,thread.id,conflict);store.event('hosting.conflict.cleared',{peerId:peer.id,runtimeId:runtime.id,sessionId:thread.id,reason:thread.status?.type==='notLoaded'?'unloaded':'native_descendant'});
+  if(JSON.stringify(store.setting(key))!==JSON.stringify(conflict)||store.peer(peer.id).sessionId!==peer.sessionId||store.pairFor(peer.id)?.id!==pairId||!sameRuntime(runtime,runtimeFor(home,{peerId:peer.id,id:runtime.id})?.value))return;
+  if(clearManagedConflict(store,peer.id,runtime.id,thread.id,conflict))store.event('hosting.conflict.cleared',{peerId:peer.id,runtimeId:runtime.id,sessionId:thread.id,reason});
 }
 
                                                         
@@ -72,10 +81,17 @@ export async function managedCodexRegistration(store:Store,home:string,input:Reg
   if(!runtime.peerId)return;
   const peer=store.peer(runtime.peerId),record=hostingRecord(store,peer);
   if(peer.sessionId&&peer.sessionId!==input.sessionId){
-    const pairId=store.pairFor(peer.id)?.id;let thread:ThreadIdentity|undefined,child=false,unlinked=false,unverified=false;
-    try{thread=read?await read(runtime,input.sessionId):undefined;unverified=!!read&&thread?.id!==input.sessionId;unlinked=!!thread&&codexSubagent(thread)&&!codexParent(thread);child=unlinked||!!thread&&!!read&&await nativeDescendant(peer,runtime,thread,read);}catch{unverified=true;}
+    const pairId=store.pairFor(peer.id)?.id;let thread:ThreadIdentity|undefined,child=false,unlinked=false,unverified=true;
+    try{
+      thread=read?await read(runtime,input.sessionId):undefined;
+      if(thread?.id===input.sessionId&&read){
+        unlinked=codexSubagent(thread)&&!codexParent(thread);
+        const relation=unlinked?'descendant':await nativeRelation(peer,runtime,thread,read);
+        child=relation==='descendant';unverified=relation==='unverified';
+      }
+    }catch{unverified=true;}
     if(store.peer(peer.id).sessionId!==peer.sessionId||store.pairFor(peer.id)?.id!==pairId||!sameRuntime(runtime,runtimeFor(home,{id:runtime.id})?.value))throw new BridgeError('managed_proof_unverified','线程核验期间原会话或运行时代次已改变。');
-    if(unverified){addManagedConflict(store,peer.id,runtime.id,input.sessionId);throw new BridgeError('managed_proof_unverified','自有运行时尚未核验登记线程的原生身份，消息暂存等待只读复核。');}
+    if(unverified)throw new BridgeError('managed_proof_unverified','自有运行时暂时无法核验这个线程，未登记或改变原根会话；稍后重试。');
     if(child){
       input.kind='subagent';input.parentId=codexParent(thread!);const registered=store.register(input);store.updatePeer(registered.id,{parentId:input.parentId??null,rootPeerId:unlinked?undefined:peer.id});
       clearManagedConflict(store,peer.id,runtime.id,input.sessionId);

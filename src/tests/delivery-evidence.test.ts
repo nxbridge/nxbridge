@@ -13,13 +13,32 @@ import { FakeAdapter } from './support/fake-adapter.js';
 import { fixture } from './support/broker-fixture.js';
 import { temporary } from './support/temporary.js';
 
-const item=(messageId:string,id='native-output')=>({type:'functionCallOutput',id,namespace:'claude',name:'receive_messages',output:JSON.stringify({messages:[{message_id:messageId,message:'正文'}]})});
+const item=(messageId:string,id='native-output',name='receive_messages')=>({type:'functionCallOutput',id,namespace:'claude',name,output:JSON.stringify({messages:[{message_id:messageId,message:'正文'}]})});
 
-test('上下文证据只解析原生取件输出中的精确 ID，不匹配正文、错误命名空间或坏 JSON',()=>{
-  const valid=item('actual');valid.output=JSON.stringify({messages:[{message_id:'actual',message:'正文引用 quoted-id'},null,{message_id:'actual'},{message_id:12}]});
+for(const name of ['receive_messages','read_messages'])test(name+' 上下文证据只解析原生输出中的精确 ID，不匹配正文、错误命名空间或坏 JSON',()=>{
+  const valid=item('actual','native-output',name);valid.output=JSON.stringify({messages:[{message_id:'actual',message:'正文引用 quoted-id'},null,{message_id:'actual'},{message_id:12}]});
   assert.deepEqual(codexContextReceipts(valid,'turn'),[{messageId:'actual',turnId:'turn',itemId:'native-output'}]);
   for(const value of [null,{...valid,type:'agentMessage'},{...valid,namespace:'other'},{...valid,name:'send_message'},{...valid,id:''},{...valid,output:'坏 JSON'},{...valid,output:JSON.stringify({message_id:'quoted-id'})}])assert.deepEqual(codexContextReceipts(value,'turn'),[]);
   assert.deepEqual(codexContextReceipts(valid,undefined),[]);
+});
+
+for(const type of ['functionCallOutput','mcpToolCall'])test(type+' 的历史重读先保持只读，收到原生输出后只结清本收件人的未知消息',async t=>{
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),incoming=f.store.accept(pair,f.c,'本窗口的未知消息','read-incoming'),outgoing=f.store.accept(pair,f.x,'另一方向','read-outgoing');
+  for(const message of [incoming,outgoing]){f.store.claim(message.id);f.store.transition(message.id,'unknown');}
+  const response=await f.broker.dispatch('messages.read',{actor:{host:'codex',sessionId:'x',callId:'read-history'},message_ids:[incoming.id,outgoing.id]});
+  assert.equal(f.store.message(incoming.id).state,'unknown','仅构造服务端返回不证明输出已进入原生上下文');
+  const output=type==='functionCallOutput'?{...item(incoming.id,'read-output','read_messages'),output:JSON.stringify(response)}:
+    {type,id:'read-output',server:'claude',tool:'read_messages',status:'completed',result:{content:[{type:'text',text:JSON.stringify(response)}]}};
+  for(const receipt of codexContextReceipts(output,'read-turn'))f.codex.emit('contextObserved',{...receipt,sessionId:'x',address:'unix://test-server'});
+  assert.equal(f.store.message(incoming.id).state,'contextObserved');assert.equal(f.store.message(outgoing.id).state,'unknown');
+  assert.equal(f.store.message(incoming.id).attempts,1);assert.equal(f.codex.delivered.length,0);
+});
+
+for(const tool of ['read_messages','claude.read_messages','mcp__claude__read_messages','mcp__plugin_nxbridge_codex__read_messages','mcp__plugin_nxbridge_claude__read_messages','legacy__receive_messages','mcp__other__read_messages','functions.read_messages'])test('原生 PostToolUse 重读回执识别本插件及兼容取件名称：'+tool,async t=>{
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),message=f.store.accept(pair,f.c,'原投递结果未知','hook-read');f.store.claim(message.id);f.store.transition(message.id,'unknown');
+  await f.broker.dispatch('hook',{actor:{host:'codex',sessionId:'x',callId:'hook-read'},session_id:'x',hook_event_name:'PostToolUse',tool_name:tool,tool_response:{messages:[{message_id:message.id,message:'原投递结果未知'}]}});
+  const foreign=tool==='mcp__other__read_messages'||tool==='functions.read_messages';
+  assert.equal(f.store.message(message.id).state,foreign?'unknown':'contextObserved');assert.equal(f.store.message(message.id).attempts,1);
 });
 
 test('真实 RPC 的原生输出回执先于 ACK 或断连错误，也不会降回 queued/unknown 或重发',async t=>{

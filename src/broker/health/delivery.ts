@@ -175,7 +175,7 @@ export class DeliveryHealth {
   eligible(pairId:string,recipient:string,id:string):boolean{const notice=this.get(pairId,recipient,id);return !!notice&&this.policy.eligible(recipient,notice);}
   private combined(notices:RuntimeNotice[],recipient:string):RuntimeNotice{
     const interventionIds=notices.flatMap(notice=>notice.interventionIds??(notice.interventionId?[notice.interventionId]:[]));
-    return{...notices[0]!,tier:Math.max(...notices.map(noticeTier)) as 3|4,wake:notices.some(n=>this.policy.canWake(recipient,n)),...(notices.some(n=>n.readyOnly)?{readyOnly:true}:{}),message:notices.map(n=>n.message).join('\n'),componentIds:notices.map(n=>n.id),...(interventionIds.length?{interventionIds:[...new Set(interventionIds)]}:{})};
+    return{...notices[0]!,tier:Math.max(...notices.map(noticeTier)) as 3|4,wake:notices.some(n=>this.policy.canWake(recipient,n)),...(notices.some(n=>n.readyOnly)?{readyOnly:true}:{}),message:[...new Set(notices.map(n=>n.message))].join('\n'),componentIds:notices.map(n=>n.id),...(interventionIds.length?{interventionIds:[...new Set(interventionIds)]}:{})};
   }
   due(pairId:string,senderId:string):boolean{return this.pending(this.storage.setting<DeliveryIncident>(deliveryHealthKey(pairId,senderId)),senderId,false).length>0;}
   prepare(pairId:string,senderId:string,id:string,scope?:string,onlyRuntime=false,requireWake=false,readyBoundary=false):RuntimeNotice|undefined{
@@ -213,6 +213,17 @@ export class DeliveryHealth {
     });
   }
   active(pairId:string,senderId:string):boolean{return this.storage.setting<DeliveryIncident>(deliveryHealthKey(pairId,senderId))?.active===true;}
-  notes(pairId:string,recipient:string):{text:string}[]{return(this.storage.setting<DeliveryIncident>(deliveryHealthKey(pairId,recipient))?.notices??[]).filter(notice=>noticeTier(notice)===2&&notice.state!=='denied').slice(-3).map(notice=>({text:notice.message}));}
+  notes(pairId:string,recipient:string,viewerId?:string,limit=3):{text:string}[]{
+    const select=(value:DeliveryIncident|undefined)=>(value?.notices??[]).filter(notice=>noticeTier(notice)===2&&notice.state!=='denied'&&(!viewerId||!notice.reportedTo?.includes(viewerId))).slice(-limit);
+    const key=deliveryHealthKey(pairId,recipient);
+    if(!viewerId)return select(this.storage.setting<DeliveryIncident>(key)).map(notice=>({text:notice.message}));
+    return this.storage.transaction(()=>{
+      const value=this.storage.setting<DeliveryIncident>(key),notices=select(value);
+                                              
+      for(const notice of notices)notice.reportedTo=[...notice.reportedTo??[],viewerId];
+      if(notices.length)this.storage.setSetting(key,value);
+      return notices.map(notice=>({text:notice.message}));
+    });
+  }
   hasPending(pairId:string,senderId:string):boolean{return this.storage.setting<DeliveryIncident>(deliveryHealthKey(pairId,senderId))?.notices.some(n=>n.state==='pending'||n.state==='sending')===true;}
 }

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {DeliveryHealth} from '../broker/health/delivery.js';
-import {deliveryHealthKey,emptyDeliveryCounts} from '../broker/health/contracts.js';
+import {deliveryHealthKey,emptyDeliveryCounts,runtimeNoticeText} from '../broker/health/contracts.js';
 import { fixture } from './support/broker-fixture.js';
 
 test('不同健康来源合并一次提交，共用持久的接收方一分钟闸门',t=>{
@@ -16,6 +16,55 @@ test('不同健康来源合并一次提交，共用持久的接收方一分钟�
   t.mock.timers.tick(59999);assert.deepEqual(restarted.take(pair.id,f.c.id),[]);assert.equal(restarted.prepare(pair.id,f.c.id,'other'),undefined);
   restarted.enqueue(pair.id,f.x.id,{id:'independent',message:'另一接收方',state:'pending'});assert.ok(restarted.prepare(pair.id,f.x.id,'independent'));
   t.mock.timers.tick(1);assert.ok(restarted.prepare(pair.id,f.c.id,'other'));assert.equal(f.store.messages().length,0);
+});
+
+test('历史恢复积压在同一上下文中只输出一份相同正文，所有分量仍逐一结清',t=>{
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),health=f.broker.deliveryHealth,body='同一归属变化的完整通知',ids:string[]=[];
+  for(let index=0;index<200;index++){
+    const id='legacy-authority-'+index;ids.push(id);
+    health.enqueue(pair.id,f.c.id,{id,source:'managed_recovery',kind:'codex_recycle_authority_lost:'+f.x.id,scope:'same-context',
+      incidentId:'old-incident-'+index,factKey:'old-incident-'+index,consumesNoticeCredit:false,tier:index===199?4:3,wake:index===199,message:body,state:'pending'});
+  }
+  ids.push('different');
+  health.enqueue(pair.id,f.c.id,{id:'different',kind:'different',scope:'same-context',tier:3,message:body+' ',state:'pending'});
+  const preview=health.peek(pair.id,f.c.id);assert.equal(preview.length,1);
+  assert.equal(preview[0]!.message,body+'\n'+body+' ');assert.deepEqual(preview[0]!.componentIds,ids);
+  const prepared=new DeliveryHealth(f.store).prepare(pair.id,f.c.id,ids[0]!,'same-context')!;
+  assert.equal(runtimeNoticeText(prepared).split('\n').slice(1).join('\n'),body+'\n'+body+' ');
+  assert.deepEqual(prepared.componentIds,ids);assert.equal(prepared.tier,4);assert.equal(prepared.wake,true);
+  health.outcome(pair.id,f.c.id,prepared.id,'submitted');
+  const recorded=f.store.setting<{notices:{id:string;admitted?:boolean;state:string}[]}>(deliveryHealthKey(pair.id,f.c.id))!.notices;
+  assert.deepEqual(recorded.map(n=>n.id),ids);assert.ok(recorded.every(n=>n.admitted&&n.state==='submitted'));
+  assert.deepEqual(new DeliveryHealth(f.store).take(pair.id,f.c.id),[]);
+});
+
+test('重启信息按事实和查看者只报告一次，重建协调器和重复发送不重复提示',t=>{
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),health=f.broker.deliveryHealth;
+  const facts=(prefix:string)=>Array.from({length:3},(_,index)=>{
+    const message=f.store.accept(pair,f.x,'仍需核对的原消息',prefix+index);f.store.claim(message.id);f.store.transition(message.id,'unknown');
+    return{id:message.id,state:'unknown'};
+  });
+  const first=facts('first-'),counts={...emptyDeliveryCounts(),unknown:3},messages=f.store.messages(),clock=f.store.setting('healthNoticeAdmission:'+f.c.id);
+  health.restarted(pair,f.x,counts,first,0);
+  const shown=health.notes(pair.id,f.x.id,f.c.id);assert.equal(shown.length,1);
+  assert.match(shown[0]!.text,/unknown=3/);
+  assert.deepEqual(new DeliveryHealth(f.store).notes(pair.id,f.x.id,f.c.id),[]);
+  assert.equal(health.notes(pair.id,f.x.id,f.x.id).length,1,'向搭档报告不代替原查看者消费');
+  health.restarted(pair,f.x,counts,first,0);
+  assert.deepEqual(health.notes(pair.id,f.x.id,f.c.id),[]);
+  assert.equal(health.notes(pair.id,f.x.id).length,1,'显式全局诊断仍能查看历史事实');
+  assert.deepEqual(f.store.messages(),messages);assert.deepEqual(f.store.setting('healthNoticeAdmission:'+f.c.id),clock);
+  const next=facts('next-');health.restarted(pair,f.x,counts,next,0);
+  assert.equal(health.notes(pair.id,f.x.id,f.c.id).length,1,'数量相同的新消息仍是新事实');
+  assert.deepEqual(health.notes(pair.id,f.x.id,f.c.id),[]);
+});
+
+test('提示输出限额只消费本次实际返回的分量',t=>{
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),health=f.broker.deliveryHealth;
+  for(const id of ['old','new'])health.enqueue(pair.id,f.x.id,{id,kind:'bridge_restart',tier:2,message:id,state:'pending'});
+  assert.deepEqual(health.notes(pair.id,f.x.id,f.c.id,1),[{text:'new'}]);
+  assert.deepEqual(health.notes(pair.id,f.x.id,f.c.id,1),[{text:'old'}]);
+  assert.deepEqual(health.notes(pair.id,f.x.id,f.c.id,1),[]);
 });
 
 test('同类反复故障十分钟内保持待定，真实恶化也不能越过一分钟硬闸门',t=>{

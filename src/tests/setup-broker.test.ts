@@ -34,18 +34,23 @@ test('已知旧版有旧问题时延后更新，未知版不会停止或尝试�
 });
 
 test('已知旧版按原到期时间等待活动问题，完成后立即接班',async t=>{
-  const home=temporary(t),db=oldQuestions(home,Date.now()+2500),steps:string[]=[];
+  const home=temporary(t),db=oldQuestions(home,Date.now()+2500),steps:string[]=[],checkpoints:any[]=[];
   const broker=(async(method,_params,options)=>{
     steps.push(method);
     if(method==='shutdown')return{stopping:true};
     return options?.start===false?old:{pid:process.pid,runtime:{generation:'next',buildId:candidate.buildId},handoff:{protocol:CUSTODY_PROTOCOL,used:false,transferred:0,held:0}};
   }) as typeof brokerCall;
   try{
-    const result=await updateBroker(home,candidate,broker,undefined,()=>{
+    const result=await updateBroker(home,candidate,broker,undefined,message=>{
+      const prefix='协调器更新进度 ';
+      if(message.startsWith(prefix)){checkpoints.push(JSON.parse(message.slice(prefix.length)));return;}
       steps.push('progress');assert.deepEqual(steps,['ping','progress']);
       setTimeout(()=>db.prepare("UPDATE questions SET status='answered' WHERE status='awaiting_user'").run(),50);
     });
     assert.equal(result.restarted,true);assert.deepEqual(steps,['ping','progress','shutdown','ping']);
+    assert.deepEqual(checkpoints.map(value=>value.phase),['preflight','reserved','legacy_drain','wait_ready','ready']);
+    assert.ok(checkpoints.every((value,index)=>value.buildId===candidate.buildId&&value.elapsedMs>=(checkpoints[index-1]?.elapsedMs??0)));
+    assert.equal(checkpoints.at(-1).serving.generation,'next');
   }finally{db.close();}
 });
 

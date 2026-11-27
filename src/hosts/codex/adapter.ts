@@ -82,9 +82,9 @@ export interface CodexContextReceipt {messageId:string;turnId:string;itemId:stri
 export function codexContextReceipts(item:any,turnId:unknown):CodexContextReceipt[]{
   if(typeof item?.id!=='string'||!item.id||typeof turnId!=='string'||!turnId)return[];
   let output:any;
-  if(item.type==='functionCallOutput'&&item.namespace==='claude'&&item.name==='receive_messages'&&typeof item.output==='string'){
+  if(item.type==='functionCallOutput'&&item.namespace==='claude'&&['receive_messages','read_messages'].includes(item.name)&&typeof item.output==='string'){
     try{output=JSON.parse(item.output);}catch{return[];}
-  }else if(item.type==='mcpToolCall'&&item.server==='claude'&&item.tool==='receive_messages'&&item.status==='completed'&&!item.error){
+  }else if(item.type==='mcpToolCall'&&item.server==='claude'&&['receive_messages','read_messages'].includes(item.tool)&&item.status==='completed'&&!item.error){
     const content=item.result?.content;
     if(!Array.isArray(content))return[];
     output={messages:content.flatMap((entry:any)=>{if(entry?.type!=='text'||typeof entry.text!=='string')return[];try{const value=JSON.parse(entry.text);return Array.isArray(value.messages)?value.messages:[];}catch{return[];}})};
@@ -523,7 +523,7 @@ export class CodexAdapter extends EventEmitter {
     const serialized:string[]=[],scoped=new Set<string>();
     for(const id of loaded)if(this.canObserveThread(endpoint,id,rpc,scope))serialized.push(id);else if(scope?.isChild(id))scoped.add(id);
     const revision=this.nativeStateRevision;
-    const [catalog]=await Promise.all([catalogCodexThreads(rpc,scoped),Promise.all(serialized.map(id=>this.discoverThread(endpoint,id,rpc)))]);
+    const [catalog]=await Promise.all([catalogCodexThreads(rpc,scoped,{independent:true}),Promise.all(serialized.map(id=>this.discoverThread(endpoint,id,rpc)))]);
     if(this.clients.get(endpoint)===rpc)for(const thread of catalog.values())if(thread.status?.type!=='notLoaded')this.record(thread,endpoint,undefined,undefined,revision);
   }
   private discoverThread(endpoint:string,id:string,rpc=this.clients.get(endpoint)):Promise<void>{
@@ -532,7 +532,7 @@ export class CodexAdapter extends EventEmitter {
     const scope=this.ownedNativeScope(runtimeFor(this.home,{endpoint})?.value),serialized=this.canObserveThread(endpoint,id,rpc,scope);
     if(!serialized&&!scope?.isChild(id))return Promise.resolve();
     const revision=this.nativeStateRevision;
-    const work=(serialized?rpc.request('thread/read',{threadId:id,includeTurns:false},{timeout:3000}).then(r=>r.thread):catalogCodexThreads(rpc,new Set([id])).then(catalog=>catalog.get(id)))
+    const work=(serialized?rpc.request('thread/read',{threadId:id,includeTurns:false},{timeout:3000}).then(r=>r.thread):catalogCodexThreads(rpc,new Set([id]),{independent:true}).then(catalog=>catalog.get(id)))
       .then(thread=>{if(!this.handoffPaused&&this.clients.get(endpoint)===rpc&&thread?.id===id&&thread.status?.type!=='notLoaded'){this.record(thread,endpoint,undefined,undefined,revision);this.discovered.set(key,Date.now()+1000);}})
       .catch(()=>{this.discovered.set(key,Date.now()+1000);}).finally(()=>{if(this.discovering.get(key)===work)this.discovering.delete(key);});
     this.discovering.set(key,work);if(this.discovered.size>256)this.discovered.delete(this.discovered.keys().next().value!);return work;
@@ -625,7 +625,7 @@ export class CodexAdapter extends EventEmitter {
     const rpc=await this.connect(endpoint.address),revision=this.nativeStateRevision;
     if(peer.kind==='subagent'&&peer.sessionId&&!this.canObserveThread(endpoint.address,peer.sessionId,rpc)){
       const id=peer.sessionId,loaded=await loadedCodexThreads(rpc);
-      const thread=loaded.has(id)?(await catalogCodexThreads(rpc,new Set([id]))).get(id):undefined;
+      const thread=loaded.has(id)?(await catalogCodexThreads(rpc,new Set([id]),{independent:true})).get(id):undefined;
       if(this.clients.get(endpoint.address)!==rpc||rpc.closed)return;
       if(thread&&codexSubagent(thread))this.record(thread,endpoint.address,undefined,peer.id,revision);
       else if(!loaded.has(id)&&(this.nativeStates.get(endpoint.address+'|'+id)?.revision??0)<=revision)this.emit('state',id,'offline',endpoint.address);
@@ -1585,7 +1585,7 @@ export class CodexAdapter extends EventEmitter {
     if(runtime.endpoint.startsWith('unix://')&&await ownedProcessState({pid:runtime.pid,startedAt:runtime.procStart})!=='alive')throw new BridgeError('managed_proof_unverified','自有运行时的原生代次尚未确认存活。');
     const rpc=await connectAppServer(runtime.endpoint,this.config,undefined,this.home,{readOnly:true});
     try{
-      const thread=scope?(await catalogCodexThreads(rpc,new Set([sessionId]))).get(sessionId)
+      const thread=scope?(await catalogCodexThreads(rpc,new Set([sessionId]),{independent:true})).get(sessionId)
         :(await rpc.request('thread/read',{threadId:sessionId,includeTurns:false},{timeout:2000})).thread;
       if(thread?.id!==sessionId)return;
                                        

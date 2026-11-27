@@ -9,6 +9,7 @@ import { managedMarker } from '../install/installation.js';
 import { Store } from '../storage/store.js';
 import { BridgeError, RuntimeRecoveryHold } from '../shared/errors.js';
 import { DeliveryHealth } from '../broker/health/delivery.js';
+import { deliveryHealthKey } from '../broker/health/contracts.js';
 import { CodexRecycleControl } from '../broker/recovery/codex-recycle-control.js';
 import { ManagedRecovery } from '../broker/recovery/managed-recovery.js';
 import { RECYCLE_CLEANUP_USER_STEP } from '../broker/stuck-session-text.js';
@@ -29,7 +30,7 @@ function recycleFixture(t:TestContext,initialWork:CodexRecycleWork,loadedUnlease
   store.saveEndpoint(endpoint);
   saveManagedRuntime(home,{id:old.runtimeId,endpoint:old.endpoint,pid:old.pid,procStart:old.procStart,owner:managedMarker(home),
     kind:'owned',state:'ready',peerId:peer.id,sessionId:peer.sessionId!,configHome:home,dedicated:true,createdAt:Date.now()});
-  const recovery=new ManagedRecovery(store),delivery=new DeliveryHealth(store);
+  let recovery=new ManagedRecovery(store);const delivery=new DeliveryHealth(store);
   let work=initialWork,oldAlive=true,afterObserve:(()=>void)|undefined,checkingHolders:(()=>void)|undefined,afterSignal:(()=>void)|undefined,
     retiringOld:(()=>void)|undefined,draining=false,lostAck=false,baseSubscription=false,observeFailed=false,firstReplacementExited=false,stopPending=false;
   const effects={stops:0,launches:0,subscriptions:0},finalized:Parameters<CodexAdapter['finalizeRecycle']>[]=[];
@@ -71,8 +72,8 @@ function recycleFixture(t:TestContext,initialWork:CodexRecycleWork,loadedUnlease
   const hold=loadedUnleased?Object.assign(new RuntimeRecoveryHold('owned_subscription_waiting','等待原生订阅'),{recycleEvidence:'loaded_unleased'}):
     new RuntimeRecoveryHold('native_thread_wedged','原生工作不可用');
   assert.equal(control.noteHold(peer,hold),true);
-  return {store,peer,sender,pair,old,fresh,recovery,delivery,get control(){return control;},effects,rollout,finalized,
-    reopenControl:()=>{control=makeControl();},
+  return {store,peer,sender,pair,old,fresh,get recovery(){return recovery;},delivery,get control(){return control;},effects,rollout,finalized,
+    reopenControl:(restartRecovery=false)=>{if(restartRecovery)recovery=new ManagedRecovery(store);control=makeControl();},
     failProfileCleanup:(value:boolean)=>{failProfileCleanup=value;},
     timeOutObservation:(value:'return'|'throw'|undefined)=>{observeTimeout=value;},
     advanceStable:async(acceptance?:Parameters<typeof control.advance>[1])=>{
@@ -96,6 +97,32 @@ function recycleFixture(t:TestContext,initialWork:CodexRecycleWork,loadedUnlease
     exitBeforeObserve:()=>{oldAlive=false;observeFailed=true;},
     notices:(part:'decision'|'result')=>delivery.peek(pair.id,sender.id).filter(notice=>notice.kind?.startsWith('codex_recycle_'+part+':'))};
 }
+
+for(const keyPrefix of ['managedRuntimeConflict:','managedSessionConflict:'])for(const opened of [false,true])test(keyPrefix+' 持续多分钟且协调器重建，不反复创建 L2 事故或通知：'+opened,async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const f=recycleFixture(t,{activeTurnIds:['active'],progress:'stalled',roles:[],unresolved:[]});
+  const held=f.store.accept(f.pair,f.sender,'仍待投递','held'),unknown=f.store.accept(f.pair,f.sender,'接收结果未知','unknown');
+  f.store.claim(unknown.id);f.store.transition(unknown.id,'unknown');const before=f.store.message(unknown.id);
+  if(opened)await f.advanceStable();
+  const original=f.recovery.get(f.peer.id)?.id,conflictKey=keyPrefix+f.peer.id;
+  f.store.setSetting(conflictKey,{runtimeId:f.old.runtimeId,sessionId:'other'});
+  const hold=new RuntimeRecoveryHold('native_thread_wedged','原生工作不可用');
+  for(let tick=0;tick<80;tick++){
+    now+=5001;
+    if(tick===40)f.reopenControl(true);
+    assert.equal(f.control.noteHold(f.peer,hold),false);assert.equal(await f.control.advance(f.peer),false);
+  }
+  assert.equal(f.recovery.get(f.peer.id)?.id,original);
+  if(opened)assert.equal(f.recovery.get(f.peer.id)?.state,'closed');
+  const notices=f.store.setting<{notices:{kind?:string}[]}>(deliveryHealthKey(f.pair.id,f.sender.id))?.notices??[];
+  assert.equal(notices.filter(n=>n.kind==='codex_recycle_authority_lost:'+f.peer.id).length,opened?1:0);
+  assert.deepEqual(f.effects,{stops:0,launches:0,subscriptions:0});
+  assert.deepEqual(f.store.message(unknown.id),before);assert.equal(f.store.message(held.id).state,'accepted');
+  f.store.setSetting(conflictKey,null);
+  assert.equal(f.control.noteHold(f.peer,hold),true);await f.advanceStable();
+  assert.equal(f.recovery.get(f.peer.id)?.recycle?.phase,'awaiting_partner');
+  if(original)assert.notEqual(f.recovery.get(f.peer.id)?.id,original);
+});
 
 test('同一事故的实际消息账本保持，只有当前工作证据可接入并通知原发送方',async t=>{
   const work:CodexRecycleWork={activeTurnIds:['active'],progress:'stalled',lastProgressAt:10,roles:[],unresolved:[]};
