@@ -32,6 +32,7 @@ import { readCodexHistory } from '../hosts/codex/codex-history.js';
 import {readSessionProfile} from '../hosts/codex/codex-session-profile.js';
 import { collectCodexRecycleEvidence } from '../hosts/codex/codex-recycle.js';
 import { codexServerVersion } from '../hosts/codex/codex-client-identity.js';
+import type { CodexRestartTiming } from '../hosts/codex/codex-restart-timing.js';
 
 test('Windows 原生停止助手超过绝对期限时保留同代次隔离子进程',{skip:process.platform!=='win32'},async t=>{
   const temp=temporaryDirectory();
@@ -260,9 +261,15 @@ await server.connect(new StdioServerTransport());
     live=store.accept(pair,partner,'只返回重启后隔离检查答案','queued-before-restart');assert.equal(live.attempts,0);
     return restart(...args);
   });
-  const result=await broker.dispatch('codex.restart',named?{partner:true,actor:{host:'claude',sessionId:partner.sessionId,callId:'native-partner-restart'}}:{}) as any;pids.add(result.pid);
+  const request_id='native-restart-timing',result=await broker.dispatch('codex.restart',{request_id,...(named?{partner:true,actor:{host:'claude',sessionId:partner.sessionId,callId:'native-partner-restart'}}:{})}) as any;pids.add(result.pid);
   duringRestart.mock.restore();
   assert.equal(result.restarted,true);assert.equal(result.session_id,peer.sessionId);assert.notEqual(result.pid,child.pid);assert.equal(liveProcess(child.pid),false);
+  assert.deepEqual(await broker.dispatch('codex.restart.result',{request_id}),result);
+  const timing=store.events(0,10000).filter(event=>event.type==='codex.restart.timing').map(event=>event.data as CodexRestartTiming).find(value=>value.requestId===request_id);
+  assert.ok(timing);assert.equal(timing.target?.pid,child.pid);assert.equal(timing.replacement?.pid,result.pid);assert.equal(timing.outcome,'complete');
+  for(const stage of ['terminal_proof_first','profile_snapshot','terminal_proof_final','delivery_proof','stop_process','cleanup_owners','launch_selection','reserve_runtime','spawn_process','native_handshake','native_resume','broker_post_ack']){
+    const measurement=timing.stages[stage];assert.ok(measurement,stage);assert.ok(!measurement.failed&&measurement.lastAtMs>=measurement.firstAtMs,stage);
+  }
   assert.deepEqual(store.message(uncertain.id),unknownBefore,'完整历史核验只解除重启阻塞，未知消息的正文、状态及投递次数保持原样');
   assert.equal(store.currentPair()?.id,pair.id);assert.equal(store.peer(peer.id).owner,'nxbridge');assert.equal(requests.length,beforeRequests,'冷恢复本身不调用模型');
   const restored=await codex.attach(store.peer(peer.id),store.endpoint(peer.id)!);

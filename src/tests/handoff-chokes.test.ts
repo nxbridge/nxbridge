@@ -39,6 +39,9 @@ test('封存后的原生连接拒绝全局请求、通知和应答，保留物�
 test('发送前回调中发生封存时，最后的实际发送门禁仍阻止出站',async t=>{
   const sent:RpcMessage[]=[],rpc=new CodexNativeRpc(message=>sent.push(message),()=>{},'fixture://late-seal');
   t.after(()=>rpc.close());
-  await assert.rejects(rpc.request('config/read',{}, {beforeSend:()=>rpc.seal()}),{code:'handoff_sealed',phase:'prepare'});
+  let recorded=false;
+  await assert.rejects(rpc.request('thread/settings/update',{threadId:'fixture'}, {mutation:true,beforeSend:()=>rpc.seal(),
+    writeAhead:()=>{recorded=true;}}),{code:'handoff_sealed',phase:'prepare'});
   assert.deepEqual(sent,[]);
+  assert.equal(recorded,false);
 });

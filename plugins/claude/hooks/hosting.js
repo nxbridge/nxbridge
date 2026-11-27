@@ -7,6 +7,12 @@ const step=h=>h?.user_step?`（${h.user_step}）`:'';
 const QUIET_HOLDS=new Set(['session_busy','subagent_active']);
                                                     
 export const hostingHoldText=h=>h?.held_unsent&&h.delivery_hold?.status&&!QUIET_HOLDS.has(h.delivery_hold.code)?`${h.held_unsent} 条消息在等：${h.delivery_hold.status}`:undefined;
+                                                                                           
+                                                                  
+const PERMISSION_BAR_STATES=new Set(['pending','restore_pending','restoring']);
+export const permissionChangeText=member=>{const change=member?.permission_change;return change?.status_text&&PERMISSION_BAR_STATES.has(change.state)&&change.restore_available!==false?change.status_text:undefined;};
+                                                                    
+export const permissionRecheckText=member=>{const change=member?.permission_change;return change?.recheck_via_open&&change.status_text?change.status_text:undefined;};
 const POLICY_PART={filesystem:'文件',network:'网络',approval:'审批方式',reviewer:'审批人'};
 const BLOCK_REASON={
   policy_unrepresentable:'原来的权限没法安全套用',policy_verification_failed:'恢复后的权限核对没通过',

@@ -9,6 +9,8 @@ import { atomicJson, readJson, sameDirectory } from '../../shared/files.js';
 import { stateDirectory } from '../../storage/state-directory.js';
 import type { ManagedRuntime } from '../managed-runtimes.js';
 import { planCodexResume, requireExactRestartProfile, verifyRestartProfileCurrent, type SessionProfile } from './codex-session-profile.js';
+import {acceptedTakeoverProfile,restartTakeoverEvidence} from './codex-takeover-permission.js';
+import type {AcceptedTakeoverPermission,TakeoverPermissionEvidence} from '../takeover-permission.js';
 
 interface RestartProfile {
   version:1;owner:string;peerId:string;configHome:string;sourceId:string;pid:number;procStart:string;bootId?:string;profile:SessionProfile;recycle?:true;
@@ -28,6 +30,14 @@ function readRestartProfile(home:string,peerId:string):RestartProfile|undefined{
   }
 }
 
+export function pendingRestartTakeoverEvidence(home:string,peerId:string,sessionId:string):TakeoverPermissionEvidence|undefined{
+  const previous=readRestartProfile(home,peerId);
+  if(previous?.profile.sessionId!==sessionId)return;
+  const evidence=restartTakeoverEvidence(previous.profile);
+  if(!evidence)throw new BridgeError('restart_profile_unverified','无法核验重启档案的权限引用。');
+  return evidence;
+}
+
                                 
 export function prepareRestartProfile(home:string,runtime:ManagedRuntime,profile:SessionProfile,options:{recycle?:true}={}):()=>void{
   if(options.recycle)planCodexResume(profile.sessionId,profile,profile.settings.cwd??'',{exact:true});
@@ -45,7 +55,7 @@ export function prepareRestartProfile(home:string,runtime:ManagedRuntime,profile
   };
 }
 
-export async function pendingRestartVerification(home:string,peerId:string,sessionId:string,configHome:string):Promise<ManagedRuntime['sessionVerification']>{
+export async function pendingRestartVerification(home:string,peerId:string,sessionId:string,configHome:string,accepted?:AcceptedTakeoverPermission):Promise<ManagedRuntime['sessionVerification']>{
   const previous=readRestartProfile(home,peerId);
   if(!previous||previous.profile.sessionId!==sessionId)return;
   if(!sameDirectory(previous.configHome,configHome))
@@ -53,8 +63,9 @@ export async function pendingRestartVerification(home:string,peerId:string,sessi
   const boot=currentLinuxBootId();
   if((!previous.bootId||!boot||previous.bootId===boot)&&await ownedProcessState({pid:previous.pid,startedAt:previous.procStart})!=='dead')
     throw new BridgeError('runtime_launch_unconfirmed','自动重启的原 Codex 进程尚未核验退出，未启动替代进程。');
-  await verifyRestartProfileCurrent(previous.profile,{exact:previous.recycle});
-  return{sessionId,profile:previous.profile,restartSourceId:previous.sourceId};
+  const profile=await acceptedTakeoverProfile(previous.profile,accepted);
+  await verifyRestartProfileCurrent(profile,{exact:previous.recycle});
+  return{sessionId,profile,restartSourceId:previous.sourceId};
 }
 
                                          

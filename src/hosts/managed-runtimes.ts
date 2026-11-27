@@ -79,8 +79,8 @@ export function managedRuntimes(home:string):RuntimeRecord[]{
   }
   return result;
 }
-export function runtimeFor(home:string,selector:{peerId?:string;endpoint?:string;id?:string}):RuntimeRecord|undefined{
-  const found=managedRuntimes(home).filter(r=>(selector.peerId===undefined||r.value.peerId===selector.peerId)&&(selector.endpoint===undefined||r.value.endpoint===selector.endpoint)&&(selector.id===undefined||r.value.id===selector.id));
+export function runtimeFor(home:string,selector:{peerId?:string;endpoint?:string;id?:string},records?:readonly RuntimeRecord[]):RuntimeRecord|undefined{
+  const found=(records??managedRuntimes(home)).filter(r=>(selector.peerId===undefined||r.value.peerId===selector.peerId)&&(selector.endpoint===undefined||r.value.endpoint===selector.endpoint)&&(selector.id===undefined||r.value.id===selector.id));
   const active=found.filter(r=>r.value.state!=='failed');
   if(active.length>1)throw new BridgeError('runtime_ambiguous','该成员有多个尚未核验结束的运行时，未启动第二个。');
   return active[0]??found.sort((a,b)=>b.value.createdAt-a.value.createdAt)[0];
@@ -106,12 +106,12 @@ function runtimePredatesBoot(runtime:ManagedRuntime,records:OwnedProcessRecord[]
   const current=currentLinuxBootId();
   return!!runtime.bootId&&!!current&&runtime.bootId!==current||records.some(record=>matchesRuntime(record,runtime)&&ownedRecordPredatesBoot(record));
 }
-export async function managedRuntimeState(home:string,runtime:ManagedRuntime):Promise<ProcessState>{
-  const proof=ownedProcesses(home),identities=new Map<string,{identity:{pid:number;startedAt:string};record?:OwnedProcessRecord}>();
-  if(runtimePredatesBoot(runtime,proof.records))return'dead';
+export async function managedRuntimeState(home:string,runtime:ManagedRuntime,records?:OwnedProcessRecord[]):Promise<ProcessState>{
+  const proof=records??ownedProcesses(home).records,identities=new Map<string,{identity:{pid:number;startedAt:string};record?:OwnedProcessRecord}>();
+  if(runtimePredatesBoot(runtime,proof))return'dead';
   let containerProof=false;
   for(const [pid,startedAt] of [[runtime.pid,runtime.procStart],[runtime.wrapperPid,runtime.wrapperProcStart]] as const)if(pid&&startedAt)identities.set(pid+':'+startedAt,{identity:{pid,startedAt}});
-  for(const record of proof.records)if(matchesRuntime(record,runtime)){
+  for(const record of proof)if(matchesRuntime(record,runtime)){
     if(record.windowsJob||record.posixGroup)containerProof=true;
     const key=record.identity.pid+':'+record.identity.startedAt,previous=identities.get(key)?.record;
     if(!previous?.windowsJob&&!previous?.posixGroup)identities.set(key,{identity:record.identity,record});

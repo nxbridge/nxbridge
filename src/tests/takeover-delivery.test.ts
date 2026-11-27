@@ -230,7 +230,7 @@ test('接手期间等待生效的模型设置说明窗口关闭条件，仍不�
   const f=await setup(t),lease=f.lease();f.broker.profiles.set(f.peer(),{model:'requested-model'});
   const message=f.store.accept(f.pair,f.c,'等设置生效再处理','takeover-profile');await f.wake();
   assert.equal(f.hosting().delivery_hold.code,'profile_pending_takeover');assert.equal(f.store.message(message.id).state,'accepted');assert.equal(f.codex.woken.length,0);
-  assert.equal(await f.takeovers.returned(f.x.id,lease.id,true),true);assert.equal(f.hosting().delivery_hold.code,'profile_unverified');
+  assert.equal(await f.takeovers.returned(f.x.id,lease.id,'ended'),true);assert.equal(f.hosting().delivery_hold.code,'profile_unverified');
 });
 
 for(const state of ['window_closed','awaiting_window','blocked','transition'] as const)test('托管等待原因保留实际下一步：'+state,async t=>{

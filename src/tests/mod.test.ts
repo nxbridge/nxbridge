@@ -2365,3 +2365,16 @@ test('状态栏：接手窗口开着时的模型变更说明等窗口关掉，�
   assert.equal(await show({preference:'bg',phase:'background',wake_capable:true,held_unsent:1,delivery_hold:takeover}),'1 条消息在等：有模型设置的变更要等你关掉打开查看的窗口后才能生效，之前先不送');
   assert.match(await show({preference:'bg',phase:'background',wake_capable:true,held_unsent:1}) ?? '',/正在换成推理强度 high/);
 });
+
+test('状态栏：接手窗口权限改动待决定只在最后显示，不盖住暂缓和离线说明',async()=>{
+  const h=await harness();await h.run('session.start',{});
+  const pending={change_id:'c-1',state:'pending',changed_fields:[],status_text:'权限改动待你决定：你在接手窗口里改了后台 Codex 的审批方式 on-request → never，现在按新设置运行；要改回原来的，跟 AI 说一声'};
+  const show=async(partner:any)=>{h.response('status',{paired:true,self:{state:'ready'},partner:{state:'ready',...partner},integrationIssues:[]});await h.tick();return h.statuses.at(-1);};
+  assert.equal(await show({permission_change:pending}),pending.status_text);
+  const delivery_hold={code:'permission_restore_unverified',status:'权限改回请求已发出，正在核对是否生效，核对完再送',model:'held'};
+  assert.equal(await show({permission_change:{...pending,state:'restoring',status_text:'正在把后台 Codex 的权限改回原设置并核对'},hosting:{preference:'bg',phase:'background',wake_capable:true,held_unsent:1,delivery_hold}}),'1 条消息在等：权限改回请求已发出，正在核对是否生效，核对完再送');
+  assert.equal(await show({permission_change:{...pending,state:'restored',status_text:'后台 Codex 的权限已改回原设置'}}),undefined);
+                                                 
+  const recheck='后台 Codex 的权限改回结果没能确认：请求已发出，但一直连不上后台，现在用的是哪套设置还不确定。自动核对次数已用完，核对清之前发给它的消息先不送；可以在终端运行 nxbridge open codex --member c 再核对一次';
+  assert.equal(await show({permission_change:{...pending,state:'failed',recheck_via_open:true,status_text:recheck},hosting:{preference:'bg',phase:'background',wake_capable:true,held_unsent:1,delivery_hold}}),recheck);
+});

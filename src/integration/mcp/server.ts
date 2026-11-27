@@ -23,7 +23,7 @@ import { READ_MESSAGES_TOOL, readMessagesSchema } from '../../broker/delivery/me
 import { disabledMember, memberOffResultFor, MEMBER_CONTROL_TOOL, type MemberContext } from '../../broker/member-control.js';
 import { classifyCodexPermission, codexMetadataEvidence } from '../../hosts/codex/codex-permission.js';
 import { RECOVER_PARTNER_TOOL, recoverPartnerSchema } from '../../broker/recovery/managed-recovery.js';
-import { PARTNER_PROFILE_TOOL, modelProfileSchema } from '../../broker/profiles/partner-profile.js';
+import { PARTNER_PROFILE_TOOL, modelProfileSchema, partnerProfileAction } from '../../broker/profiles/partner-profile.js';
 import { CODEX_HOOK_TOOL, McpHook } from '../hooks/mcp-hook.js';
 
 export const MESSAGE_TOOLS=[
@@ -146,7 +146,7 @@ export async function serveMcp(host:Host,options:{connection?:BrokerSession;tran
         case'send_message':{const args=z.object({message:z.string().min(1),in_reply_to:z.string().optional(),reply_expected:z.boolean().optional()}).strict().parse(request.params.arguments);value=await brokerCall('send',{actor,...args},{mutation:true});if(host==='codex')value=await elicitPartner(server,value,(method,params)=>brokerCall(method,{actor,...params},{mutation:['pair.selection.commit','pair.selection.resolve'].includes(method)}),{signal:extra.signal,relatedRequestId:extra.requestId,timeout:600000});break;}
         case'choose_partner':{z.object({}).strict().parse(request.params.arguments??{});value=await brokerCall('pair.code',{actor},{mutation:true});if(host==='codex')value=await elicitPartner(server,value,(method,params)=>brokerCall(method,{actor,...params},{mutation:['pair.selection.commit','pair.selection.resolve'].includes(method)}),{signal:extra.signal,relatedRequestId:extra.requestId,timeout:600000});break;}
         case'select_partner':{const args=z.object({selection_id:z.string(),key:z.string().optional(),action:z.enum(['choose','create','adopt','wait','unpair','cancel']).optional(),...modelProfileSchema.shape}).strict().parse(request.params.arguments);value=await brokerCall('pair.selection.commit',{actor,...args},{mutation:true});break;}
-        case'partner_profile':{const args=modelProfileSchema.extend({action:z.enum(['get','set','reset']).default('get')}).strict().parse(request.params.arguments??{});value=await brokerCall('partner.profile',{actor,...args},{mutation:args.action!=='get'});break;}
+        case'partner_profile':{const args=modelProfileSchema.extend({action:partnerProfileAction,change_id:z.string().uuid().optional()}).strict().parse(request.params.arguments??{});value=await brokerCall('partner.profile',{actor,...args},{mutation:args.action!=='get'});break;}
         case'status':z.object({}).strict().parse(request.params.arguments??{});value=await brokerCall('status',{actor,model_view:true});break;
         case'receive_messages':z.object({}).strict().parse(request.params.arguments??{});value=await brokerCall('receive',actor,{mutation:true});break;
         default:throw new BridgeError('unknown_tool','未知的搭档工具。');

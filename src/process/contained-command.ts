@@ -63,20 +63,24 @@ child.once('exit',async(code,signal)=>{
 `);
 
                                     
-export async function spawnContainedCommand(command:string,args:string[],options:SpawnOptions&{home?:string}={}):Promise<ChildProcess>{
-  const {home,...settings}=options;
+export async function spawnContainedCommand(command:string,args:string[],options:SpawnOptions&{home?:string;beforeSpawn?:()=>void|Promise<void>}={}):Promise<ChildProcess>{
+  const {home,beforeSpawn,...settings}=options;
+  const launch=async(executable:string,argv:string[],spawnOptions:SpawnOptions)=>{
+    const checked=beforeSpawn?.();if(checked)await checked;
+    return spawn(executable,argv,spawnOptions);
+  };
   if(process.platform==='win32'){
     const helper=await windowsHookIdentityHelper(home);
     const pipe='nxbridge-command-'+process.pid+'-'+randomUUID(),connections=new Set<net.Socket>();let child:ChildProcess;
     const server=net.createServer(socket=>{connections.add(socket);receiveStatus(child,socket,home??bridgeHome(),command);socket.once('close',()=>connections.delete(socket));});
     await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen('\\\\.\\pipe\\'+pipe,resolve);});
-    try{child=spawn(helper,['run',String(process.pid),pipe,command,...args],{...settings,windowsHide:true,shell:false});}
+    try{child=await launch(helper,['run',String(process.pid),pipe,command,...args],{...settings,windowsHide:true,shell:false});}
     catch(error){server.close();throw error;}
     child.once('close',()=>{for(const socket of connections)socket.destroy();server.close();});
     return child;
   }
   const encoded=Buffer.from(JSON.stringify({command,args,grace:CONTAINED_COMMAND_EXIT_GRACE_MS,supervisorModule:'data:text/javascript;base64,'+Buffer.from(posixSupervisorSource).toString('base64')})).toString('base64');
-  const child=spawn(process.execPath,['--input-type=module','-e',posixCommandSource,encoded],{...settings,detached:true,stdio:['pipe','pipe','pipe','pipe'],shell:false});
+  const child=await launch(process.execPath,['--input-type=module','-e',posixCommandSource,encoded],{...settings,detached:true,stdio:['pipe','pipe','pipe','pipe'],shell:false});
   receiveStatus(child,child.stdio[3] as unknown as NodeJS.ReadWriteStream,home??bridgeHome(),command);return child;
 }
 
@@ -91,9 +95,9 @@ export async function closeContainedCommand(child:ChildProcess,grace=1000+CONTAI
   });
 }
 
-export async function executeContainedCommand(command:string,args:string[],options:{cwd?:string;env?:NodeJS.ProcessEnv;home?:string;timeout:number;maxBuffer:number;onSpawn?:()=>void}):Promise<{stdout:string;stderr:string}>{
+export async function executeContainedCommand(command:string,args:string[],options:{cwd?:string;env?:NodeJS.ProcessEnv;home?:string;timeout:number;maxBuffer:number;beforeSpawn?:()=>void|Promise<void>;onSpawn?:()=>void}):Promise<{stdout:string;stderr:string}>{
   let child:ChildProcess;
-  try{child=await spawnContainedCommand(command,args,{cwd:options.cwd,env:options.env,home:options.home,stdio:['pipe','pipe','pipe']});}catch(error){throw Object.assign(Error('控制进程容器准备失败'),{ownershipError:error});}
+  try{child=await spawnContainedCommand(command,args,{cwd:options.cwd,env:options.env,home:options.home,beforeSpawn:options.beforeSpawn,stdio:['pipe','pipe','pipe']});}catch(error){throw Object.assign(Error('控制进程容器准备失败'),{ownershipError:error});}
   let stdout=Buffer.alloc(0),stderr=Buffer.alloc(0),failure:Error|undefined,killed=false;
   const collect=(kind:'stdout'|'stderr',chunk:Buffer)=>{
     const previous=kind==='stdout'?stdout:stderr;

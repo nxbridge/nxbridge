@@ -2,6 +2,7 @@ import type { RpcClient } from '../../ipc/rpc.js';
 import {BridgeError} from '../../shared/errors.js';
 import type { CodexThread } from './adapter.js';
 import { codexThreadUnmaterialized } from './codex-thread-state.js';
+import { timeCodexRestart } from './codex-restart-timing.js';
 
 const capabilities=new WeakMap<RpcClient,Set<string>>();
 const threadCapabilities=new WeakMap<RpcClient,Set<string>>();
@@ -50,11 +51,11 @@ export function readCodexThread(rpc:RpcClient,threadId:string,options:{turnId?:s
   let reads=pending.get(rpc);if(!reads){reads=new Map();pending.set(rpc,reads);}
   const key=threadId+'|'+(options.turnId??'')+'|'+!!options.progress,active=reads.get(key);if(active)return active;
   const work=(async()=>{
-    const {thread}=await rpc.request('thread/read',{threadId,includeTurns:false},{timeout:options.timeout??5000});
+    const {thread}=await timeCodexRestart('native_thread_read',()=>rpc.request('thread/read',{threadId,includeTurns:false},{timeout:options.timeout??5000}));
     if(thread?.id!==threadId)throw new BridgeError('session_changed','原生证据返回了不同的线程。');
     if(unavailable(rpc,'thread/turns/list',threadId))return{...thread,turns:[],...(options.progress?{progressEvidence:false}:{})};
     try{
-      const page=await rpc.request('thread/turns/list',{threadId,limit:options.turnId?16:1,sortDirection:'desc',itemsView:'summary'},{timeout:options.timeout??5000});
+      const page=await timeCodexRestart('native_turn_summary',()=>rpc.request('thread/turns/list',{threadId,limit:options.turnId?16:1,sortDirection:'desc',itemsView:'summary'},{timeout:options.timeout??5000}));
                                            
       const value={...thread,turns:[...(page.data??[])].reverse()};
       return options.progress?await readProgress(rpc,value,options.timeout):value;

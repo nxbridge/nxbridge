@@ -1,15 +1,17 @@
 import test,{type TestContext} from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
 import {mkdirSync,writeFileSync,existsSync} from 'node:fs';
 import {Store} from '../storage/store.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
 import {atomicJson} from '../shared/files.js';
-import {claudeChild,claudeChildFile,ensureClaudeChild,type ClaudeChildRecord} from '../hosts/claude/claude-child.js';
+import {childCall,claudeChild,claudeChildFile,ensureClaudeChild,findClaudeChild,stopClaudeChild,type ClaudeChildRecord} from '../hosts/claude/claude-child.js';
 import {ensureHome} from '../ipc/home.js';
 import {listenBroker} from '../ipc/ipc.js';
-import {processIdentity} from '../process/process.js';
-import {recordOwnedProcess,forgetOwnedProcess,type OwnedProcessRecord} from '../process/owned-processes.js';
+import {liveProcess,processIdentity} from '../process/process.js';
+import {currentLinuxBootId,processRegistryDirectory,recordOwnedProcess,forgetOwnedProcess,rememberOwnedChild,releaseOwnedProcess,type OwnedProcessRecord} from '../process/owned-processes.js';
 import {temporaryDirectory} from './support/temporary.js';
 import {registration} from './support/registration.js';
 
@@ -56,4 +58,61 @@ test('明确没有提交的 worker 启动失败可重试，失败回执只更新
     const record=claudeChild(f.home,f.peer.id)!;assert.equal(record.phase,'failed');assert.ok(record.launchId);assert.notEqual(record.launchId,previous);previous=record.launchId;
   }
   assert.equal(existsSync(f.marker),false);
+});
+
+test('Linux 上次启动的托管记录只保留恢复资料，复用的 PID 不被探测或停止',linux,async t=>{
+  const f=await setup(t),neighbor=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}),closed=once(neighbor,'exit');
+  await once(neighbor,'spawn');
+  const owned=await rememberOwnedChild(f.home,neighbor,'host-control');assert.ok(owned);
+  t.after(async()=>{await releaseOwnedProcess(owned);await closed;});
+  const file=claudeChildFile(f.home,f.peer.id),previous:ClaudeChildRecord={...f.record,bootId:'previous-boot',phase:'active',native:owned.identity,
+    registration:registration('claude',f.peer.sessionId)};
+  const bootId=currentLinuxBootId();assert.ok(bootId);
+  atomicJson(file,previous);
+  const recovered=findClaudeChild(f.home,f.peer.sessionId)!;
+  assert.equal(recovered.phase,'stopped');assert.equal(recovered.native,undefined);assert.equal(recovered.registration,undefined);
+  await assert.rejects(childCall(f.home,previous,'status'),{code:'claude_child_offline'});
+  assert.equal((await stopClaudeChild(f.home,previous)).phase,'released');
+  assert.equal(liveProcess(owned.identity.pid),true);
+  atomicJson(file,{...previous,phase:'user',foreground:owned.identity});
+  await assert.rejects(ensureClaudeChild(f.home,f.config,f.peer),{code:'claude_handoff'});
+  atomicJson(file,previous);
+  const abort=Error('测试在实际派生 worker 前结束');
+  await assert.rejects(ensureClaudeChild(f.home,f.config,f.peer,undefined,undefined,()=>{
+    const intent=claudeChild(f.home,f.peer.id)!;
+    assert.equal(intent.phase,'starting');assert.equal(intent.bootId,bootId);assert.equal(intent.sessionId,f.peer.sessionId);assert.equal(intent.hasSession,true);
+    throw abort;
+  }),error=>error===abort);
+  assert.equal(liveProcess(owned.identity.pid),true);assert.equal(existsSync(f.marker),false);
+});
+
+test('Linux 旧托管文件没有启动代号时，保留无法核验的活进程且不另起副本',linux,async t=>{
+  const f=await setup(t),neighbor=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}),closed=once(neighbor,'exit');
+  await once(neighbor,'spawn');const owned=await rememberOwnedChild(f.home,neighbor,'host-control');assert.ok(owned);
+  t.after(async()=>{await releaseOwnedProcess(owned);await closed;});
+  atomicJson(claudeChildFile(f.home,f.peer.id),{...f.record,phase:'active',native:owned.identity});
+  await assert.rejects(ensureClaudeChild(f.home,f.config,f.peer),{code:'claude_child_orphan'});
+  await assert.rejects(stopClaudeChild(f.home,claudeChild(f.home,f.peer.id)!),{code:'claude_child_orphan'});
+  assert.equal(liveProcess(owned.identity.pid),true);assert.equal(existsSync(f.marker),false);
+  const legacy=await recordOwnedProcess(f.home,{role:'host-control',identity:owned.identity,parent:await processIdentity(process.pid),peerId:f.peer.id,proof:{kind:'spawn'}});
+  t.after(()=>forgetOwnedProcess(legacy));delete legacy.bootId;atomicJson(path.join(processRegistryDirectory(f.home),legacy.id+'.json'),legacy);
+  atomicJson(claudeChildFile(f.home,f.peer.id),{...f.record,phase:'active',native:owned.identity});
+  await assert.rejects(ensureClaudeChild(f.home,f.config,f.peer),{code:'claude_child_orphan'});
+  await assert.rejects(stopClaudeChild(f.home,claudeChild(f.home,f.peer.id)!),{code:'claude_child_orphan'});
+  assert.equal(liveProcess(owned.identity.pid),true,'旧归属记录同样缺少启动代号时不能绕过原生停止边界');
+  assert.equal(claudeChild(f.home,f.peer.id)?.phase,'active');assert.equal(existsSync(f.marker),false);
+});
+
+test('Linux 升级后仍通过存活旧 worker 的原控制通道停止未带启动代号的进程',linux,async t=>{
+  const f=await setup(t),worker=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}),closed=once(worker,'exit');
+  await once(worker,'spawn');const owned=await rememberOwnedChild(f.home,worker,'claude-worker',{peerId:f.peer.id});assert.ok(owned);
+  t.after(async()=>{if(worker.exitCode===null&&worker.signalCode===null)worker.kill();await closed;forgetOwnedProcess(owned);});
+  delete owned.bootId;atomicJson(path.join(processRegistryDirectory(f.home),owned.id+'.json'),owned);
+  const legacy:ClaudeChildRecord={...f.record,phase:'active',worker:owned.identity,native:owned.identity};atomicJson(claudeChildFile(f.home,f.peer.id),legacy);
+  let requests=0;
+  const server=await listenBroker(f.home,async method=>{
+    assert.equal(method,'stop');requests++;worker.kill();await closed;
+    return{...legacy,phase:'stopped'};
+  },legacy.address);t.after(()=>server.close());
+  const result=await stopClaudeChild(f.home,legacy);assert.equal(result.phase,'stopped');assert.equal(requests,1);assert.equal(liveProcess(owned.identity.pid),false);
 });

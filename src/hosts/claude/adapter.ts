@@ -4,7 +4,7 @@ import {BridgeError} from '../../shared/errors.js';
 import {type BridgeConfig,type DeliveryResult,type Endpoint,type Peer,type RegisterInput} from '../../types.js';
 import {bridgeHome} from '../../shared/local-paths.js';
 import {delay} from '../../shared/time.js';
-import {readJson} from '../../shared/files.js';
+import {readJson,sameDirectory} from '../../shared/files.js';
 import {runCli} from '../../process/host-command.js';
 import { prepareOwnedLaunch, recordHostLaunch, selectHostLaunch } from '../host-launch.js';
 import { selectSessionLaunch } from '../session-launch.js';
@@ -13,12 +13,12 @@ import type { DeliveryMessage } from '../../broker/delivery/file-references.js';
 import { deliverClaudeInbox, type SessionRecord } from './claude-inbox.js';
 import { ClaudeReplySockets } from './claude-reply-sockets.js';
 export { canonicalPipe, peerKeyFile, peerAddress, encodePeerMessage, type SessionRecord } from './claude-inbox.js';
-import { claudeBackground, claudeBackgroundMode, requireClaudeBackground } from './claude-capability.js';
+import { claudeBackground, claudeBackgroundMode, requireClaudeBackground, CLAUDE_UNRESOLVED_LAUNCH_NOTICE } from './claude-capability.js';
 import { claudeChild, childCall, ensureClaudeChild, findClaudeChild, stopClaudeChild } from './claude-child.js';
 import {probePeerRuntime} from '../../broker/health/probe.js';
 import {type RuntimeAvailability} from '../../broker/health/contracts.js';
 import { beginNativeLaunch, bindNativeLaunch, captureNativeProcess, failNativeLaunch, forgetNativeOwnership, nativeLaunchHandle, nativeOwnership, nativeOwnershipForSession, nativeSupervisorAvailable, saveNativeOwnership } from '../../process/owned-native.js';
-import { ownedProcesses, releaseOwnedProcess } from '../../process/owned-processes.js';
+import { ownedProcesses, ownedRecordMatchesGeneration, ownedRecordPredatesBoot, predatesLinuxBoot, releaseOwnedProcess } from '../../process/owned-processes.js';
 import { ownedProcessState } from '../../process/process-stop.js';
 import type { NativeOwnership } from '../../process/owned-native.js';
 import { restoreState } from '../../broker/pairing/pair-restore.js';
@@ -64,11 +64,16 @@ export class ClaudeAdapter extends EventEmitter {
     requireClaudeBackground(this.home,this.config);
     if(this.childMode())return(await ensureClaudeChild(this.home,this.config,peer,beforeLaunch,sourcePermission,beforeCreate,this.modelProfile(peer))).sessionId;
     const name=`nxbridge-${peer.id}`;
-    let binding=nativeOwnership(this.home,peer.id);
+    let binding=nativeOwnership(this.home,peer.id,{includePreviousBoot:true});
+    if(binding?.releasedToUser)throw new BridgeError('process_owned_by_user','该后台会话已经交给用户窗口，未自动恢复。');
+    if(binding&&predatesLinuxBoot(binding.bootId)&&binding.phase!=='failed'){
+      if(!binding.sessionId)throw new BridgeError('claude_start_pending','上次后台启动的会话 ID 尚未确认，保留启动记录，未创建其他会话。请运行 doctor。');
+      if(peer.sessionId&&peer.sessionId!==binding.sessionId)throw new BridgeError('session_changed','后台启动记录属于其他会话，未自动恢复。');
+      await this.wake({...peer,sessionId:binding.sessionId},undefined,undefined,beforeLaunch);return binding.sessionId;
+    }
     const launch=await prepareOwnedLaunch(selectHostLaunch('claude',this.config,{home:this.home,cwd:peer.cwd,configHome:binding?.configHome,executable:binding?.executable,profileId:binding?.profileId}));
     if(binding?.phase==='failed'){forgetNativeOwnership(binding);binding=undefined;}
     if(binding){
-      if(binding.releasedToUser)throw new BridgeError('process_owned_by_user','该后台会话已经交给用户窗口，未自动恢复。');
       const before=await this.list(undefined,launch.configHome);
       this.requireMember(peer);
       const launched=before.filter(value=>value.id===binding!.handle&&value.kind==='background');
@@ -106,7 +111,7 @@ export class ClaudeAdapter extends EventEmitter {
     return childCall(this.home,child,'profile.get');
   }
   async corroborateRegistration(input:RegisterInput,proof:NativeOwnership):Promise<NativeOwnership|undefined>{
-    if(!proof.handle||proof.releasedToUser||!input.endpoint.pid||!input.endpoint.procStart)return;
+    if(!proof.handle||proof.releasedToUser||predatesLinuxBoot(proof.bootId)||!input.endpoint.pid||!input.endpoint.procStart)return;
     const key=JSON.stringify([proof.id,proof.peerId,proof.handle,proof.configHome,proof.phase,proof.native,input.sessionId,input.endpoint.pid,input.endpoint.procStart]),cached=this.registrationProbes.get(key);if(cached&&cached.until>Date.now())return cached.work;
     let timer:ReturnType<typeof setTimeout>|undefined;
     const probe=(async()=>{
@@ -150,10 +155,11 @@ export class ClaudeAdapter extends EventEmitter {
       await ensureClaudeChild(this.home,this.config,peer,beforeLaunch,undefined,undefined,prepared?.sessionId===peer.sessionId?prepared.profile:baseline);
       this.restartLaunches.delete(peer.id);return;
     }
-    let binding=nativeOwnership(this.home,peer.id);
-    if(binding?.sessionId&&binding.sessionId!==peer.sessionId)throw new BridgeError('session_changed','后台启动记录属于后继会话，未恢复旧会话或覆盖启动记录。');
-    const agents=await this.list(peer.sessionId??undefined,affinity?.configHome??binding?.configHome);
-    if(binding?.releasedToUser)throw new BridgeError('process_owned_by_user','该后台会话已经交给用户窗口，未自动恢复。');
+    const previous=nativeOwnership(this.home,peer.id,{includePreviousBoot:true});
+    if(previous?.sessionId&&previous.sessionId!==peer.sessionId)throw new BridgeError('session_changed','后台启动记录属于后继会话，未恢复旧会话或覆盖启动记录。');
+    if(previous?.releasedToUser)throw new BridgeError('process_owned_by_user','该后台会话已经交给用户窗口，未自动恢复。');
+    let binding=predatesLinuxBoot(previous?.bootId)?undefined:previous;
+    const agents=await this.list(peer.sessionId??undefined,affinity?.configHome??previous?.configHome);
     if(binding?.phase==='intent'){
       const launched=agents.filter(a=>a.kind==='background'&&a.id===binding!.handle&&a.sessionId===peer.sessionId);
       if(launched.length!==1)throw new BridgeError('claude_start_pending','上次后台启动结果尚未核验，未重复恢复。');
@@ -167,14 +173,17 @@ export class ClaudeAdapter extends EventEmitter {
       if(existing.kind!=='background')throw new BridgeError('process_owned_by_user','该会话已由前台窗口运行，未认领用户窗口。');
       if(binding?.phase==='bound'){await captureNativeProcess(binding,existing);return;}
       const actual=await processIdentity(existing.pid);
-      if(ownedProcesses(this.home).records.some(value=>!value.releasedToUser&&value.role==='claude-native'&&value.peerId===peer.id&&value.identity.pid===actual.pid&&value.sessionId===peer.sessionId&&value.identity.startedAt===actual.startedAt))return;
+      if(ownedProcesses(this.home).records.some(value=>!value.releasedToUser&&value.role==='claude-native'&&value.peerId===peer.id&&value.sessionId===peer.sessionId&&ownedRecordMatchesGeneration(value,actual)))return;
       throw new BridgeError('claude_launch_unverified','同一会话的在线进程不是 nxbridge 启动的，未认领用户窗口。');
     }
     if(binding?.native&&await ownedProcessState(binding.native)!=='dead')throw new BridgeError('claude_start_pending','原后台进程尚未核验退出，未重复恢复。');
     if(binding){
                                                                     
       const managed=agents.some(agent=>agent.kind==='background'&&agent.id===binding!.handle&&agent.sessionId===peer.sessionId&&['working','blocked'].includes(agent.state));
-      const controllers=ownedProcesses(this.home).records.filter(value=>value.role==='claude-native'&&!value.releasedToUser&&value.peerId===peer.id&&value.sessionId===peer.sessionId&&value.proof.launchId===binding!.id&&(value.identity.pid!==binding!.native?.pid||value.identity.startedAt!==binding!.native?.startedAt));
+      const controllers=ownedProcesses(this.home).records.filter(value=>value.role==='claude-native'&&!value.releasedToUser&&
+        value.peerId===peer.id&&value.sessionId===peer.sessionId&&value.proof.launchId===binding!.id&&
+        (process.platform!=='linux'||!ownedRecordPredatesBoot(value))&&
+        (value.identity.pid!==binding!.native?.pid||value.identity.startedAt!==binding!.native?.startedAt));
       const rebuilding=managed||(await Promise.all(controllers.map(value=>ownedProcessState(value.identity)))).some(state=>state!=='dead');
       const current=nativeOwnership(this.home,peer.id);
       if(current?.id!==binding.id||current.releasedToUser)throw new BridgeError('process_record_changed','核验退出期间后台归属已改变，未重复恢复。');
@@ -185,8 +194,10 @@ export class ClaudeAdapter extends EventEmitter {
       }
     }
     this.nativeRestartWaits.delete(peer.id);
-    const prepared=this.restartLaunches.get(peer.id),launch=prepared?.sessionId===peer.sessionId?prepared.launch:await prepareOwnedLaunch(await selectSessionLaunch('claude',this.config,{home:this.home,cwd:peer.cwd,sessionId:peer.sessionId??undefined,configHome:affinity?.configHome??binding?.configHome,executable:binding?.executable??affinity?.executable,profileId:binding?.profileId??affinity?.profileId}));
+    const prepared=this.restartLaunches.get(peer.id),launch=prepared?.sessionId===peer.sessionId?prepared.launch:await prepareOwnedLaunch(await selectSessionLaunch('claude',this.config,{home:this.home,cwd:peer.cwd,sessionId:peer.sessionId??undefined,configHome:affinity?.configHome??previous?.configHome,executable:previous?.executable??affinity?.executable,profileId:previous?.profileId??affinity?.profileId}));
     if(restoreState(peer,launch.configHome)==='gone')throw new BridgeError('session_not_found','原配置目录中没有该 Claude 会话，请先在原生窗口恢复原会话。');
+    const current=nativeOwnership(this.home,peer.id,{includePreviousBoot:true}),expected=binding??previous;
+    if(current?.id!==expected?.id||current?.bootId!==expected?.bootId||current?.releasedToUser)throw new BridgeError('process_record_changed','准备恢复期间后台归属已改变，未覆盖当前记录。');
     let intent:NativeOwnership={...await beginNativeLaunch(this.home,peer,launch.configHome),executable:launch.executable.command,profileId:launch.profile?.id,hostVersion:launch.profile?.version};saveNativeOwnership(intent);
     intent=await this.submitLaunch(peer,intent,launch,['--resume',peer.sessionId!,'--bg'],beforeLaunch);
     for(let i=0;i<20;i++){
@@ -198,7 +209,7 @@ export class ClaudeAdapter extends EventEmitter {
   }
   async createManualCopy(peer:Peer,source:NativeOwnership,beforeLaunch:()=>void|Promise<void>):Promise<string>{
     this.requireMember(peer);
-    if(peer.owner!=='nxbridge'||peer.sessionId!==source.sessionId||source.releasedToUser)throw new BridgeError('claude_launch_unverified','自动权限恢复缺少原后台启动证明。');
+    if(peer.owner!=='nxbridge'||peer.sessionId!==source.sessionId||source.releasedToUser||predatesLinuxBoot(source.bootId))throw new BridgeError('claude_launch_unverified','自动权限恢复缺少原后台启动证明。');
     if(nativeOwnership(this.home,peer.id))throw new BridgeError('claude_start_pending','后台已有未结算启动，未重复创建权限恢复副本。');
     const launch=await prepareOwnedLaunch(await selectSessionLaunch('claude',this.config,{home:this.home,cwd:peer.cwd,sessionId:peer.sessionId!,configHome:source.configHome,executable:source.executable,profileId:source.profileId}));
     await beforeLaunch();
@@ -233,10 +244,14 @@ export class ClaudeAdapter extends EventEmitter {
   }
   async assertIdleWorkload(peer:Peer,endpoint:Endpoint):Promise<void>{
     if(!endpoint.pid||!endpoint.procStart)throw new BridgeError('runtime_workload_unverified','缺少原生进程代次，未停止 Claude。');
+    const child=claudeChild(this.home,peer.id),binding=nativeOwnership(this.home,peer.id,{includePreviousBoot:true});
+    if(predatesLinuxBoot(child?.bootId)||predatesLinuxBoot(binding?.bootId))throw new BridgeError('process_record_changed','上次系统启动的进程归属已失效，未停止 Claude。');
     const native=await processIdentity(endpoint.pid);
     if(native.startedAt!==endpoint.procStart)throw new BridgeError('process_record_changed','原生 Claude 代次已改变，未停止。');
-    const child=claudeChild(this.home,peer.id),binding=nativeOwnership(this.home,peer.id),identities=[child?.worker,child?.wrapper,child?.native,binding?.native].filter(Boolean);
-    const owners=ownedProcesses(this.home).records.filter(record=>!record.releasedToUser&&(record.peerId===peer.id&&(!record.sessionId||record.sessionId===peer.sessionId))&&(record.proof.launchId===binding?.id||identities.some(identity=>identity!.pid===record.identity.pid&&identity!.startedAt===record.identity.startedAt)||record.native?.pid===native.pid&&record.native.startedAt===native.startedAt));
+    const identities=[child?.worker,child?.wrapper,child?.native,binding?.native].filter(Boolean);
+    const owners=ownedProcesses(this.home).records.filter(record=>!record.releasedToUser&&!(process.platform==='linux'&&ownedRecordPredatesBoot(record))&&
+      record.peerId===peer.id&&(!record.sessionId||record.sessionId===peer.sessionId)&&
+      (record.proof.launchId===binding?.id||identities.some(identity=>identity!.pid===record.identity.pid&&identity!.startedAt===record.identity.startedAt)||record.native?.pid===native.pid&&record.native.startedAt===native.startedAt));
     const configHome=endpoint.configHome??child?.configHome??binding?.configHome;
     const commands=configHome?nxbridgeMcpCommands(this.home,'claude',configHome):[];
     for(const file of [configHome&&path.join(configHome,'.claude.json'),path.join(peer.cwd,'.mcp.json')]){
@@ -248,7 +263,7 @@ export class ClaudeAdapter extends EventEmitter {
   async release(peer:Peer,beforeStop?:(agent:any)=>void|Promise<void>):Promise<void>{
     if(peer.owner!=='nxbridge')throw new BridgeError('process_owned_by_user','用户窗口不由 nxbridge 停止。');
     const child=claudeChild(this.home,peer.id)??(peer.sessionId?findClaudeChild(this.home,peer.sessionId):undefined);if(child){
-      if(beforeStop){
+      if(beforeStop&&!predatesLinuxBoot(child.bootId)){
         const current=await childCall(this.home,child,'status'),health=current.health;
         if(current.sessionId!==peer.sessionId||current.phase!=='active'||current.human||!health||!['ready','failed'].includes(health.state)||health.tools.length||current.native?.pid!==child.native?.pid||current.native?.startedAt!==child.native?.startedAt)throw new BridgeError('session_busy','托管 Claude 仍在工作或身份无法核验，未自动停止。');
         await beforeStop({status:'idle',pid:current.native?.pid,worker:current});
@@ -256,31 +271,64 @@ export class ClaudeAdapter extends EventEmitter {
       }else await stopClaudeChild(this.home,child);
       return;
     }
-    let binding=nativeOwnership(this.home,peer.id);
-    if(binding?.phase==='failed'){forgetNativeOwnership(binding);return;}
-    const sessionId=peer.sessionId??binding?.sessionId,records=ownedProcesses(this.home).records.filter(value=>value.role==='claude-native'&&value.peerId===peer.id&&(!sessionId||value.sessionId===sessionId));
+    let binding=nativeOwnership(this.home,peer.id,{includePreviousBoot:true});
     if(binding?.releasedToUser)throw new BridgeError('process_owned_by_user','该后台会话已经交给用户窗口，未停止。');
+    if(binding?.phase==='failed'){forgetNativeOwnership(binding);return;}
+    const previousBoot=predatesLinuxBoot(binding?.bootId);
+    const readOwned=()=>ownedProcesses(this.home).records.filter(value=>value.role==='claude-native'&&value.peerId===peer.id&&(!previousBoot||ownedRecordPredatesBoot(value)));
+    const releaseRecords=readOwned();
+    const sessionId=peer.sessionId??binding?.sessionId,records=releaseRecords.filter(value=>!sessionId||value.sessionId===sessionId);
     if(!binding&&!records.length){if(!peer.sessionId)return;throw new BridgeError('claude_launch_unverified','缺少后台会话启动归属，保留进程。请运行 doctor 核对。');}
     if(binding?.sessionId&&peer.sessionId&&binding.sessionId!==peer.sessionId)throw new BridgeError('session_changed','后台归属与要释放的会话不符，未停止。');
+    const changed=()=>new BridgeError('process_record_changed','Claude 后台的停止归属已经变化，已保留当前归属记录。');
+    const assertOriginalBinding=()=>{
+      const current=nativeOwnership(this.home,peer.id,{includePreviousBoot:true});
+      if(!binding){if(current)throw changed();return;}
+      if(!current||current.id!==binding.id||current.bootId!==binding.bootId||current.phase!==binding.phase||current.releasedToUser||
+        current.peerId!==binding.peerId||current.sessionId!==binding.sessionId||current.handle!==binding.handle||
+        current.native?.pid!==binding.native?.pid||current.native?.startedAt!==binding.native?.startedAt||
+        !sameDirectory(current.home,binding.home)||!sameDirectory(current.configHome,binding.configHome))throw changed();
+    };
     const directory=binding?.configHome??records[0]?.configHome??selectHostLaunch('claude',this.config,{sessionId:sessionId??undefined}).configHome;
                                   
-    const available=await nativeSupervisorAvailable(directory);
+    const available=!previousBoot&&await nativeSupervisorAvailable(directory);
     const agents=available?await this.list(sessionId??undefined,directory):[],matches=agents.filter(value=>sessionId?value.sessionId===sessionId:value.id===binding?.handle);
     if(matches.length>1)throw new BridgeError('ambiguous_background','同一会话存在多个后台实例，未停止。');
     const agent=matches[0];
     if(agent){
       if(agent.kind!=='background')throw new BridgeError('process_owned_by_user','当前会话由前台窗口运行，未停止用户窗口。');
-      if(binding?.phase==='intent')binding=await bindNativeLaunch(binding,agent);
-      const native=agent.pid?await processIdentity(agent.pid):undefined;
-      const proven=!!binding?.handle&&binding.handle===agent.id||records.some(value=>value.identity.pid===native?.pid&&value.identity.startedAt===native.startedAt);
-      if(!proven)throw new BridgeError('claude_launch_unverified','当前后台 handle 不属于已记录的启动，未停止。');
-      if(binding)binding=await captureNativeProcess(binding,agent);
+      let assertStopAuthority=assertOriginalBinding;
+      if(binding){
+        const capture=binding.phase==='intent'?bindNativeLaunch:captureNativeProcess;
+        binding=await capture(binding,agent);
+      }else{
+        const native=agent.pid?await processIdentity(agent.pid):undefined;
+        const recorded=native&&records.find(value=>!value.releasedToUser&&ownedRecordMatchesGeneration(value,native));
+        if(!recorded||!native)throw new BridgeError('claude_launch_unverified','当前后台 handle 不属于已记录的启动，未停止。');
+        assertStopAuthority=()=>{
+          assertOriginalBinding();
+          if(!readOwned().some(value=>value.id===recorded.id&&!value.releasedToUser&&value.handle===recorded.handle&&
+            value.sessionId===recorded.sessionId&&value.configHome===recorded.configHome&&
+            value.proof.kind===recorded.proof.kind&&value.proof.launchId===recorded.proof.launchId&&ownedRecordMatchesGeneration(value,native)))throw changed();
+        };
+      }
+      assertStopAuthority();
       await beforeStop?.(agent);
-      await runCli('claude',['stop',agent.id],{config:this.config,home:this.home,sessionId:sessionId??undefined,launch:selectHostLaunch('claude',this.config,{home:this.home,sessionId:sessionId??undefined,configHome:directory})});
+      await runCli('claude',['stop',agent.id],{config:this.config,home:this.home,sessionId:sessionId??undefined,
+        launch:selectHostLaunch('claude',this.config,{home:this.home,sessionId:sessionId??undefined,configHome:directory}),beforeSpawn:assertStopAuthority});
     }
-    for(const record of ownedProcesses(this.home).records.filter(value=>value.role==='claude-native'&&value.peerId===peer.id))await releaseOwnedProcess(record);
-    if(binding?.phase==='intent')throw new BridgeError(binding.handle?'claude_release_pending':'claude_release_unresolved',binding.handle?'原生后台启动结果尚未确认，保留归属记录，稍后重试。':'仅剩未结算启动记录，缺少可解析 handle 和可核验进程；停止自动回收重试，保留证据，请运行 nxbridge doctor 后显式 retire。');
-    if(binding)forgetNativeOwnership(nativeOwnership(this.home,peer.id)??binding);
+    const selected=new Set(releaseRecords.map(record=>record.id));
+    for(let pending=releaseRecords;;pending=[]){
+      assertOriginalBinding();
+                                     
+      if(binding)for(const record of readOwned())if(record.proof.launchId===binding.id&&!selected.has(record.id)){
+        selected.add(record.id);pending.push(record);
+      }
+      if(!pending.length)break;
+      for(const record of pending)await releaseOwnedProcess(record,assertOriginalBinding);
+    }
+    if(!previousBoot&&binding?.phase==='intent')throw new BridgeError(binding.handle?'claude_release_pending':'claude_release_unresolved',binding.handle?'原生后台启动结果尚未确认，保留归属记录，稍后重试。':CLAUDE_UNRESOLVED_LAUNCH_NOTICE);
+    if(binding)forgetNativeOwnership(binding);
   }
   close():void{this.replySockets.close();}
 }

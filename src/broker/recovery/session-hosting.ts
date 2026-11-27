@@ -3,6 +3,7 @@ import {BridgeError,describeError} from '../../shared/errors.js';
 import {type Endpoint,type Peer,type BridgeConfig} from '../../types.js';
 import type { SessionPolicy } from '../../hosts/codex/codex-session-profile.js';
 import { readSessionProfile, sessionFile } from '../../hosts/codex/codex-session-profile.js';
+import { timeCodexRestart, traceCodexRestartTarget, withCodexRestartTiming } from '../../hosts/codex/codex-restart-timing.js';
 import {sameDirectory} from '../../shared/files.js';
 import { prepareOwnedLaunch } from '../../hosts/host-launch.js';
 import { selectSessionLaunch } from '../../hosts/session-launch.js';
@@ -100,7 +101,10 @@ export class SessionTransfers {
   }
   private run(peer:Peer,kind:'adopt'|'release',work:()=>Promise<unknown>):Promise<unknown>{
     const pending=this.pending.get(peer.id);if(pending?.kind===kind)return pending.work;
-    const execute=pending?pending.work.catch(()=>{}).then(work):work(),next=execute.finally(()=>{if(this.pending.get(peer.id)?.work===next)this.pending.delete(peer.id);});this.pending.set(peer.id,{kind,work:next});return next;
+    const run=()=>withCodexRestartTiming({kind:kind==='adopt'?'hosting_restore':'hosting_release'},timing=>this.store.event('codex.restart.timing',timing),()=>{
+      traceCodexRestartTarget(peer,this.store.endpoint(peer.id));return work();
+    });
+    const execute=pending?pending.work.catch(()=>{}).then(run):run(),next=execute.finally(()=>{if(this.pending.get(peer.id)?.work===next)this.pending.delete(peer.id);});this.pending.set(peer.id,{kind,work:next});return next;
   }
   private waiting(peer:Peer):unknown{const live=!!this.store.endpoint(peer.id)&&peer.state!=='offline';this.store.updatePeer(peer.id,{owner:'user'});writeHosting(this.store,this.store.peer(peer.id),{background:false,released:true,phase:live?undefined:'awaiting_window',reason:undefined,userStep:live?undefined:'按平时方式重新打开原 Codex 会话。',attempts:0,nextAt:undefined});return{status:'paired',hosting:this.view(this.store.peer(peer.id))};}
   async wait(peer:Peer):Promise<unknown>{this.assert(peer);if(this.pending.has(peer.id)||runtimeFor(this.home,{peerId:peer.id}))return this.release(peer);return this.waiting(peer);}
@@ -150,7 +154,7 @@ export class SessionTransfers {
         await this.assertNoExternalHolder(peer);guard();
         const affinity=this.store.setting<any>('managedLaunchProof:'+peer.id),launch=await prepareOwnedLaunch(await selectSessionLaunch('codex',this.config,{home:this.home,sessionId:id,configHome:home,cwd:peer.cwd,...(affinity?.executable?{executable:affinity.executable,profileId:affinity.profileId}:{})},{writer:profile.meta.cli_version}));
         guard();this.store.setSetting('managedLaunchProof:'+peer.id,{sessionId:id,configHome:home,executable:launch.executable.command,profileId:launch.profile?.id,version:launch.version!.trim(),adopted:true});
-        await this.ops.prepare(this.store.peer(peer.id));guard(false);
+        await timeCodexRestart('prepare_hosting',()=>this.ops.prepare(this.store.peer(peer.id)));guard(false);
         if(!this.store.endpoint(peer.id)||this.store.peer(peer.id).state==='offline')throw new BridgeError('policy_verification_failed','原会话尚未完成权限核验，消息继续保留。');
         writeHosting(this.store,this.store.peer(peer.id),{phase:undefined,verified:true,reason:undefined,userStep:undefined,attempts:0,nextAt:undefined});this.store.event('hosting.adopted',{peerId:peer.id,pairId:pair.id,sessionId:id});
         return{status:'paired',hosting:this.view(this.store.peer(peer.id))};
@@ -179,7 +183,7 @@ export class SessionTransfers {
       if(!endpoint)throw new BridgeError('holder_unknown','没有可核验的原后台端点，未报告可以打开原会话。');
       const pairId=this.store.pairFor(peer.id)!.id,id=peer.sessionId!,guard=()=>{const current=this.store.peer(peer.id);this.ops.enabled(current);const record=hostingRecord(this.store,current);if(current.sessionId!==id||this.store.pairFor(current.id)?.id!==pairId||!record?.released)throw new BridgeError('session_changed','释放期间会话或选择已变化。');};
       this.store.transaction(()=>{this.store.updatePeer(peer.id,{owner:'user'});writeHosting(this.store,this.store.peer(peer.id),{background:false,released:true,phase:'releasing',reason:undefined,verified:false});});
-      try{await this.ops.stop(this.store.peer(peer.id),endpoint,guard);guard();closeHostedWindow(this.store,this.store.peer(peer.id));writeHosting(this.store,this.store.peer(peer.id),{phase:'awaiting_window',verified:true,userStep:`原后台已退出。按平时方式打开原会话 ${id}（目录 ${peer.cwd}）。`});return{status:'paired',hosting:this.view(this.store.peer(peer.id))};}
+      try{await timeCodexRestart('old_runtime',()=>this.ops.stop(this.store.peer(peer.id),endpoint,guard));guard();closeHostedWindow(this.store,this.store.peer(peer.id));writeHosting(this.store,this.store.peer(peer.id),{phase:'awaiting_window',verified:true,userStep:`原后台已退出。按平时方式打开原会话 ${id}（目录 ${peer.cwd}）。`});return{status:'paired',hosting:this.view(this.store.peer(peer.id))};}
       catch(error){this.failed(this.store.peer(peer.id),error,'releasing');throw error;}
     });
   }

@@ -31,11 +31,23 @@ export class DeliveryHealth {
         }
         return;
       }
-      value.notices=value.notices.filter(n=>n.state==='pending'||n.state==='sending'||waitingIdle(n)&&n.kind!==notice.kind);value.notices.push(notice);this.storage.setSetting(key,value);
+      value.notices=value.notices.filter(n=>n.retainUntilReconciled||n.state==='pending'||n.state==='sending'||waitingIdle(n)&&n.kind!==notice.kind);value.notices.push(notice);this.storage.setSetting(key,value);
     });
   }
   cancel(pairId:string,recipientId:string,id:string):void{
     this.storage.transaction(()=>{const key=deliveryHealthKey(pairId,recipientId),value=this.storage.setting<DeliveryIncident>(key),notice=value?.notices.find(n=>n.id===id&&!n.admitted&&(n.state==='pending'||n.state==='sending'));if(notice){notice.state='denied';notice.error='condition resolved before delivery';this.storage.setSetting(key,value);}});
+  }
+  reconcileNotice(pairId:string,recipientId:string,id:string):boolean{
+    return this.storage.transaction(()=>{
+      const key=deliveryHealthKey(pairId,recipientId),value=this.storage.setting<DeliveryIncident>(key),notice=value?.notices.find(n=>n.id===id);
+      if(!value||!notice)return false;
+      delete notice.retainUntilReconciled;
+      if(!notice.admitted&&(notice.state==='pending'||notice.state==='sending')){
+        notice.state='denied';notice.error='condition resolved before delivery';
+      }
+      this.storage.setSetting(key,value);
+      return notice.admitted===true;
+    });
   }
   cancelSource(pairId:string,recipientId:string,source:string):void{
     this.storage.transaction(()=>{
@@ -146,7 +158,7 @@ export class DeliveryHealth {
       const signature=JSON.stringify(messages.map(({id,state})=>[id,state]).sort((a,b)=>a[0]!.localeCompare(b[0]!)));
       if(value.restartSignature===signature)return;
       value.restartSignature=signature;const id=randomUUID();
-      value.notices=value.notices.filter(n=>n.kind!=='bridge_restart'&&(n.state==='pending'||n.state==='sending'||waitingIdle(n)));
+      value.notices=value.notices.filter(n=>n.retainUntilReconciled||n.kind!=='bridge_restart'&&(n.state==='pending'||n.state==='sending'||waitingIdle(n)));
       value.notices.push({id,state:'pending',kind:'bridge_restart',message:`nxbridge runtime monitor (not partner reply or user msg): bridge restarted; undelivered msgs rechecked. pending: ${countsText(counts)}${recoveredSending?'; '+recoveredSending+' interrupted sends now unknown':''}. only safely unsent msgs retry; unknown msgs never auto-replayed; nothing resent`});
       this.storage.setSetting(key,value);this.storage.event('health.delivery.restart',{pairId:pair.id,senderId:sender.id,noticeId:id,counts,recoveredSending});
     });

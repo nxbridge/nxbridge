@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { restartCommand } from '../app/commands/restart-command.js';
+import { restartCommand, restartResultCommand } from '../app/commands/restart-command.js';
 import { listenBroker } from '../ipc/ipc.js';
 import {ensureHome} from '../ipc/home.js';
 import {ipcAddress} from '../shared/local-paths.js';
@@ -9,7 +9,7 @@ import { processIdentity } from '../process/process.js';
 import { temporary } from './support/temporary.js';
 import {BridgeError} from '../shared/errors.js';
 
-for(const outcome of ['completed','failed'] as const)test(`单组重启回复断连后等待持久${outcome==='completed'?'完成':'失败'}结果，不重复执行或重建协调器`,async t=>{
+for(const outcome of ['completed','failed','timeout'] as const)test(`单组重启回复断连后等待持久${outcome==='completed'?'完成':outcome==='failed'?'失败':'超时'}结果，不重复执行或重建协调器`,async t=>{
   const home=temporary(t);await ensureHome(home);let restartCalls=0,resultCalls=0,saved:any;
   let completion:NodeJS.Timeout|undefined;t.after(()=>clearTimeout(completion));
   const server=net.createServer(socket=>{
@@ -23,14 +23,21 @@ for(const outcome of ['completed','failed'] as const)test(`单组重启回复断
         restartCalls++;completion=setTimeout(()=>saved={requestId:request.params.request_id,text:'确认已完成的重启'},450);socket.destroy();continue;
       }else if(request.method==='codex.restart.result'){
         resultCalls++;
-        if(!saved||outcome==='failed'){socket.write(JSON.stringify({jsonrpc:'2.0',id:request.id,error:{code:saved?'restart_incomplete':'restart_result_missing',message:saved?'原 ID 未完整恢复':'结果尚未落盘'}})+'\n');continue;}
-        assert.equal(request.params.request_id,saved.requestId);result={text:saved.text};
+        if(!saved)result={request_id:request.params.request_id,state:'pending'};
+        else{
+          assert.equal(request.params.request_id,saved.requestId);
+          if(outcome!=='completed'){socket.write(JSON.stringify({jsonrpc:'2.0',id:request.id,error:{code:outcome==='timeout'?'timeout':'restart_incomplete',message:'原 ID 未完整恢复',data:{operation:'codex.restart'}}})+'\n');continue;}
+          result={text:saved.text};
+        }
       }else throw Error('意外的方法 '+request.method);
       socket.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result})+'\n');
     }});
   });
   await new Promise<void>(resolve=>server.listen(ipcAddress(home),resolve));t.after(()=>new Promise<void>(resolve=>server.close(()=>resolve())));
-  if(outcome==='completed')assert.equal((await restartCommand({},home)).text,'确认已完成的重启');else await assert.rejects(restartCommand({},home),{code:'restart_incomplete',uncertain:false});
+  let requestId:string|undefined;
+  const work=restartCommand({},home,id=>{requestId=id;});
+  if(outcome==='completed'){const {text}=await work;assert.match(text,/^确认已完成的重启/);assert.ok(requestId&&text.includes(requestId));}
+  else await assert.rejects(work,{code:outcome==='timeout'?'timeout':'restart_incomplete',uncertain:false});
   assert.equal(restartCalls,1);assert.ok(resultCalls>=2);
 });
 
@@ -41,7 +48,7 @@ test('独立协调器保留原身份，仅重启选中会话，不影响其他�
     if(method==='codex.restart.target'){assert.equal(params.session_id,'project-a');return{owner:'nxbridge',session_id:'project-a',runtime:{pid:2147483647,procStart:'gone'},broker:{pid:process.pid,generation:'kept',windowsIndependent:true}};}
     assert.equal(method,'codex.restart');assert.equal(params.session_id,'project-a');assert.equal(params.broker_pid,process.pid);assert.equal(params.broker_generation,'kept');restarts++;return{text:'原会话已恢复'};
   });t.after(()=>server.close());
-  assert.equal((await restartCommand({session_id:'project-a'},home)).text,'原会话已恢复');assert.equal(restarts,1);
+  assert.match((await restartCommand({session_id:'project-a'},home)).text,/^原会话已恢复/);assert.equal(restarts,1);
 });
 
 test('重启调用属于目标宿主时先拒绝，不停止自身或其他会话',async t=>{
@@ -71,6 +78,19 @@ test('搭档命令从预检到停止保留原生调用方及配对围栏，拒�
     assert.equal(method,'codex.restart');assert.equal(params.peer_id,'chosen');assert.equal(params.pair_id,'pair');assert.equal(params.session_id,'same');
     if(failure)throw new BridgeError(failure,'拒绝原因');return{text:'原会话恢复'};
   });t.after(()=>server.close());
-  assert.equal((await restartCommand({native,partner:true},home)).text,'原会话恢复');
+  assert.match((await restartCommand({native,partner:true},home)).text,/^原会话恢复/);
   for(const code of ['session_busy','subagent_active','shared_runtime']){failure=code;await assert.rejects(restartCommand({native,partner:true},home),(error:any)=>{assert.equal(error.code,code);assert.match(error.message,code!=='shared_runtime'?/空闲后再尝试一次.*不要轮询/:/停止自动重试.*告知用户/);return true;});}
+});
+
+test('显式按请求 ID 查询仅访问只读结果，区分执行中、确定完成与断档',async t=>{
+  const home=temporary(t);await ensureHome(home);let state:'pending'|'done'|'unknown'='pending';
+  const server=await listenBroker(home,async(method,params)=>{
+    assert.equal(method,'codex.restart.result');assert.deepEqual(params,{request_id:'request-id'});
+    if(state==='pending')return{request_id:'request-id',state};
+    if(state==='unknown')throw new BridgeError('restart_result_unknown','曾登记、已无在途结果');
+    return{text:'原会话已经恢复'};
+  });t.after(()=>server.close());
+  assert.match((await restartResultCommand('request-id',home)).text,/request-id/);
+  state='done';assert.match((await restartResultCommand('request-id',home)).text,/^原会话已经恢复/);
+  state='unknown';await assert.rejects(restartResultCommand('request-id',home),{code:'restart_result_unknown',uncertain:true});
 });

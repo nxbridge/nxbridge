@@ -49,11 +49,14 @@ export class HealthNoticePolicy {
   sameFact(recipient:string,notice:RuntimeNotice):boolean{return notice.factKey!==undefined&&this.state(recipient)?.kinds[notice.kind??notice.source??'runtime']?.factKey===notice.factKey;}
   eligible(recipient:string,notice:RuntimeNotice,now=Date.now()):boolean{
     if(noticeTier(notice)<3)return false;
+    if(notice.recipientSessionId!==undefined&&this.storage.getPeer?.(recipient)?.sessionId!==notice.recipientSessionId)return false;
+    if(notice.subjectSession&&this.storage.getPeer?.(notice.subjectSession.id)?.sessionId!==notice.subjectSession.sessionId)return false;
     const retry=notice.retryBeforeSubmit===true;
     if(retry&&this.retryHold(recipient,notice))return false;
     const state=this.state(recipient);
     const last=state?.kinds[notice.kind??notice.source??'runtime'];
     if(!retry&&notice.factKey!==undefined&&last?.factKey===notice.factKey)return false;
+    if(notice.source==='takeover_permission_change'||notice.source==='takeover_permission_result')return true;
                                           
     if(!retry&&(notice.kind==='explicit_recovery'||notice.source==='managed_recovery'&&notice.factKey
       &&/^codex_recycle_(?:decision|result|held|acceptance_lapsed):/.test(notice.kind??'')))return true;

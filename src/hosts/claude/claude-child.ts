@@ -18,7 +18,7 @@ import {type BridgeConfig,type Peer,type RegisterInput} from '../../types.js';
 import { ClaudeStreamHealth } from './claude-stream.js';
 import type { TurnHealth } from '../../broker/health/turn-health.js';
 import { rotateLog } from '../../storage/logs.js';
-import {ownedProcesses,recordOwnedProcess,registerCurrentProcess,releaseOwnedProcess,rememberOwnedChild,type OwnedProcessRecord} from '../../process/owned-processes.js';
+import {currentLinuxBootId,isCurrentLinuxBoot,ownedProcesses,ownedRecordMatchesGeneration,predatesLinuxBoot,recordOwnedProcess,registerCurrentProcess,releaseOwnedProcess,rememberOwnedChild,type OwnedProcessRecord} from '../../process/owned-processes.js';
 import { ownedProcessState, stopOwnedProcess } from '../../process/process-stop.js';
 import { disabledMember } from '../../broker/member-control.js';
 import { ownedClaudeArgs, claudeInboxLaunchArgs } from '../owned-launch-policy.js';
@@ -41,17 +41,23 @@ export interface ClaudeChildRecord {
   launchSourcePermission?:PermissionClass;
   modelProfile?:ModelProfile;
   idleStop?:true;
-  launchId?:string;
+  launchId?:string;bootId?:string;
 }
 const key=(id:string)=>createHash('sha256').update(id).digest('hex').slice(0,16);
 export const claudeChildFile=(home:string,id:string)=>path.join(home,'run','claude-child-'+key(id)+'.json');
+function currentChildState(record:ClaudeChildRecord):ClaudeChildRecord{
+  if(!predatesLinuxBoot(record.bootId))return record;
+                                     
+  return {...record,phase:['starting','active'].includes(record.phase)?'stopped':record.phase,
+    worker:undefined,wrapper:undefined,native:undefined,foreground:undefined,registration:undefined,health:undefined,human:undefined};
+}
 export function claudeChild(home:string,id:string):ClaudeChildRecord|undefined{
-  try{const value=readJson<ClaudeChildRecord>(claudeChildFile(home,id));return value.version===1&&value.peerId===id?value:undefined;}catch{return;}
+  try{const value=readJson<ClaudeChildRecord>(claudeChildFile(home,id));return value.version===1&&value.peerId===id?currentChildState(value):undefined;}catch{return;}
 }
 export function findClaudeChild(home:string,sessionId:string):ClaudeChildRecord|undefined{
   if(!existsSync(path.join(home,'run')))return;
   const records=readdirSync(path.join(home,'run')).filter(n=>/^claude-child-[a-f0-9]+\.json$/.test(n)).flatMap(n=>{try{return[readJson<ClaudeChildRecord>(path.join(home,'run',n))];}catch{return[];}}).filter(v=>v.version===1&&v.sessionId===sessionId);
-  if(records.length>1)throw new BridgeError('ambiguous_endpoint','同一 Claude 会话有多个托管记录，未启动新进程。');return records[0];
+  if(records.length>1)throw new BridgeError('ambiguous_endpoint','同一 Claude 会话有多个托管记录，未启动新进程。');return records[0]&&currentChildState(records[0]);
 }
 export function claudeHistoryExists(configHome:string,sessionId:string):boolean{
   const projects=path.join(configHome,'projects');if(!/^[a-f0-9-]{36}$/i.test(sessionId)||!existsSync(projects))return false;
@@ -61,15 +67,28 @@ async function alive(identity?:Pick<ProcessIdentity,'pid'|'startedAt'>):Promise<
   if(!identity||!liveProcess(identity.pid))return false;
   try{const current=await processIdentity(identity.pid);return current.startedAt===identity.startedAt&&!['Z','X'].includes(current.state??'');}catch(error){if((error as BridgeError).code==='process_missing')return false;throw error;}
 }
-async function stopProcess(home:string,identity?:Pick<ProcessIdentity,'pid'|'startedAt'>):Promise<void>{
-  if(!identity)return;
-  const records=ownedProcesses(home).records.filter(value=>value.identity.pid===identity.pid&&value.identity.startedAt===identity.startedAt),proof=records.find(value=>value.windowsJob||value.posixGroup)??records[0];
-  if(proof)await releaseOwnedProcess(proof);else await stopOwnedProcess(identity);
+type ChildProcessOwnership={state:'current';proof:OwnedProcessRecord}|{state:'previous_boot'|'missing'|'unknown'};
+function childProcessOwnership(home:string,record:ClaudeChildRecord,identity:Pick<ProcessIdentity,'pid'|'startedAt'>):ChildProcessOwnership{
+  const records=ownedProcesses(home).records.filter(value=>value.peerId===record.peerId&&value.identity.pid===identity.pid&&value.identity.startedAt===identity.startedAt);
+  const current=records.filter(value=>ownedRecordMatchesGeneration(value,identity)&&(process.platform!=='linux'||isCurrentLinuxBoot(value.bootId)));
+  const proof=current.find(value=>value.windowsJob||value.posixGroup)??current[0];
+  if(proof)return{state:'current',proof};
+  return{state:records.length?records.every(value=>predatesLinuxBoot(value.bootId))?'previous_boot':'unknown':'missing'};
+}
+const unconfirmedChildOwnership=()=>new BridgeError('claude_child_orphan','托管父进程已退出，子进程缺少可核验的启动归属；保留进程和记录，请运行 doctor。');
+async function stopProcess(home:string,record:ClaudeChildRecord,identity?:Pick<ProcessIdentity,'pid'|'startedAt'>):Promise<void>{
+  if(!identity||predatesLinuxBoot(record.bootId))return;
+  const ownership=childProcessOwnership(home,record,identity);
+  if(ownership.state==='current'){await releaseOwnedProcess(ownership.proof);return;}
+  if(ownership.state==='previous_boot'||await ownedProcessState(identity)==='dead')return;
+  if(ownership.state==='missing'&&(process.platform!=='linux'||isCurrentLinuxBoot(record.bootId))){await stopOwnedProcess(identity);return;}
+  throw unconfirmedChildOwnership();
 }
 async function waitDead(identities:(Pick<ProcessIdentity,'pid'|'startedAt'>|undefined)[],timeout=4000):Promise<boolean>{
   const end=Date.now()+timeout;while((await Promise.all(identities.map(alive))).some(Boolean)){if(Date.now()>end)return false;await delay(50);}return true;
 }
 export async function childCall<T=ClaudeChildRecord>(home:string,record:ClaudeChildRecord,method:'status'|'interrupt'|'stop'|'profile'|'profile.get',params:unknown={},timeout=method==='profile'?10000:7000):Promise<T>{
+  if(predatesLinuxBoot(record.bootId))throw new BridgeError('claude_child_offline','上次系统启动的托管 Claude 已离线。');
   const rpc=await connectBroker(home,1000,record.address).catch(error=>{throw method==='profile'?profileChangeFailure(error,false):error;});try{return await rpc.request<T>(method,params,{timeout,mutation:!['status','profile.get'].includes(method)});}finally{rpc.close();}
 }
 export function childHandoff(home:string,id:string,phase:'user'|'stopped',handoffId:string,profile?:ModelProfile):void{
@@ -77,7 +96,7 @@ export function childHandoff(home:string,id:string,phase:'user'|'stopped',handof
   atomicJson(claudeChildFile(home,id),{...record,phase,...(profile?{modelProfile:{...record.modelProfile,...profile}}:{}),updatedAt:Date.now()});
 }
 
-const childGeneration=(record?:ClaudeChildRecord)=>record?JSON.stringify([record.launchId,record.sessionId,record.address,record.phase,record.worker,record.wrapper,record.native,record.foreground,record.handoffId]):undefined;
+const childGeneration=(record?:ClaudeChildRecord)=>record?JSON.stringify([record.bootId,record.launchId,record.sessionId,record.address,record.phase,record.worker,record.wrapper,record.native,record.foreground,record.handoffId]):undefined;
 async function reconcileStartingChild(home:string,record:ClaudeChildRecord):Promise<ClaudeChildRecord>{
   const pending=()=>new BridgeError('claude_child_pending','上次 worker 启动的结果尚未核验，未覆盖启动记录或创建第二份；请运行 nxbridge status 核对恢复状态。');
   let current:ClaudeChildRecord;
@@ -86,10 +105,10 @@ async function reconcileStartingChild(home:string,record:ClaudeChildRecord):Prom
   if(!latest)throw pending();
   if(childGeneration(latest)!==childGeneration(record))return latest;
   const worker=current.worker;
-  if(current.peerId!==record.peerId||current.sessionId!==record.sessionId||!worker||!await alive(worker)||!ownedProcesses(home).records.some(proof=>proof.role==='claude-worker'&&proof.peerId===record.peerId&&proof.sessionId===record.sessionId&&proof.identity.pid===worker.pid&&proof.identity.startedAt===worker.startedAt))throw pending();
+  if(current.peerId!==record.peerId||current.sessionId!==record.sessionId||predatesLinuxBoot(current.bootId)||!worker||!await alive(worker)||!ownedProcesses(home).records.some(proof=>proof.role==='claude-worker'&&!proof.releasedToUser&&proof.peerId===record.peerId&&proof.sessionId===record.sessionId&&ownedRecordMatchesGeneration(proof,worker)))throw pending();
                                                 
   if(childGeneration(claudeChild(home,record.peerId))!==childGeneration(record))throw pending();
-  atomicJson(claudeChildFile(home,record.peerId),current);return current;
+  const adopted={...current,bootId:currentLinuxBootId()};atomicJson(claudeChildFile(home,record.peerId),adopted);return adopted;
 }
 function failedChildSpawn(home:string,record:ClaudeChildRecord,error:unknown):void{
   const current=claudeChild(home,record.peerId);
@@ -97,7 +116,7 @@ function failedChildSpawn(home:string,record:ClaudeChildRecord,error:unknown):vo
 }
 export function recordClaudeForeground(home:string,id:string,pid:number,startedAt:string):void{
   const record=claudeChild(home,id);if(record?.phase!=='user'||record.foreground?.pid===pid&&record.foreground.startedAt===startedAt)return;
-  atomicJson(claudeChildFile(home,id),{...record,foreground:{pid,startedAt},updatedAt:Date.now()});
+  atomicJson(claudeChildFile(home,id),{...record,bootId:predatesLinuxBoot(record.bootId)?currentLinuxBootId():record.bootId,foreground:{pid,startedAt},updatedAt:Date.now()});
 }
 export async function ensureClaudeChild(home:string,config:BridgeConfig,peer:Peer,beforeLaunch?:()=>void|Promise<void>,sourcePermission?:PermissionClass,beforeCreate?:()=>void|Promise<void>,profile?:ModelProfile):Promise<ClaudeChildRecord>{
   const requireEnabled=()=>{if(disabledMember(home,{host:'claude',memberId:peer.id}))throw new BridgeError('member_disabled','此成员的 nxbridge 已关闭，未启动或恢复后台。');};requireEnabled();
@@ -112,17 +131,17 @@ export async function ensureClaudeChild(home:string,config:BridgeConfig,peer:Pee
     const current=await childCall(home,previous,'status');if(current.phase==='active'&&current.registration)return current;
     if(current.phase==='failed')throw new BridgeError('claude_child_failed',current.error??'托管 Claude 启动失败。');
   }else if(previous){
-                                                
+                                              
     if(previous.wrapper&&!previous.native){
-      const wrapper=previous.wrapper,container=ownedProcesses(home).records.find(value=>value.identity.pid===wrapper.pid&&value.identity.startedAt===wrapper.startedAt);
-      if(!container?.posixGroup&&!container?.windowsJob&&await alive(wrapper))previous.native=await nativeDescendant(wrapper.pid,'claude',0);
+      const wrapper=previous.wrapper,ownership=childProcessOwnership(home,previous,wrapper),proof=ownership.state==='current'?ownership.proof:undefined;
+      if((ownership.state==='current'||ownership.state==='missing')&&(process.platform!=='linux'||isCurrentLinuxBoot(previous.bootId))&&!proof?.posixGroup&&!proof?.windowsJob&&await alive(wrapper))previous.native=await nativeDescendant(wrapper.pid,'claude',0);
     }
-    requireEnabled();await stopProcess(home,previous.native);requireEnabled();await stopProcess(home,previous.wrapper);
+    requireEnabled();await stopProcess(home,previous,previous.native);requireEnabled();await stopProcess(home,previous,previous.wrapper);
   }
   if(!previous||!await alive(previous.worker)){
     const launch=await prepareOwnedLaunch(await selectSessionLaunch('claude',config,{home,cwd:peer.cwd,sessionId:peer.sessionId??undefined,configHome:previous?.configHome,executable:previous?.executable,profileId:previous?.profileId}));
     if(peer.sessionId&&restoreState(peer,launch.configHome)==='gone')throw new BridgeError('session_not_found','原配置目录中没有该 Claude 会话，请先恢复原会话文件。');
-    const controlName='cc-'+key(peer.id)+'.sock',directory=persistentSocketDirectory(home,controlName),hasSession=previous?.hasSession||!!(previous?.configHome&&claudeHistoryExists(previous.configHome,previous.sessionId))||!previous&&!!peer.sessionId,record:ClaudeChildRecord={version:1,launchId:randomUUID(),peerId:peer.id,sessionId:peer.sessionId??previous?.sessionId??randomUUID(),cwd:peer.cwd,address:path.join(directory,controlName),phase:'starting',hasSession,configHome:launch.configHome,executable:launch.executable.command,profileId:launch.profile?.id,updatedAt:Date.now()};
+    const controlName='cc-'+key(peer.id)+'.sock',directory=persistentSocketDirectory(home,controlName),hasSession=previous?.hasSession||!!(previous?.configHome&&claudeHistoryExists(previous.configHome,previous.sessionId))||!previous&&!!peer.sessionId,record:ClaudeChildRecord={version:1,bootId:currentLinuxBootId(),launchId:randomUUID(),peerId:peer.id,sessionId:peer.sessionId??previous?.sessionId??randomUUID(),cwd:peer.cwd,address:path.join(directory,controlName),phase:'starting',hasSession,configHome:launch.configHome,executable:launch.executable.command,profileId:launch.profile?.id,updatedAt:Date.now()};
                                                
     record.launchSourcePermission=previous?.launchSourcePermission??(!hasSession?sourcePermission:undefined);
     record.modelProfile=profile??previous?.modelProfile;
@@ -149,17 +168,19 @@ export async function ensureClaudeChild(home:string,config:BridgeConfig,peer:Pee
 }
 interface IdleStop {native:Pick<ProcessIdentity,'pid'|'startedAt'>;lastEventAt:number}
 export async function stopClaudeChild(home:string,record:ClaudeChildRecord,handoffId?:string,idle?:IdleStop):Promise<ClaudeChildRecord>{
+  record=currentChildState(record);
   if(await alive(record.worker)){
     try{const result=await childCall<ClaudeChildRecord>(home,record,'stop',{...(handoffId?{handoffId}:{}),...(idle&&record.idleStop?{idle}:{})},12000);
-      if(!await waitDead([result.worker,result.wrapper,result.native]))throw new BridgeError('claude_child_stopping','Claude 托管进程尚未完全退出，未启动前台副本。');await stopProcess(home,result.worker);return result;
+      if(!await waitDead([result.worker,result.wrapper,result.native]))throw new BridgeError('claude_child_stopping','Claude 托管进程尚未完全退出，未启动前台副本。');await stopProcess(home,result,result.worker);return result;
     }catch(error){if(record.phase!=='failed'||!await waitDead([record.worker,record.wrapper,record.native]))throw error;}
   }
   if(record.foreground&&await alive(record.foreground))throw new BridgeError('process_owned_by_user','原生前台窗口仍在运行，未停止用户窗口。');
   for(const identity of [record.native,record.wrapper,record.worker])if(identity){
-    const records=ownedProcesses(home).records.filter(value=>value.peerId===record.peerId&&value.identity.pid===identity.pid&&value.identity.startedAt===identity.startedAt),proof=records.find(value=>value.windowsJob||value.posixGroup)??records[0];
-    if(!proof){if(await ownedProcessState(identity)==='dead')continue;throw new BridgeError('claude_child_orphan','托管父进程已退出，子进程缺少可核验的启动归属；保留进程和记录，请运行 doctor。');}
-    await releaseOwnedProcess(proof);
+    const ownership=childProcessOwnership(home,record,identity);
+    if(ownership.state!=='current'){if(ownership.state==='previous_boot'||await ownedProcessState(identity)==='dead')continue;throw unconfirmedChildOwnership();}
+    await releaseOwnedProcess(ownership.proof);
   }
+  if(predatesLinuxBoot(record.bootId)&&childGeneration(claudeChild(home,record.peerId))!==childGeneration(record))throw new BridgeError('process_record_changed','托管 Claude 的启动记录已改变，保留后继记录。');
   const result={...record,phase:handoffId?'handoff' as const:'released' as const,...(handoffId?{handoffId}:{}),updatedAt:Date.now()};atomicJson(claudeChildFile(home,record.peerId),result);return result;
 }
 
@@ -205,7 +226,7 @@ export async function runClaudeWorker(peerId:string):Promise<void>{
       }else if(!closed)await interrupt();
                                                        
       state.phase=handoffId?'handoff':'released';if(handoffId)state.handoffId=handoffId;save();
-      await stopProcess(home,state.native);await stopProcess(home,state.wrapper);
+      await stopProcess(home,state,state.native);await stopProcess(home,state,state.wrapper);
       save();setTimeout(()=>void finish(),30);return state;
     }catch(error){stopping=false;state.error=describeError(error);save();throw error;}
   };
@@ -235,7 +256,7 @@ export async function runClaudeWorker(peerId:string):Promise<void>{
         try{native=await nativeDescendant(state.worker.pid,'claude',0,undefined,ownership);}
         catch(error){if((error as BridgeError).code!=='launch_owner_unverified')throw error;throw new BridgeError('claude_identity_pending',describeError(error));}
         state.native=native;
-        if(!ownedProcesses(home).records.some(value=>value.peerId===peerId&&value.identity.pid===native.pid&&value.identity.startedAt===native.startedAt))await recordOwnedProcess(home,{role:'claude-child',identity:native,parent:state.wrapper,peerId,sessionId:state.sessionId,configHome:launch.configHome,proof:{kind:'spawn'}});
+        if(!ownedProcesses(home).records.some(value=>value.peerId===peerId&&!value.releasedToUser&&ownedRecordMatchesGeneration(value,native)))await recordOwnedProcess(home,{role:'claude-child',identity:native,parent:state.wrapper,peerId,sessionId:state.sessionId,configHome:launch.configHome,proof:{kind:'spawn'}});
         let env:string[];
         try{env=readFileSync('/proc/'+native.pid+'/environ','utf8').split('\0');}
         catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;throw new BridgeError('claude_identity_pending',describeError(error));}
@@ -255,9 +276,9 @@ export async function runClaudeWorker(peerId:string):Promise<void>{
       }
     }
     if(state.phase!=='active')throw new BridgeError('claude_child_failed',state.error??('启动命令没有发布可核验的同一 Claude 会话和 inbox；请核对信任与插件状态。'+(pendingIdentity?' 原因：'+describeError(pendingIdentity):'')));
-    timer=setInterval(()=>{void (async()=>{if(stopping)return;if(!await alive(state.native)){state.phase='failed';state.error='Claude 原生进程已退出；保留同一会话 ID。';await stopProcess(home,state.wrapper);save();await finish();return;}if(dirty)save();})().catch(error=>{state.error=describeError(error);save();});},500);
+    timer=setInterval(()=>{void (async()=>{if(stopping)return;if(!await alive(state.native)){state.phase='failed';state.error='Claude 原生进程已退出；保留同一会话 ID。';await stopProcess(home,state,state.wrapper);save();await finish();return;}if(dirty)save();})().catch(error=>{state.error=describeError(error);save();});},500);
   }catch(error){
                                                 
-    if(server){state.phase='failed';state.error=describeError(error);save();for(const identity of [state.native,state.wrapper])try{await stopProcess(home,identity);}catch(cleanup){process.stderr.write('托管启动失败后的回收未完成：'+describeError(cleanup)+'\n');}try{await finish();}catch(cleanup){process.stderr.write('托管 worker 关闭未完成：'+describeError(cleanup)+'\n');}}else supervisor.stop();throw error;
+    if(server){state.phase='failed';state.error=describeError(error);save();for(const identity of [state.native,state.wrapper])try{await stopProcess(home,state,identity);}catch(cleanup){process.stderr.write('托管启动失败后的回收未完成：'+describeError(cleanup)+'\n');}try{await finish();}catch(cleanup){process.stderr.write('托管 worker 关闭未完成：'+describeError(cleanup)+'\n');}}else supervisor.stop();throw error;
   }
 }

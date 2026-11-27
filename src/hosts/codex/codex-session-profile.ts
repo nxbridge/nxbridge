@@ -7,6 +7,8 @@ import type { RpcClient } from '../../ipc/rpc.js';
 import {delay} from '../../shared/time.js';
 import {setImmediate as yieldToIo} from 'node:timers/promises';
 import {CodexServiceTierError,nativeServiceTier,observedServiceTier} from './codex-service-tier.js';
+import type {TakeoverModelSettings,TakeoverPermission} from '../takeover-permission.js';
+import { timeCodexRestart } from './codex-restart-timing.js';
 
 export interface SessionPolicy {
   source:'persisted'|'conservative';sandbox:unknown;approval:unknown;reviewer:unknown;
@@ -18,6 +20,8 @@ export interface SessionProfile {
   live?:Record<string,any>;livePermissionConfig?:Record<string,unknown>;
   activePermission?:{id:string;extends?:string}|null;
   appliedServiceTier?:{offset:number;present:boolean;value?:string|null};
+  appliedTakeoverPermission?:{offset:number;policy:TakeoverPermission;cwd:string;roots:unknown[];sandbox?:Record<string,unknown>;modelSettings?:TakeoverModelSettings};
+  takeoverPermissionConflict?:true;
   turn?:{id:string;state:'running'|'ready'|'paused';at:number};
   rolloutWork?:{turnOffset:number;lastWorkOffset:number;lastWorkAt?:number};
   usage?:{inputTokens:number;at:number};
@@ -53,7 +57,10 @@ async function verifyResumedTier(rpc:RpcClient,id:string,profile:SessionProfile,
 }
 
                                             
-export async function readSessionProfile(file:unknown,sessionId:string,options:{trackWork?:boolean}={}):Promise<SessionProfile>{
+export function readSessionProfile(file:unknown,sessionId:string,options:{trackWork?:boolean}={}):Promise<SessionProfile>{
+  return timeCodexRestart('profile_read',()=>readSessionProfileInner(file,sessionId,options));
+}
+async function readSessionProfileInner(file:unknown,sessionId:string,options:{trackWork?:boolean}):Promise<SessionProfile>{
   if(typeof file!=='string'||!file)return emptyProfile(sessionId);
   const key=JSON.stringify([file,sessionId,!!options.trackWork]);
   let fd:number|undefined,stat:BigIntStats;
@@ -65,7 +72,7 @@ export async function readSessionProfile(file:unknown,sessionId:string,options:{
     if(sameVersion(pending.stat,stat))return structuredClone(await pending.work);
                                            
     await pending.work;
-    return readSessionProfile(file,sessionId,options);
+    return readSessionProfileInner(file,sessionId,options);
   }
   const work=readProfile(file,sessionId,key,fd,stat,options.trackWork).finally(()=>pendingProfiles.delete(key));
   pendingProfiles.set(key,{stat,work});
@@ -129,6 +136,10 @@ async function readProfile(file:string,sessionId:string,key:string,fd:number,sta
             }
             const value=row.type==='turn_context'?row.payload:row.type==='event_msg'&&row.payload?.type==='thread_settings_applied'&&row.payload.thread_id===sessionId?row.payload.thread_settings:undefined;
             if(!value||typeof value!=='object')continue;
+            if(row.type==='turn_context'&&cache.appliedTakeoverPermission&&takeoverContextChanged(cache.appliedTakeoverPermission,value)){
+              delete cache.appliedTakeoverPermission;
+              cache.takeoverPermissionConflict=true;
+            }
             cache.settingsOffset=cache.offset;
             if(row.type==='event_msg'){
               const tier=observedServiceTier(value.service_tier);
@@ -145,6 +156,19 @@ async function readProfile(file:string,sessionId:string,key:string,fd:number,sta
             for(const [source,target] of Object.entries(fields))if(Object.hasOwn(value,source))cache.settings[target]=value[source];
                                                          
             if(Object.hasOwn(value,'permission_profile')&&!Object.hasOwn(value,'sandbox_policy'))delete cache.settings.sandbox;
+            if(row.type==='event_msg'){
+              const active=cache.activePermission;
+              if(value.permission_profile&&value.approval_policy!=null&&value.approvals_reviewer!=null&&active!==undefined
+                &&typeof value.cwd==='string'&&Array.isArray(value.runtime_workspace_roots)){
+                delete cache.takeoverPermissionConflict;
+                const provider=value.model_provider_id??value.model_provider,effort=value.reasoning_effort??value.effort??null;
+                const tier=cache.appliedServiceTier?.present?cache.appliedServiceTier.value:null;
+                const modelSettings=typeof value.model==='string'&&typeof provider==='string'&&(typeof effort==='string'||effort===null)&&tier!==undefined
+                  ?{model:value.model,modelProvider:provider,reasoningEffort:effort,serviceTier:tier}:undefined;
+                cache.appliedTakeoverPermission={offset:cache.offset,policy:{approval:value.approval_policy,reviewer:value.approvals_reviewer,sandbox:value.permission_profile,active},
+                  cwd:value.cwd,roots:value.runtime_workspace_roots,...(value.sandbox_policy?{sandbox:value.sandbox_policy}:{}),...(modelSettings?{modelSettings}:{})};
+              }else delete cache.appliedTakeoverPermission;
+            }
           }
         }
       }
@@ -156,6 +180,18 @@ async function readProfile(file:string,sessionId:string,key:string,fd:number,sta
     if(invalid)return{...empty(),file,complete:cache.complete};
     return cache;
   }catch{return{...empty(),file};}finally{if(stream)stream.destroy();else closeSync(fd);}
+}
+
+function takeoverContextChanged(applied:NonNullable<SessionProfile['appliedTakeoverPermission']>,value:Record<string,any>):boolean{
+  const active=value.active_permission_profile;
+  const activePolicy=active==null?null:{id:active.id,...(typeof active.extends==='string'?{extends:active.extends}:{})};
+  return Object.hasOwn(value,'approval_policy')&&!isDeepStrictEqual(value.approval_policy,applied.policy.approval)
+    ||Object.hasOwn(value,'approvals_reviewer')&&!isDeepStrictEqual(value.approvals_reviewer,applied.policy.reviewer)
+    ||Object.hasOwn(value,'active_permission_profile')&&!isDeepStrictEqual(activePolicy,applied.policy.active)
+    ||Object.hasOwn(value,'permission_profile')&&!isDeepStrictEqual(normalizedPermission(value.permission_profile),normalizedPermission(applied.policy.sandbox))
+    ||Object.hasOwn(value,'sandbox_policy')&&(applied.sandbox!==undefined||!Object.hasOwn(value,'permission_profile'))&&!isDeepStrictEqual(value.sandbox_policy,applied.sandbox)
+    ||Object.hasOwn(value,'cwd')&&(typeof value.cwd!=='string'||!sameDirectory(value.cwd,applied.cwd))
+    ||Object.hasOwn(value,'runtime_workspace_roots')&&!isDeepStrictEqual(value.runtime_workspace_roots,applied.roots);
 }
 
 export function sessionFile(home:string,sessionId:string):string|undefined{
@@ -210,7 +246,7 @@ function permissionPlan(profile:SessionProfile){
   return{options:{permissions:'nxbridge_transfer',config:{'permissions.nxbridge_transfer':{filesystem,network:{enabled:network}},default_permissions:'nxbridge_transfer'}},permission,policy:{source:unknown.length?'conservative':'persisted',sandbox:permission,approval:saved.approvalPolicy??'on-request',reviewer:saved.approvalsReviewer??'user',unknown:[...new Set(unknown)],narrowed,...(reason?{reason}:{})} as SessionPolicy};
 }
 
-function sandboxCandidate(profile:SessionProfile):any{
+export function sandboxCandidate(profile:SessionProfile):any{
   if(profile.settings.sandbox){const p=structuredClone(profile.settings.sandbox);p.type=({read_only:'readOnly','read-only':'readOnly',workspace_write:'workspaceWrite','workspace-write':'workspaceWrite',danger_full_access:'dangerFullAccess','danger-full-access':'dangerFullAccess',external_sandbox:'externalSandbox','external-sandbox':'externalSandbox'} as any)[p.type]??p.type;
     for(const [a,b] of [['network_access','networkAccess'],['writable_roots','writableRoots'],['exclude_tmpdir_env_var','excludeTmpdirEnvVar'],['exclude_slash_tmp','excludeSlashTmp']])if(p[a!]!==undefined){p[b!]=p[a!];delete p[a!];}return p;
   }
@@ -240,8 +276,8 @@ export function withPersistedCodexPermission(profile:SessionProfile):SessionProf
 }
 
 async function persistedAfter(rpc:RpcClient,id:string,file:string,offset:number,settings:Record<string,unknown>,guard?:()=>void):Promise<SessionProfile>{
-  await rpc.request('thread/settings/update',{threadId:id,...settings},{mutation:true,beforeSend:guard});
-  return readAppliedSessionSettings(file,id,offset);
+  await timeCodexRestart('native_settings_update',()=>rpc.request('thread/settings/update',{threadId:id,...settings},{mutation:true,beforeSend:guard}));
+  return timeCodexRestart('settings_persisted',()=>readAppliedSessionSettings(file,id,offset));
 }
 
 export async function readAppliedSessionSettings(file:unknown,id:string,offset?:number):Promise<SessionProfile>{
@@ -274,7 +310,7 @@ export async function readLiveServiceTier(rpc:RpcClient,id:string,loaded:any,cur
 export async function snapshotLiveSession(rpc:RpcClient,id:string,file:string):Promise<SessionProfile>{
   const previous=await readSessionProfile(file,id);
   const {args}=planCodexResume(id,previous,previous.settings.cwd??'',{exact:true});
-  const live=await rpc.request('thread/resume',args,{mutation:true});
+  const live=await timeCodexRestart('native_snapshot_resume',()=>rpc.request('thread/resume',args,{mutation:true}));
   if(live.thread?.id!==id)throw new BridgeError('session_changed','实时快照返回了其他线程。');
   if(live.approvalPolicy===undefined)throw new BridgeError('profile_unavailable','原生未回报当前审批策略，无法安全保存重启快照；未停止原运行时。');
   const profile=await persistedAfter(rpc,id,file,previous.offset,{approvalPolicy:live.approvalPolicy});
@@ -322,7 +358,7 @@ export async function verifyRestartProfileCurrent(profile:SessionProfile,options
                                        
 export async function verifyResumedSession(rpc:RpcClient,id:string,original:SessionProfile,guard?:()=>void,cwd=original.settings.cwd??original.meta.cwd??''):Promise<{resumed:any;policy:SessionPolicy;profile:SessionProfile}>{
   const {args,plan}=planCodexResume(id,original,cwd,{exact:true});
-  const resumed=await rpc.request('thread/resume',args,{mutation:true,beforeSend:guard});
+  const resumed=await timeCodexRestart('native_resume',()=>rpc.request('thread/resume',args,{mutation:true,beforeSend:guard}));
   if(resumed.thread?.id!==id)throw new BridgeError('session_changed','恢复结果的线程 ID 与原会话不符，未投递。');
   const file=original.file??resumed.thread?.path;
   const current=await readSessionProfile(file,id);guard?.();
@@ -393,7 +429,7 @@ function firstResumeAck(original:SessionProfile,ack:any,cwd:string){
   return {plan};
 }
                                              
-function recordedTakeoverModelSettings(original:SessionProfile,current:SessionProfile):SessionProfile{
+export function recordedTakeoverModelSettings(original:SessionProfile,current:SessionProfile):SessionProfile{
   const values=Object.fromEntries(['model','reasoningEffort','serviceTier'].filter(key=>current.settings[key]!==undefined).map(key=>[key,current.settings[key]]));
   const settings={...original.settings,...values};
   const collaboration=original.settings.collaborationMode,mirrored=collaboration?.settings;
@@ -445,7 +481,7 @@ export async function resumeSession(rpc:RpcClient,id:string,options:{file?:strin
   const original=options.profile??await readSessionProfile(options.file??(options.home?sessionFile(options.home,id):undefined),id),saved=original.settings;
   const {args,plan}=planCodexResume(id,original,options.cwd,{exact:!!options.beforeResume});
   let resumed:any;
-  try{resumed=await rpc.request('thread/resume',args,{timeout:30000,mutation:!!options.beforeResume,beforeSend:options.beforeResume,onResponse:options.onResponse});}
+  try{resumed=await timeCodexRestart('native_resume',()=>rpc.request('thread/resume',args,{timeout:30000,mutation:!!options.beforeResume,beforeSend:options.beforeResume,onResponse:options.onResponse}));}
   catch(error){if(plan.policy.unknown.includes('filesystem')&&/sandbox helper|codex-linux-sandbox|failed to load AGENTS/i.test(String((error as Error).message)))throw new BridgeError('policy_unknown_unstartable','原会话权限未知，原生宿主无法在禁止读取的策略下初始化。消息继续保留；请在正常窗口明确设置权限并完成一次交互后重试。');throw error;}
   if(resumed.thread?.id!==id)throw new BridgeError('session_changed','恢复结果的线程 ID 与原会话不符，未投递。');
   options.onResumed?.(resumed.thread);

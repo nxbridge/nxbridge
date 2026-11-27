@@ -7,7 +7,8 @@ import type {BrokerHealthCoordinator} from '../health/coordinator.js';
 import type {DeliveryHealth} from '../health/delivery.js';
 import type {CodexDaemons} from '../../hosts/codex/codex-daemon.js';
 import type {CodexDirectDelivery} from '../../hosts/codex/codex-direct.js';
-import type {Takeovers} from '../recovery/takeover.js';
+import type {TakeoverReturn,Takeovers} from '../recovery/takeover.js';
+import type {TakeoverPermissions} from '../recovery/takeover-permission.js';
 import {hostingRecord,writeHosting,closeHostedWindow,type SessionTransfers} from '../recovery/session-hosting.js';
 import {managedRecoveryKey,recoveryPrecondition,recoveryUserStep,type ManagedRecovery,type ManagedIncident,type RecoveryNotice} from '../recovery/managed-recovery.js';
 import {returnLegacyTakeover} from '../recovery/legacy-takeover.js';
@@ -15,6 +16,7 @@ import {type ManagedConflict,clearManagedConflict} from '../recovery/managed-con
 import {reconcileManagedCodexConflict} from '../../hosts/managed-registration.js';
 import {claudeAutoHolds,claudeAutoKey,observeClaudeAuto,type ClaudeAutoFallback} from '../../hosts/claude/claude-auto-mode.js';
 import {claudeChild,childCall,childHandoff,type ClaudeChildRecord} from '../../hosts/claude/claude-child.js';
+import {CLAUDE_UNRESOLVED_LAUNCH_NOTICE} from '../../hosts/claude/claude-capability.js';
 import {nativeOwnership,nativeOwnershipRecords} from '../../process/owned-native.js';
 import {ownedProcesses} from '../../process/owned-processes.js';
 import {probeProcesses,liveProcess} from '../../process/process.js';
@@ -23,7 +25,7 @@ import {partnerConfigHome} from '../pairing/pair-restore.js';
 import {launchInputFingerprint,parkLaunchFailure} from '../../hosts/launch-park.js';
 import {nativeProfileEffort} from '../../integration/mod/mod-protocol.js';
 import {memberEnabled,requireMemberEnabled} from '../member-control.js';
-import {BridgeError,RuntimeRecoveryHold,describeError} from '../../shared/errors.js';
+import {BridgeError,DeliveryError,RuntimeRecoveryHold,describeError} from '../../shared/errors.js';
 import {sameDirectory} from '../../shared/files.js';
 import {delay} from '../../shared/time.js';
 import {randomUUID} from 'node:crypto';
@@ -31,6 +33,7 @@ import {SKIPPED} from '../fault-boundary.js';
 import {TransportMigrations,ownedTransportPaths,type TransportMigration} from '../recovery/transport-migration.js';
 import type {CodexContextReceipt,CodexRestartOptions} from '../../hosts/codex/adapter.js';
 import {CodexRecycleControl} from '../recovery/codex-recycle-control.js';
+import { timeCodexRestart, traceCodexRestartReplacement, traceCodexRestartTarget, withCodexRestartTiming } from '../../hosts/codex/codex-restart-timing.js';
 import type {CodexRecycleAcceptance} from '../recovery/codex-recycle.js';
 import type {OwnedCodexRoute} from '../../hosts/codex/codex-owned-routes.js';
 import {codexSocketAlias} from '../../ipc/unix-socket.js';
@@ -42,6 +45,7 @@ interface LifecycleServices {
   readonly profileCoordination:PartnerProfileCoordination;
   readonly deletedSessions:DeletedSessions;
   readonly takeovers:Takeovers;
+  readonly takeoverPermissions:TakeoverPermissions;
   readonly managedRecovery:ManagedRecovery;
   readonly transfers:SessionTransfers;
   readonly runtimeHealth:BrokerHealthCoordinator;
@@ -100,8 +104,9 @@ export class BrokerLifecycleCoordinator {
   isPreparing(id:string):boolean{return this.preparing.has(id);}
   isRestarting(id:string):boolean{return this.restarting.has(id)||this.codexRecycle.fenced(id);}
   isRetiring(id:string):boolean{return this.retiring.has(id);}
-  deliveryActivationHold(id:string):'startup_route_pending'|'restart_in_progress'|'peer_retiring'|'session_conflict'|undefined{
+  deliveryActivationHold(id:string):'startup_route_pending'|'restart_in_progress'|'peer_retiring'|'session_conflict'|'permission_restore_unverified'|undefined{
     if(this.hooks.startupBlocked?.(id))return'startup_route_pending';
+    if(this.services.takeoverPermissions.holdsDelivery(id))return'permission_restore_unverified';
     if(this.isRestarting(id))return'restart_in_progress';
     if(this.isRetiring(id))return'peer_retiring';
     if(this.environment.store.setting('managedSessionConflict:'+id))return'session_conflict';
@@ -134,6 +139,7 @@ export class BrokerLifecycleCoordinator {
     for(const peer of store.peers())await this.pumpStage('startup_member:'+peer.id,()=>{
       if(!this.enabled(peer.id))adapters[peer.host].setEnabled?.(peer,runtimeEndpoint(peer.id),false);
       if(peer.host==='codex')this.codexRecycle.reconcileFinishedProfile(peer.id);
+      this.blockUnresolvedNativeLaunch(peer);
     });
   }
 
@@ -225,10 +231,14 @@ export class BrokerLifecycleCoordinator {
           catch(error){
             const runtime=runtimeFor(this.environment.home,{endpoint:endpoint.address})?.value;
             if(error instanceof RuntimeRecoveryHold||!(error instanceof BridgeError)||error.code!=='policy_verification_incomplete'||peer.owner!=='nxbridge'||!runtime?.dedicated||runtime.peerId!==peer.id||runtime.sessionVerification?.sessionId!==peer.sessionId)throw error;
-            guard();const pair=store.pairFor(peer.id)!,counts=store.deliveryCounts(pair.id,pair[otherHost(peer.host)]);
-            if(counts.unknown+counts.sending+counts.runtimeQueued)throw new BridgeError('delivery_unsettled','权限核验被中断且仍有未结算投递，保留原运行时及消息。');
-            const result=await adapters.codex.restart(peer,endpoint,guard,{verificationRecovery:true,requesterSession:codexRequester(store,peer)});guard();
-            store.deactivate(peer.id,endpoint.epoch);store.event('codex.verification.restarted',{peerId:peer.id,sessionId:peer.sessionId,oldPid:result.oldPid,pid:result.pid});
+            await withCodexRestartTiming({kind:'verification_recovery'},timing=>store.event('codex.restart.timing',timing),async()=>{
+              traceCodexRestartTarget(peer,endpoint);
+              guard();const pair=store.pairFor(peer.id)!,counts=store.deliveryCounts(pair.id,pair[otherHost(peer.host)]);
+              if(counts.unknown+counts.sending+counts.runtimeQueued)throw new BridgeError('delivery_unsettled','权限核验被中断且仍有未结算投递，保留原运行时及消息。');
+              const result=await adapters.codex.restart(peer,endpoint,()=>timeCodexRestart('guard',guard),{verificationRecovery:true,requesterSession:codexRequester(store,peer)});guard();
+              traceCodexRestartReplacement(undefined,result.pid);
+              store.deactivate(peer.id,endpoint.epoch);store.event('codex.verification.restarted',{peerId:peer.id,sessionId:peer.sessionId,oldPid:result.oldPid,pid:result.pid});
+            },true);
           }
         };
         const previous=this.ownedCodexRoute(peer.id)?.endpoint??store.endpoints(peer.id).filter(e=>e.mode==='app-server'&&(hostingRecord(store,peer)?.phase!=='adopting'||runtimeFor(this.environment.home,{endpoint:e.address})?.value.peerId===peer.id)).sort((a,b)=>a.seenAt-b.seenAt).at(-1);
@@ -242,12 +252,15 @@ export class BrokerLifecycleCoordinator {
         }
         if(peer.owner==='nxbridge'){
           const original=previous??store.endpoints(peer.id).sort((a,b)=>b.seenAt-a.seenAt)[0];
-          guard();
-          const affinity=store.setting<ManagedIncident['proof']&{sessionId:string}>('managedLaunchProof:'+peer.id),proof=affinity?.sessionId===peer.sessionId?affinity:this.services.managedRecovery.get(peer.id)?.proof;
-          const address=await adapters.codex.ensureEndpoint(peer.cwd,peer.id,codexRequester(store,peer),peer.sessionId,partnerConfigHome(store,peer,proof?.configHome??original?.configHome),beforeLaunch,proof);
-          guard();
-          await attach({peerId:peer.id,mode:'app-server',address,epoch:address,pid:null,procStart:null,seenAt:Date.now(),active:true});guard();
-          for(const old of store.endpoints(peer.id))if(old.mode==='app-server'&&old.address!==address)store.deactivate(peer.id,old.epoch);
+          await withCodexRestartTiming({kind:'managed_restore'},timing=>store.event('codex.restart.timing',timing),async()=>{
+            traceCodexRestartTarget(peer,original);
+            timeCodexRestart('guard',guard);
+            const affinity=store.setting<ManagedIncident['proof']&{sessionId:string}>('managedLaunchProof:'+peer.id),proof=affinity?.sessionId===peer.sessionId?affinity:this.services.managedRecovery.get(peer.id)?.proof;
+            const address=await timeCodexRestart('start_replacement',()=>adapters.codex.ensureEndpoint(peer.cwd,peer.id,codexRequester(store,peer),sessionId!,partnerConfigHome(store,peer,proof?.configHome??original?.configHome),beforeLaunch,proof));
+            guard();
+            await timeCodexRestart('restore_replacement',()=>attach({peerId:peer.id,mode:'app-server',address,epoch:address,pid:null,procStart:null,seenAt:Date.now(),active:true}));guard();
+            for(const old of store.endpoints(peer.id))if(old.mode==='app-server'&&old.address!==address)store.deactivate(peer.id,old.epoch);
+          },true);
         }
       }else if(peer.owner==='nxbridge'){
         const saved=store.setting<ManagedIncident['proof']&{sessionId:string}>('managedLaunchProof:'+peer.id),interrupted=this.transportMigrations.get(peer.id),affinity={...(saved?.sessionId===peer.sessionId?saved:{}),configHome:partnerConfigHome(store,peer),...(interrupted?.sessionId===peer.sessionId&&interrupted.attempts&&['unknown','restarting'].includes(interrupted.state)?{modelProfile:interrupted.profile}:{})};
@@ -488,7 +501,7 @@ export class BrokerLifecycleCoordinator {
     if(current&&profile?.effortUnverified)this.environment.store.event('partner.profile.unverified',{peerId:peer.id,sessionId:peer.sessionId,field:'effort',action:'host_default'});
     childHandoff(this.environment.home,peer.id,'stopped',handoffId,current);
   }
-  async returnTakeover(peerId:string,leaseId:string,foregroundEnded=false):Promise<boolean>{
+  async returnTakeover(peerId:string,leaseId:string,outcome?:TakeoverReturn):Promise<boolean>{
     if(this.hooks.startupBlocked?.(peerId))return false;
     const {store}=this.environment;
     const lease=this.services.takeovers.get(peerId);if(!lease)return true;
@@ -497,7 +510,8 @@ export class BrokerLifecycleCoordinator {
       const references=store.endpoints().filter(ep=>{const peer=store.peer(ep.peerId);return ep.active&&!(ep.mode==='app-server'&&peer.host==='codex'&&peer.kind==='subagent');}),note=await this.environment.adapters.codex.releaseRuntime(references,lease.adopted.endpoint.address,[{...store.peer(peerId),owner:'nxbridge'}]);
       if(note)store.event('takeover.old_runtime_retained',{peerId,note});
     }
-    if(!await this.services.takeovers.returned(peerId,leaseId,foregroundEnded))return false;
+    if(!await this.services.takeovers.returned(peerId,leaseId,outcome))return false;
+    try{
     const peer=store.peer(peerId);if(peer.sessionId!==lease.sessionId||store.pairFor(peerId)?.id!==lease.pairId)return true;
     this.services.profileCoordination.profiles.clear(peer);
     if(peer.host==='codex'&&hostingRecord(store,peer)?.released){
@@ -509,6 +523,7 @@ export class BrokerLifecycleCoordinator {
     if(child&&lease.handoffId&&['handoff','user'].includes(child.phase))this.returnClaudeChild(peer,child,lease.handoffId);
     if(lease.kind==='child'||lease.endpoint?.pid&&!liveProcess(lease.endpoint.pid)){store.deactivate(peerId);if(peer.owner==='nxbridge'&&peer.state!=='paused')store.updatePeer(peerId,{state:'offline'});}
     return true;
+    }finally{await this.services.takeoverPermissions.synchronize(peerId,true);}
   }
   completeClaudeAuto(peer:Peer,discovered:RegisterInput,value:ClaudeAutoFallback):ClaudeAutoFallback{
     const {store}=this.environment;
@@ -646,6 +661,7 @@ export class BrokerLifecycleCoordinator {
     const {store}=this.environment;
     const peer=store.getPeer(id),pair=store.pairFor(id);
     if(this.hooks.stopped()||!peer)return;
+    if(this.blockUnresolvedNativeLaunch(peer))return;
     if(!pair||pair.paused||!this.enabled(id)||claudeAutoHolds(store,peer)||this.retiring.has(id)||this.restarting.has(id)
       ||store.setting('managedSessionConflict:'+id)||hostingRecord(store,peer)?.released||['paused','needsHuman'].includes(peer.state)){
       if(peer.host==='codex')this.codexRecycle.reconcileAuthority(peer);
@@ -702,10 +718,31 @@ export class BrokerLifecycleCoordinator {
     if(restore){this.restoringMembers.add(id);try{await restore();}finally{this.restoringMembers.delete(id);}}
   }
 
+  private blockUnresolvedNativeLaunch(peer:Peer):boolean{
+    const {store,home}=this.environment;
+    if(peer.host!=='claude'||peer.owner!=='nxbridge'||!peer.sessionId||!store.pairFor(peer.id)||this.preparing.has(peer.id)||this.releases.has(peer.id))return false;
+    const prior=this.services.managedRecovery.get(peer.id);
+    if(!prior&&peer.launchFailure?.code!=='claude_start_pending')return false;
+    const binding=nativeOwnership(home,peer.id);
+                                                       
+    if(binding?.phase!=='intent'||binding.handle||binding.native||binding.sessionId!==peer.sessionId||Date.now()-binding.createdAt<30000)return false;
+    if(prior?.state==='blocked'&&prior.preconditionCode==='claude_release_unresolved'){
+      if(peer.state==='ready')store.updatePeer(peer.id,{state:'unknown'});
+      return true;
+    }
+    const incident=this.recoveryIncident(peer),message=CLAUDE_UNRESOLVED_LAUNCH_NOTICE;
+    this.services.managedRecovery.blocked(incident,new DeliveryError('claude_release_unresolved',message,true));
+    store.updatePeer(peer.id,{state:'unknown',launchFailure:{at:Date.now(),code:'claude_release_unresolved',message}});
+    this.publishRecovery(incident,store.peer(peer.id),'recovery held: '+message);
+    return true;
+  }
+
   private observeTransport(peer:Peer,endpoint:Endpoint):TransportMigration|undefined{
-    const {home,store}=this.environment,child=peer.host==='claude'?claudeChild(home,peer.id):undefined;
-    const runtime=peer.host==='codex'?runtimeFor(home,{endpoint:endpoint.address})?.value:undefined;
-    const owners=ownedProcesses(home).records,paths=ownedTransportPaths(home,peer,endpoint,owners,child,runtime);
+    const {home,store}=this.environment,paths=ownedTransportPaths(home,peer,endpoint,()=>({
+      child:peer.host==='claude'?claudeChild(home,peer.id):undefined,
+      runtime:peer.host==='codex'?runtimeFor(home,{endpoint:endpoint.address})?.value:undefined,
+      owners:ownedProcesses(home).records,
+    }));
     return this.transportMigrations.observe(peer,store.pairFor(peer.id)?.id??'',endpoint,paths);
   }
   transportStatus(peer:Peer):unknown{

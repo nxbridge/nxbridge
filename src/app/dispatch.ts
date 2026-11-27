@@ -164,9 +164,15 @@ export async function dispatchCommand(command:string|undefined,args:string[]):Pr
     }
     case 'restart':{
       const {restartArguments}=await import('../hosts/codex/codex-restart.js');
-      const {restartCommand}=await import('./commands/restart-command.js');
+      const {restartCommand,restartResultCommand}=await import('./commands/restart-command.js');
+      if(args[0]==='codex'&&args[1]==='--result'){
+        if(args.length!==3||!args[2]||args[2].startsWith('-'))throw new BridgeError('invalid_arguments','用法：nxbridge restart codex --result <请求ID>。');
+        process.stdout.write((await restartResultCommand(args[2])).text+'\n');
+        break;
+      }
+      const {restartRequestText}=await import('./commands/restart-text.js');
       const {administrativeTarget}=await import('../broker/pairing/admin-target.js');
-      const explicit=restartArguments(args),selector=explicit.partner?{...await administrativeTarget([]),partner:true as const}:Object.keys(explicit).length?explicit:await administrativeTarget([]),result=await restartCommand(selector);
+      const explicit=restartArguments(args),selector=explicit.partner?{...await administrativeTarget([]),partner:true as const}:Object.keys(explicit).length?explicit:await administrativeTarget([]),result=await restartCommand(selector,undefined,id=>process.stderr.write(restartRequestText(id)+'\n'));
       process.stdout.write(result.text+'\n');
       break;
     }

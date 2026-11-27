@@ -96,7 +96,12 @@ export async function openPartner(host:Host,options:TargetSelector&{interrupt?:b
   const controller=await processIdentity(process.pid);
   const {peer,endpoint,handle,mode,handoffId,leaseId,notice,resume,modelProfile}=await brokerCall<any>('open',{...options,host,interrupt:options.interrupt??false,request_id:randomUUID(),terminal_origin:await externalTerminalOrigin(),controller:{pid:controller.pid,procStart:controller.startedAt}},{timeout:40000});
   if(!peer.sessionId)throw new BridgeError('partner_starting','搭档尚未就绪。');
-  const claim=async(child:ChildProcess)=>{const identity=await processIdentity(child.pid!);await brokerCall('open.claim',{peer_id:peer.id,session_id:peer.sessionId,handoff_id:handoffId,lease_id:leaseId,foreground:{pid:identity.pid,procStart:identity.startedAt}},{mutation:true});};
+  let spawned=false;
+  const claim=async(child:ChildProcess)=>{
+    spawned=true;
+    const identity=await processIdentity(child.pid!);
+    await brokerCall('open.claim',{peer_id:peer.id,session_id:peer.sessionId,handoff_id:handoffId,lease_id:leaseId,foreground:{pid:identity.pid,procStart:identity.startedAt}},{mutation:true});
+  };
   try{
   if(mode==='child'){
     if(notice)process.stderr.write(notice+'\n');
@@ -106,5 +111,6 @@ export async function openPartner(host:Host,options:TargetSelector&{interrupt?:b
   const args=host==='claude'?['attach',handle]:endpoint?.mode==='app-server'?['--remote',endpoint.address,'--cd',peer.cwd,...(codexArgs??['resume',peer.sessionId])]:null;
   if(!args)throw new BridgeError('embedded_active','已有 embedded 窗口不能同时恢复成第二个运行时。请先释放原窗口，再用 nxbridge codex resume <ID> 冷恢复。');
   return await interactive(host,args,claim,{cwd:peer.cwd,sessionId:peer.sessionId,configHome:endpoint?.configHome});
-  }finally{if(leaseId)try{await brokerCall('open.return',{peer_id:peer.id,session_id:peer.sessionId,handoff_id:handoffId,lease_id:leaseId,foreground_ended:true},{mutation:true});}catch(error){process.stderr.write(`nxbridge：接管归还待核对：${String(error)}\n`);}if(host==='codex')process.stderr.write(`nxbridge：再次打开此搭档请运行 nxbridge open codex --member ${peer.id}。\n`);}
+  }finally{if(leaseId)try{await brokerCall('open.return',{peer_id:peer.id,session_id:peer.sessionId,handoff_id:handoffId,lease_id:leaseId,foreground_ended:true,
+    ...(!spawned?{foreground_outcome:'not_started'}:{})},{mutation:true});}catch(error){process.stderr.write(`nxbridge：接管归还待核对：${String(error)}\n`);}if(host==='codex')process.stderr.write(`nxbridge：再次打开此搭档请运行 nxbridge open codex --member ${peer.id}。\n`);}
 }

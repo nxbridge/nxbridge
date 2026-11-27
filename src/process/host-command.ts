@@ -50,17 +50,21 @@ async function runSelectedCli(host:Host,args:string[],selection:HostLaunch,optio
   let control:Awaited<ReturnType<typeof beginTestControl>>;
   try{
     control=host==='claude'?await beginTestControl(options.home??bridgeHome(),selection.configHome):undefined;
-                                         
-    await options.beforeSpawn?.();
+    const guard=options.beforeSpawn,background=args.includes('--bg');
+                                       
+    if(background)await guard?.();
     const settings={cwd:options.cwd??selection.cwd,env:options.env??selection.env,timeout:options.timeout??15000,maxBuffer:8*1024*1024};
     const argv=host==='claude'?claudeLaunchArgs(exe.prefix,args,settings.cwd):[...exe.prefix,...args];
+    let refusal:{error:unknown}|undefined;
+    const refuse=(error:unknown):never=>{refusal={error};throw error;};
     try{
                                         
-      if(!args.includes('--bg'))return(await executeContainedCommand(exe.command,argv,{...settings,home:options.home??bridgeHome(),onSpawn:options.onSpawn})).stdout;
+      if(!background)return(await executeContainedCommand(exe.command,argv,{...settings,home:options.home??bridgeHome(),onSpawn:options.onSpawn,
+        beforeSpawn:guard&&(()=>{try{return guard()?.catch(refuse);}catch(error){return refuse(error);}})})).stdout;
       const pending=execute(exe.command,argv,{...settings,windowsHide:true,encoding:'utf8'});
       pending.child.once('spawn',()=>options.onSpawn?.());pending.child.stdin?.end();
       return(await pending).stdout;
-    }catch(error){throw hostControlFailure(host,args,error);}
+    }catch(error){if(refusal)throw refusal.error;throw hostControlFailure(host,args,error);}
   }finally{try{await finishTestControl(control);}catch(error){process.stderr.write('隔离进程归属登记未完成：'+String(error)+'\n');}release();}
 }
 

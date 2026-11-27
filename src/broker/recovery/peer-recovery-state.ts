@@ -1,7 +1,7 @@
 import {embeddedSource} from "../../shared/embedded-source.js";
 import type { DatabaseSync } from 'node:sqlite';
 
-const recoveryPrefixes=['hosting:','managedRuntimeConflict:','managedSessionConflict:','managedRecovery:','managedAdopted:','managedLaunchProof:','legacyTakeoverNeedsUser:','takeover:','codexIdentity:','pairLoss:','sessionHistory:','sessionDeleted:','deletedReplacement:'];
+const recoveryPrefixes=['hosting:','managedRuntimeConflict:','managedSessionConflict:','managedRecovery:','managedAdopted:','managedLaunchProof:','legacyTakeoverNeedsUser:','takeover:','takeoverPermission:','codexIdentity:','pairLoss:','sessionHistory:','sessionDeleted:','deletedReplacement:'];
 
                                              
 export function forgetPeerRecovery(db:DatabaseSync,peerId:string,replacement?:string):void{

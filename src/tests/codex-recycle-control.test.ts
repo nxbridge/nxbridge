@@ -134,6 +134,7 @@ test('同一事故的实际消息账本保持，只有当前工作证据可接�
   await advanceStable();
   const first=recovery.get(peer.id)!,initial=first.recycle;
   assert.equal(initial?.phase,'awaiting_partner');
+  assert.equal(store.events().filter(event=>event.type==='codex.restart.timing').length,0,'只观察和等待决定不持续写重启计时');
   if(initial?.phase!=='awaiting_partner')return;
   const acceptance={incidentId:first.id,evidenceRevision:initial.basis.decision.revision,reason:'已核对可能中断的工作。'};
   setWork({...work,progress:'progressing',lastProgressAt:11});
@@ -147,6 +148,7 @@ test('同一事故的实际消息账本保持，只有当前工作证据可接�
   await control.advance(peer,{...acceptance,evidenceRevision:current.basis.decision.revision});
   assert.equal(recovery.get(peer.id)?.recycle?.phase,'ready');
   assert.deepEqual(effects,{stops:1,launches:1,subscriptions:1});
+  assert.equal(store.events().filter(event=>event.type==='codex.restart.timing').length,1,'实际停止和启动的这一轮保留阶段计时');
   assert.equal(store.endpoint(peer.id)?.runtimeId,fresh.runtimeId);
   assert.deepEqual(store.message(unknown.id),originalUnknown);
   assert.equal(store.message(holding.id).state,'accepted');

@@ -2,9 +2,11 @@
                                   
                                                                                   
 
-export type CodexDeliveryHoldCode='disabled'|'pair_paused'|'startup_route_pending'|'context_transition'|'hosting_transition'|'session_conflict'|'restart_in_progress'|'peer_retiring'|'profile_unverified'|'owned_subscription_waiting'|'session_busy'|'subagent_active'|'pending_user'|'runtime_unavailable'|'peer_paused'|'takeover_unverified'|'hosting_window_closed'|'hosting_awaiting_window'|'hosting_blocked'|'profile_pending_takeover'|'restart_incomplete';
+export type CodexDeliveryHoldCode='disabled'|'pair_paused'|'startup_route_pending'|'context_transition'|'hosting_transition'|'session_conflict'|'restart_in_progress'|'peer_retiring'|'profile_unverified'|'owned_subscription_waiting'|'session_busy'|'subagent_active'|'pending_user'|'runtime_unavailable'|'peer_paused'|'takeover_unverified'|'hosting_window_closed'|'hosting_awaiting_window'|'hosting_blocked'|'profile_pending_takeover'|'restart_incomplete'|'permission_restore_unverified';
 
 const texts:Record<CodexDeliveryHoldCode,{status:string;model:string}>={
+                                      
+  permission_restore_unverified:{status:'权限改回结果还没核对清，消息先保留，核对清再送',model:'held: permission restore submitted, result unconfirmed; nxbridge reconciles automatically from fresh evidence (no resend); delivers once reconciled'},
                                       
   disabled:{status:'nxbridge 在这一侧已关闭，消息先保留，重新打开后再送',model:'held: nxbridge off for this member; delivers after `nxbridge on`; no resend'},
                            

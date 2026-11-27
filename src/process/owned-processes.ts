@@ -32,6 +32,8 @@ export interface OwnedProcessRecord {
 const normalize=(home:string)=>process.platform==='win32'?path.resolve(home).toLowerCase():path.resolve(home);
 const linuxBootId=(()=>{if(process.platform!=='linux')return;try{return readFileSync('/proc/sys/kernel/random/boot_id','utf8').trim()||undefined;}catch{return;}})();
 export const currentLinuxBootId=():string|undefined=>linuxBootId;
+export const isCurrentLinuxBoot=(bootId?:string):boolean=>!!linuxBootId&&bootId===linuxBootId;
+export const predatesLinuxBoot=(bootId?:string):boolean=>!!(bootId&&linuxBootId&&bootId!==linuxBootId);
 const defaultProcessRegistryRoot=()=>process.platform==='win32'?path.join(process.env.LOCALAPPDATA??path.join(homedir(),'AppData','Local'),'nxbridge','processes'):path.join(process.env.XDG_STATE_HOME??path.join(homedir(),'.local','state'),'nxbridge','processes');
 export function processRegistryRoot():string{return path.resolve(process.env.NXBRIDGE_PROCESS_REGISTRY??defaultProcessRegistryRoot());}
 export function processRegistryDirectory(home:string):string{return path.join(processRegistryRoot(),createHash('sha256').update(normalize(home)).digest('hex').slice(0,24));}
@@ -89,6 +91,17 @@ export function completeOwnedContainer(record:OwnedProcessRecord):void{
 }
 const retiredCompletionFile=(record:Pick<OwnedProcessRecord,'id'>)=>path.join(processRegistryRoot(),'retired',record.id+'.done');
 export const ownedContainerComplete=(record:OwnedProcessRecord)=>!!record.completionFile&&(existsSync(record.completionFile)||existsSync(retiredCompletionFile(record)));
+                                        
+export async function ownedContainerRetirementReady(record:OwnedProcessRecord):Promise<boolean>{
+  if(!ownedContainerComplete(record))return false;
+  if(process.platform==='win32'&&record.windowsJob){
+    try{return (await readWindowsJobMembers(record.windowsJob,record.identity)).length===0;}
+                                                 
+    catch{return false;}
+  }
+  if(record.posixGroup&&!isCurrentLinuxBoot(record.bootId)&&!predatesLinuxBoot(record.bootId))return await ownedGroupState(record.identity)==='dead';
+  return true;
+}
                                      
 function predatesBoot(record:OwnedProcessRecord):boolean{
   if(process.platform==='linux'&&record.bootId&&linuxBootId)return record.bootId!==linuxBootId;
@@ -98,11 +111,15 @@ function predatesBoot(record:OwnedProcessRecord):boolean{
   return Number.isFinite(started)&&started<boot-tolerance;
 }
                                                           
-export function ownedRecordPredatesBoot(record:OwnedProcessRecord):boolean{return process.platform==='linux'?!!(record.bootId&&linuxBootId&&record.bootId!==linuxBootId):predatesBoot(record);}
-async function unknownContainerState(record:OwnedProcessRecord):Promise<ProcessState>{
-  if(ownedContainerComplete(record))return'dead';
-  if(predatesBoot(record)&&await ownedProcessState(record.identity)==='dead'&&(!record.native||await ownedProcessState(record.native)==='dead')){completeOwnedContainer(record);return'dead';}
-  return'unknown';
+export function ownedRecordPredatesBoot(record:OwnedProcessRecord):boolean{return process.platform==='linux'?predatesLinuxBoot(record.bootId):predatesBoot(record);}
+                                                  
+export function ownedRecordMatchesGeneration(record:OwnedProcessRecord,identity:OwnedIdentity):boolean{
+  return record.identity.pid===identity.pid&&record.identity.startedAt===identity.startedAt&&
+    (process.platform!=='linux'||!ownedRecordPredatesBoot(record));
+}
+function unknownContainerState(record:OwnedProcessRecord):ProcessState{
+                                               
+  return ownedContainerComplete(record)?'dead':'unknown';
 }
                                              
 export async function declareOwnedNative(record:OwnedProcessRecord,identity:OwnedIdentity):Promise<void>{
@@ -183,13 +200,27 @@ export function migrateRetiredCompletions(home:string):void{
     if(record.completionFile!==target&&existsSync(target))atomicJson(file,{...record,completionFile:target});
   }
 }
+const retirementChanged=()=>new BridgeError('process_record_changed','进程的停止权限已经改变，保留进程。');
+function retirementRecord(record:OwnedProcessRecord,beforeRetire?:()=>void):OwnedProcessRecord|undefined{
+                                  
+  try{beforeRetire?.();}
+  catch(error){if(!currentRecord(record))return;throw error;}
+  const live=currentRecord(record);if(!live)return;
+  if(live.releasedToUser&&(beforeRetire||!record.releasedToUser)||!sameStopAuthority(live,record))throw retirementChanged();
+  return live;
+}
+                                 
+export function retireOwnedProcessRecord(record:OwnedProcessRecord,reason='dead-generation',beforeRetire?:()=>void):boolean{
+  const live=retirementRecord(record,beforeRetire);if(!live)return false;
+  forgetOwnedProcess(live,reason);return true;
+}
                                             
-export async function retireDeadOwnedProcess(record:OwnedProcessRecord,reason='dead-generation',beforeSignal?:()=>void):Promise<void>{
-  const guard=beforeSignal&&(()=>{beforeSignal();const live=currentRecord(record);
-    if(!live||live.releasedToUser||!sameStopAuthority(live,record))throw new BridgeError('process_record_changed','进程的停止权限已经改变，保留进程。');});
-  if(record.windowsHolder)await stopWindowsProcess(record.windowsHolder,3000,{beforeSignal:guard});
-  guard?.();
-  forgetOwnedProcess(record,reason);
+export async function retireDeadOwnedProcess(record:OwnedProcessRecord,reason='dead-generation',beforeSignal?:()=>void):Promise<boolean>{
+  if(record.windowsHolder)await stopWindowsProcess(record.windowsHolder,3000,{beforeSignal:()=>{
+    const live=retirementRecord(record,beforeSignal);if(!live)return false;
+    if(live.releasedToUser)throw retirementChanged();
+  }});
+  return retireOwnedProcessRecord(record,reason,beforeSignal);
 }
 export async function ownedRecordState(record:OwnedProcessRecord):Promise<ProcessState>{
   if(ownedContainerComplete(record))return'dead';

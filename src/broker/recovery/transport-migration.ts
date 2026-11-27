@@ -28,8 +28,15 @@ export function persistentTransportPath(home:string,file:string,userHome=homedir
   const root=path.resolve(home),short=path.resolve(userHome,'.nxb-'+createHash('sha256').update(root).digest('hex').slice(0,12));
   return [path.join(root,'run'),short].some(directory=>{const relative=path.relative(directory,path.resolve(file));return relative!==''&&!relative.startsWith('..'+path.sep)&&relative!=='..'&&!path.isAbsolute(relative);});
 }
-export function ownedTransportPaths(home:string,peer:Peer,endpoint:Endpoint,owners:OwnedProcessRecord[],child?:ClaudeChildRecord,runtime?:ManagedRuntime,platform=process.platform):string[]{
+interface TransportOwnership {
+  owners:OwnedProcessRecord[];
+  child?:ClaudeChildRecord;
+  runtime?:ManagedRuntime;
+}
+export function ownedTransportPaths(home:string,peer:Peer,endpoint:Endpoint,readOwnership:()=>TransportOwnership,platform=process.platform):string[]{
+                                     
   if(platform==='win32'||peer.owner!=='nxbridge')return[];
+  const {owners,child,runtime}=readOwnership();
   const paths:string[]=[];
   if(endpoint.mode==='claude-inbox'&&path.isAbsolute(endpoint.address)&&!persistentTransportPath(home,endpoint.address))paths.push(endpoint.address);
   if(child?.sessionId===peer.sessionId&&!['handoff','user','released','stopped'].includes(child.phase)&&!persistentTransportPath(home,child.address))paths.push(child.address);

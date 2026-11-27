@@ -10,6 +10,7 @@ import {sameDirectory} from '../shared/files.js';
 import {BridgeError} from '../shared/errors.js';
 import {type BridgeConfig,type Host} from '../types.js';
 import { deterministicEntryFailure } from './launch-failure.js';
+import { timeCodexRestart } from './codex/codex-restart-timing.js';
 
 export interface LaunchCandidate {executable:string;version?:string;source:string;reason?:string;code?:string}
 const failureText:Record<string,string>={launch_image_ambiguous:'同一版本有多份程序，报出的版本或架构不一致',launch_profile_missing:'程序或配置目录已不存在',launch_command_missing:'找不到配置的启动命令',launch_command_invalid:'启动命令格式无效',session_not_found:'找不到原会话历史',rollout_not_found:'找不到原会话历史',invalid_config:'原生配置无法解析',timeout:'版本核验超时',host_control_timeout:'入口正在执行其他控制命令',ENOENT:'找不到程序或原会话文件',EACCES:'当前账户无权读取或运行入口',EPERM:'当前账户无权读取或运行入口'};
@@ -74,8 +75,8 @@ export async function selectSessionLaunch(host:Host,config:BridgeConfig,options:
     try{
       launch=selectHostLaunch(host,config,{...options,...candidate,record:candidate.record,profileId:candidate.record?.id,unobserved:!candidate.record,executable:candidate.executable??candidate.record?.exe},state);
       const key=JSON.stringify([launch.executable,candidate.record?.id]);if(seen.has(key))continue;seen.add(key);
-      writer??=await sessionWriterVersion(host,options.configHome??config[homeKey(host)]??launch.configHome,options.sessionId);
-      const version=await(dependencies.version??versionOf)(launch),entry:LaunchCandidate={executable:launch.executable.command,version,source:candidate.source};checked.push(entry);
+      writer??=await timeCodexRestart('launch_writer_version',()=>sessionWriterVersion(host,options.configHome??config[homeKey(host)]??launch!.configHome,options.sessionId!));
+      const version=await timeCodexRestart('launch_binary_version',()=>(dependencies.version??versionOf)(launch!)),entry:LaunchCandidate={executable:launch.executable.command,version,source:candidate.source};checked.push(entry);
       if(writer&&!profileVersionSupported(version,writer)){
         if(host==='claude'&&pinned)launch.notes.push('用户显式指定的 Claude '+version+' 早于会话写入版本 '+writer+'；继续使用指定入口，由原生恢复检查兼容性。');
         else{entry.reason='早于会话写入版本 '+writer;entry.code='profile_version_unsupported';continue;}

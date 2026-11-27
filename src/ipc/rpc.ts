@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import {DeliveryError} from '../shared/errors.js';
 
 export interface RpcMessage { jsonrpc?: string; id?: string | number; method?: string; params?: any; result?: any; error?: {code: number|string;message:string;data?:unknown} }
-export interface RpcRequestOptions { timeout?:number;mutation?:boolean;maxBytes?:number;beforeSend?:()=>void;onResponse?:()=>void;onLateSuccess?:()=>void }
+export interface RpcRequestOptions { timeout?:number;mutation?:boolean;maxBytes?:number;beforeSend?:()=>void;writeAhead?:()=>void;onResponse?:()=>void;onLateSuccess?:()=>void }
 const circuits=new Map<string,{code:string;message:string;until:number}>();
 const MAX_LATE_REPLIES=64;
 const circuitKey=(endpoint:string,method:string,params:any)=>JSON.stringify([endpoint,method,params?.threadId??'']);
@@ -47,6 +47,7 @@ export class RpcClient extends EventEmitter {
     return new Promise((resolve,reject)=>{
       options.beforeSend?.();
       this.beforeWireSend();
+      options.writeAhead?.();
       const timer=setTimeout(()=>{
         this.pending.delete(id);
         if(options.onLateSuccess){

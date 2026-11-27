@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type {HealthStorage} from '../health/contracts.js';
 import type { Endpoint, Host, Pair, Peer } from '../../types.js';
-import {BridgeError,describeError} from '../../shared/errors.js';
+import {BridgeError,DeliveryError,describeError} from '../../shared/errors.js';
 import { normalizedHome } from '../../integration/hooks/session-bindings.js';
 import { deterministicLaunchFailure, type LaunchPark } from '../../hosts/launch-park.js';
 import { codexRecycleFenced, type CodexRecycleOperation, type CodexRecycleDecision } from './codex-recycle.js';
@@ -99,6 +99,8 @@ export function recoveryUserStep(peer:Pick<Peer,'host'|'cwd'>,incident:ManagedIn
       return `在 ${peer.host} 里确认后台运行、审批和收信设置（${home}）`;
     case 'claude_native_recovery_waiting':
       return `后台 Claude 的原会话卡在 Claude 的后台列表里，超过一分钟没有恢复。请用平时启动 Claude 的方式（${home}）在终端运行 claude agents，找到会话 ${sid} 那一行，再运行 claude stop <那一行的 ID>。这只是停掉卡住的后台进程，对话不会删除；nxbridge 随后会自动接着原会话运行，消息都还在`;
+    case 'claude_release_unresolved':
+      return 'nxbridge doctor 查看；nxbridge pair 换一个搭档或新建一个';
     case 'claude_inbox_idle_unverified':
       return '无法证明当前后台可以安全重启，已保留原会话；下一次正常恢复会改用持久目录中的消息连接。运行 nxbridge status 查看';
     case 'claude_inbox_scheduled_work':
@@ -190,9 +192,9 @@ export class ManagedRecovery {
     else if(!value.launchPark&&(value.nextAt>this.now()||value.updatedAt>this.now()))value.nextAt=this.now()+Math.min(120000,Math.max(0,value.nextAt-value.updatedAt));
     this.save(value);
   }
-  blocked(value:ManagedIncident,error:unknown,park?:LaunchPark):void{const current=this.get(value.peerId);if(!current||current.id!==value.id||blocksOrdinary(current))return;Object.assign(value,current);const last=value.attempts.at(-1);if(last?.state==='claimed')last.state='failed';value.state='blocked';value.precondition=describeError(error).slice(0,1200);value.preconditionCode=String((error as {code?:string})?.code??'precondition_failed');value.error=value.precondition;value.launchPark=park;value.nextAt=park?Number.MAX_SAFE_INTEGER:this.now()+30000;this.stable.delete(value.peerId);this.save(value);}
+  blocked(value:ManagedIncident,error:unknown,park?:LaunchPark):void{const current=this.get(value.peerId);if(!current||current.id!==value.id||blocksOrdinary(current))return;Object.assign(value,current);const last=value.attempts.at(-1);if(last?.state==='claimed')last.state=error instanceof DeliveryError&&error.uncertain?'unknown':'failed';value.state='blocked';value.precondition=describeError(error).slice(0,1200);value.preconditionCode=String((error as {code?:string})?.code??'precondition_failed');value.error=value.precondition;value.launchPark=park;value.nextAt=park?Number.MAX_SAFE_INTEGER:this.now()+30000;this.stable.delete(value.peerId);this.save(value);}
   rearm(value:ManagedIncident):void{if(blocksOrdinary(this.get(value.peerId)))return;delete value.launchPark;delete value.precondition;delete value.preconditionCode;delete value.error;value.nextAt=0;if(value.state==='blocked')value.state='pending';this.save(value);}
-  due(value:ManagedIncident):boolean{if(blocksOrdinary(value)||value.launchPark)return false;const wall=this.now(),mono=this.monotonic(),prior=this.clocks.get(value.id);this.clocks.set(value.id,{wall,mono});if(prior&&Math.abs((wall-prior.wall)-(mono-prior.mono))>10000&&value.nextAt>wall+120000){value.nextAt=wall+120000;this.save(value);}return value.state!=='closed'&&value.state!=='recovering'&&!(value.state==='exhausted'&&value.attempts.filter(row=>!row.extra&&!row.user).length>=3)&&value.nextAt<=wall;}
+  due(value:ManagedIncident):boolean{if(blocksOrdinary(value)||value.launchPark||value.preconditionCode==='claude_release_unresolved')return false;const wall=this.now(),mono=this.monotonic(),prior=this.clocks.get(value.id);this.clocks.set(value.id,{wall,mono});if(prior&&Math.abs((wall-prior.wall)-(mono-prior.mono))>10000&&value.nextAt>wall+120000){value.nextAt=wall+120000;this.save(value);}return value.state!=='closed'&&value.state!=='recovering'&&!(value.state==='exhausted'&&value.attempts.filter(row=>!row.extra&&!row.user).length>=3)&&value.nextAt<=wall;}
                                            
   absent(value:ManagedIncident):void{const current=this.get(value.peerId);if(!current||current.id!==value.id||blocksOrdinary(current))return;if(current.attempts.at(-1)?.state==='unknown'){current.attempts.at(-1)!.state='failed';current.state='pending';this.save(current);Object.assign(value,current);}}
   private capKey(value:ManagedIncident):string{return'recoveryLaunches:'+JSON.stringify([process.platform,value.host,value.configHome,value.sessionId]);}

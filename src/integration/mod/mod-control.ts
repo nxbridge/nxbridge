@@ -107,7 +107,7 @@ async function modNow(input:any,execution?:ModExecution):Promise<unknown>{
     case'selection-get':case'selection-refresh':return request(input.operation==='selection-get'?'pair.selection.get':'pair.selection.refresh',{actor,selection_id:input.selection_id});
     case'selection-resolve':return request('pair.selection.resolve',{actor,selection_id:input.selection_id},{mutation:true});
     case'selection-commit':return request('pair.selection.commit',{actor,selection_id:input.selection_id,key:input.key,action:input.action,...(input.model!==undefined?{model:input.model}:{}),...(input.effort!==undefined?{effort:input.effort}:{}),...(input.serviceTier!==undefined?{serviceTier:input.serviceTier}:{})},{mutation:true});
-    case'partner-profile':{const action=input.action??'get';return request('partner.profile',{actor,action,...(input.model!==undefined?{model:input.model}:{}),...(input.effort!==undefined?{effort:input.effort}:{}),...(input.serviceTier!==undefined?{serviceTier:input.serviceTier}:{})},{mutation:action!=='get'});}
+    case'partner-profile':{const action=input.action??'get';return request('partner.profile',{actor,action,...(input.change_id!==undefined?{change_id:input.change_id}:{}),...(input.model!==undefined?{model:input.model}:{}),...(input.effort!==undefined?{effort:input.effort}:{}),...(input.serviceTier!==undefined?{serviceTier:input.serviceTier}:{})},{mutation:action!=='get'});}
     case'partner-recover':{const action=input.action??'preview';return request('partner.recover',{actor,action,incident_id:input.incident_id,evidence_revision:input.evidence_revision,reason:input.reason},
       {mutation:action==='retry'||action==='recycle',timeout:action==='recycle'?75000:45000});}
     case'pair-code':return request('pair.code',{actor});

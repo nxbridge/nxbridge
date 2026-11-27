@@ -8,8 +8,11 @@ import { hostingRecord, writeHosting } from './session-hosting.js';
 import {sameDirectory} from '../../shared/files.js';
 import {matchingCodexForegroundWindows} from '../../hosts/codex/codex-foreground.js';
 import {codexDeliveryHoldText} from '../delivery/codex-delivery-hold-text.js';
+import type {TakeoverPermissionEvidence} from '../../hosts/takeover-permission.js';
+import type {TakeoverPermissions} from './takeover-permission.js';
 
-export interface Takeover {id:string;peerId:string;pairId:string;sessionId:string;kind:'remote'|'child';startedAt:number;endpoint?:Endpoint;foreground?:{pid:number;procStart:string};controller?:{pid:number;procStart:string};handle?:string;nextObservation?:number;handoffId?:string;adopted?:{endpoint?:Endpoint;retirementChecked?:boolean}}
+export interface Takeover {id:string;peerId:string;pairId:string;sessionId:string;kind:'remote'|'child';startedAt:number;endpoint?:Endpoint;foreground?:{pid:number;procStart:string};controller?:{pid:number;procStart:string};handle?:string;nextObservation?:number;handoffId?:string;adopted?:{endpoint?:Endpoint;retirementChecked?:boolean};permissionBaseline?:TakeoverPermissionEvidence}
+export type TakeoverReturn='ended'|'not_started';
 const key=(peerId:string)=>'takeover:'+peerId;
 export function foregroundMatchesTakeover(value:Takeover,host:Peer['host'],args:string[]):boolean{
   if(codexAppServerArguments(args))return false;
@@ -28,6 +31,7 @@ async function observeForeground(store:Store,value:Takeover,host:Peer['host']):P
 }
                                 
 export class Takeovers {
+  permissions?:Pick<TakeoverPermissions,'opened'|'foregroundMayHaveOpened'|'returned'>;
   constructor(private store:Store,private probe=probeProcesses,private observe=(value:Takeover,host:Peer['host'])=>observeForeground(store,value,host),private sessionState?:(peer:Peer)=>Promise<'alive'|'dead'|'unknown'>,private alive=liveProcess,private ancestors=processAncestors){}
   get(id:string):Takeover|undefined{return this.store.setting(key(id));}
   allowsCodexSubscription(peer:Peer,endpoint:Endpoint):boolean{
@@ -76,32 +80,39 @@ export class Takeovers {
                                            
     const adopted=this.store.adopt(peer.id,input);this.store.updatePeer(peer.id,{owner:'nxbridge'});return this.store.peer(adopted.id);
   }
-  begin(peer:Peer,endpoint?:Endpoint,handoffId?:string,controller?:Takeover['controller'],handle?:string):Takeover{
+  begin(peer:Peer,endpoint?:Endpoint,handoffId?:string,controller?:Takeover['controller'],handle?:string,permissionBaseline?:TakeoverPermissionEvidence):Takeover{
     const pair=this.store.pairFor(peer.id);if(!pair||!peer.sessionId)throw new BridgeError('session_changed','接管目标已改变。');
     if(this.get(peer.id))throw new BridgeError('foreground_active','原接管仍未结束，请返回已经打开的窗口。');
-    const value:Takeover={id:randomUUID(),peerId:peer.id,pairId:pair.id,sessionId:peer.sessionId,kind:handoffId?'child':'remote',startedAt:Date.now(),endpoint,handoffId,controller,handle};
-    this.store.setSetting(key(peer.id),value);this.store.event('takeover.requested',{peerId:peer.id,leaseId:value.id,sessionId:peer.sessionId});return value;
+    const value:Takeover={id:randomUUID(),peerId:peer.id,pairId:pair.id,sessionId:peer.sessionId,kind:handoffId?'child':'remote',startedAt:Date.now(),endpoint,handoffId,controller,handle,permissionBaseline};
+    return this.store.transaction(()=>{
+      this.permissions?.opened(value,peer);
+      this.store.setSetting(key(peer.id),value);this.store.event('takeover.requested',{peerId:peer.id,leaseId:value.id,sessionId:peer.sessionId});return value;
+    });
   }
   claim(peerId:string,id:string,foreground:{pid:number;procStart:string}):void{
     const value=this.get(peerId),peer=this.store.peer(peerId);
     if(!value||value.id!==id||peer.sessionId!==value.sessionId||this.store.pairFor(peerId)?.id!==value.pairId)throw new BridgeError('session_changed','接管目标已改变，未改写后台归属。');
     if(value.foreground&&(value.foreground.pid!==foreground.pid||value.foreground.procStart!==foreground.procStart))throw new BridgeError('foreground_active','此接管已登记另一原生窗口。');
-    this.store.setSetting(key(peerId),{...value,foreground});this.store.event('takeover.spawned',{peerId,leaseId:id,pid:foreground.pid});
+    this.store.transaction(()=>{
+      const claimed={...value,foreground};
+      if(!value.foreground)this.permissions?.foregroundMayHaveOpened(claimed,peer);
+      this.store.setSetting(key(peerId),claimed);this.store.event('takeover.spawned',{peerId,leaseId:id,pid:foreground.pid});
+    });
   }
-  async returned(peerId:string,id:string,foregroundEnded=false):Promise<boolean>{
+  async returned(peerId:string,id:string,outcome?:TakeoverReturn):Promise<boolean>{
     const value=this.get(peerId);if(!value)return true;if(value.id!==id)return false;
     const backend=value.endpoint?.pid&&value.endpoint.procStart?{pid:value.endpoint.pid,procStart:value.endpoint.procStart}:undefined;
     const identityKey=(holder:Takeover['foreground'])=>holder?holder.pid+':'+holder.procStart:'';
-    const holders=()=>value.kind==='remote'&&value.endpoint?matchingCodexForegroundWindows(this.store,value.endpoint.address,value.sessionId).map(window=>window.foreground):[];
-    const holderSet=()=>holders().map(identityKey).sort().join('|'),before=holderSet();
-    const others=[...new Map(holders().filter(holder=>identityKey(holder)!==identityKey(value.foreground)).map(holder=>[identityKey(holder),holder])).values()];
+    const windows=()=>value.kind==='remote'&&value.endpoint?matchingCodexForegroundWindows(this.store,value.endpoint.address,value.sessionId):[];
+    const holderSet=()=>windows().map(window=>JSON.stringify([identityKey(window.foreground),window.sessionId])).sort().join('|'),before=holderSet();
+    const others=[...new Map(windows().map(window=>window.foreground).filter(holder=>identityKey(holder)!==identityKey(value.foreground)).map(holder=>[identityKey(holder),holder])).values()];
     const identities=[...(value.foreground?[value.foreground]:[]),...others,...(backend?[backend]:[])];
                                    
     const states=identities.every(native=>this.alive(native.pid))?identities.map(()=>'alive' as const):await this.probe(identities);
     const tui=value.foreground?states[0]:undefined,server=backend?states.at(-1):undefined;
     if(server!=='dead'&&states.slice(value.foreground?1:0,(value.foreground?1:0)+others.length).some(state=>state!=='dead'))return false;
     let observedAbsent=false;
-    if(!value.foreground&&!foregroundEnded&&(value.adopted||value.controller&&!liveProcess(value.controller.pid)&&Date.now()-value.startedAt>=5000)&&(value.nextObservation??0)<=Date.now()){
+    if(!value.foreground&&!outcome&&(value.adopted||value.controller&&!liveProcess(value.controller.pid)&&Date.now()-value.startedAt>=5000)&&(value.nextObservation??0)<=Date.now()){
       value.nextObservation=Date.now()+30000;this.store.setSetting(key(peerId),value);
       const matches=await this.observe(value,this.store.peer(peerId).host);if(!matches)return false;
       if(this.get(peerId)?.id!==id)return false;
@@ -109,13 +120,18 @@ export class Takeovers {
                                               
       observedAbsent=matches.length===0&&await this.sessionState?.(this.store.peer(peerId))==='dead';
     }
-    if(tui!=='dead'&&!(foregroundEnded&&!value.foreground)&&!observedAbsent&&!(value.kind==='remote'&&server==='dead'))return false;
+    if(tui!=='dead'&&!(outcome&&!value.foreground)&&!observedAbsent&&!(value.kind==='remote'&&server==='dead'))return false;
     const current=this.get(peerId);
                                          
     if(current?.id!==id||identityKey(current.foreground)!==identityKey(value.foreground)||holderSet()!==before)return false;
     this.store.transaction(()=>{
       this.store.setSetting(key(peerId),null);
       const peer=this.store.peer(peerId);
+                                     
+      const observed=!!current.foreground||windows().some(window=>window.sessionId===current.sessionId);
+      const couldHaveOpened=observed||outcome!=='not_started';
+      if(couldHaveOpened&&!current.foreground)this.permissions?.foregroundMayHaveOpened(current,peer);
+      if(couldHaveOpened)this.permissions?.returned(current,peer);
       if(hostingRecord(this.store,peer)?.verificationTakeoverId===id)
         writeHosting(this.store,peer,{verifying:false,verificationRuntimeId:undefined,verificationEndpoint:undefined,verificationTakeoverId:undefined,verificationError:undefined});
       this.store.event('takeover.returned',{peerId,leaseId:id,backend:server??'unknown'});

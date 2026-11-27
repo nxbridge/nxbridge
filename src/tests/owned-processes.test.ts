@@ -12,7 +12,7 @@ import net from 'node:net';
 import { temporaryDirectory } from './support/temporary.js';
 import { processIdentity } from '../process/process.js';
 import { ownedProcessState, stopOwnedProcess } from '../process/process-stop.js';
-import { ownedProcesses, processRegistryDirectory, processRegistryRoot, recordOwnedProcess, releaseOwnedProcess, rememberOwnedChild, transferOwnedPeerToUser, recordSpawnedProcess, ownedRecordState, forgetOwnedProcess, declareOwnedNative, ownedRecordPredatesBoot, ownedContainerComplete } from '../process/owned-processes.js';
+import { ownedProcesses, processRegistryDirectory, processRegistryRoot, recordOwnedProcess, releaseOwnedProcess, rememberOwnedChild, transferOwnedPeerToUser, recordSpawnedProcess, ownedRecordState, forgetOwnedProcess, declareOwnedNative, ownedRecordPredatesBoot, ownedContainerComplete, ownedContainerRetirementReady, completeOwnedContainer, retireDeadOwnedProcess } from '../process/owned-processes.js';
 import { spawnPosixSupervisor } from '../process/posix/posix-supervisor.js';
 import { uptime } from 'node:os';
 import { Store } from '../storage/store.js';
@@ -110,6 +110,28 @@ test('其他入口撤销归属后，旧快照没有停止权限，也不伪造�
   assert.equal(await ownedProcessState(identity),'alive');assert.equal(ownedContainerComplete(record),false);
 });
 
+test('Windows 停止持有器前记录已退休则正常结束，变更或转交则保留持有器',{skip:process.platform!=='win32'},async t=>{
+  const {home,identity}=await scope(t),holder={pid:identity.pid,startedAt:identity.startedAt};
+  for(const change of ['退休','替换','转交'] as const){
+    const record=await recordSpawnedProcess(home,{role:'host-control',identity:{...identity,startedAt:(BigInt(identity.startedAt)-1n).toString()},
+      windowsHolder:holder,proof:{kind:'spawn'}}),file=path.join(processRegistryDirectory(home),record.id+'.json');
+    const pending=retireDeadOwnedProcess(record,'dead-generation',()=>{
+      assert.ok(ownedProcesses(home).records.some(value=>value.id===record.id));
+    });
+                                  
+    if(change==='退休'){
+      forgetOwnedProcess(record);
+      await pending;
+    }else{
+      atomicJson(file,change==='转交'?{...record,releasedToUser:true}:{...record,windowsHolder:{...holder,startedAt:record.identity.startedAt}});
+      await assert.rejects(pending,{code:'process_record_changed'});
+      assert.ok(ownedProcesses(home).records.some(value=>value.id===record.id));
+      forgetOwnedProcess(record);
+    }
+    assert.equal(await ownedProcessState(identity),'alive');
+  }
+});
+
 test('并发回收已经退休并清除完成凭据的 POSIX 容器时，旧快照不再重新核验或终止',{skip:process.platform==='win32'},async t=>{
   const temp=temporaryDirectory(),home=path.join(temp.directory,'bridge');mkdirSync(home);t.after(temp.cleanup);
   const child=spawnPosixSupervisor(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
@@ -199,7 +221,7 @@ test('短命控制进程在采集归属期间正常退出，不误报身份核�
   assert.equal(child.exitCode,0);assert.equal(ownedProcesses(home).records.filter(value=>value.identity.pid===child.pid).length,0);
 });
 
-test('重启前缺失 Job 的记录可退休，同代存活根或宿主不能被启动时间推断覆盖',{skip:process.platform!=='win32'},async t=>{
+test('缺失 Job 的记录不按推算启动时间确认完成，根和宿主退出后仍保留未知',{skip:process.platform!=='win32'},async t=>{
   const {home,identity,parent,child}=await scope(t),record=await recordSpawnedProcess(home,{role:'codex-runtime',identity,parent,windowsJob:'Global\\nxbridge-job-'+randomUUID(),proof:{kind:'spawn'}});
   const save=()=>atomicJson(path.join(processRegistryDirectory(home),record.id+'.json'),record);
   t.after(()=>forgetOwnedProcess(record));
@@ -208,8 +230,9 @@ test('重启前缺失 Job 的记录可退休，同代存活根或宿主不能被
   child.kill();await once(child,'close');record.native={pid:parent.pid,startedAt:parent.startedAt};save();
   assert.equal(await ownedRecordState(record),'unknown','存活的精确原生宿主仍阻止退休');
   delete record.native;record.bootTime=Date.now()-uptime()*1000;save();assert.equal(await ownedRecordState(record),'unknown','同一次启动中丢失持有器仍需保留证据');
-  record.bootTime-=86400000;save();assert.equal(await ownedRecordState(record),'dead');
-  await releaseOwnedProcess(record);assert.equal(ownedProcesses(home).records.length,0);
+  record.bootTime-=86400000;save();assert.equal(await ownedRecordState(record),'unknown');
+  assert.equal(ownedContainerComplete(record),false);
+  await assert.rejects(releaseOwnedProcess(record),{code:'process_identity_unknown'});assert.equal(ownedProcesses(home).records.length,1);
 });
 
 test('原生交接等待确认期间的转交、删除及元数据更新不能被旧快照覆盖',async t=>{
@@ -237,4 +260,24 @@ test('Linux 重启代号阻止复用的 PID/tick 获得旧权限，同一启动�
   record.bootId='previous-boot';atomicJson(path.join(processRegistryDirectory(home),record.id+'.json'),record);
   assert.equal(ownedRecordPredatesBoot(record),true);assert.equal(await ownedRecordState(record),'dead');
   await releaseOwnedProcess(record);assert.equal(await ownedProcessState(identity),'alive','旧启动记录不能停止数值身份恰好相同的新进程');
+});
+
+test('POSIX 旧记录没有启动代号时，组长退出及启动时钟变化不能确认仍有成员的组已结束',{skip:process.platform==='win32'},async t=>{
+  const temp=temporaryDirectory(),home=temp.directory;
+  const source="const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});let leaving=false;process.on('exit',()=>{if(!leaving)child.kill()});process.on('message',()=>{leaving=true;child.unref();process.exit(0)});child.once('spawn',()=>process.send(child.pid));";
+  const leader=spawn(process.execPath,['-e',source],{detached:true,stdio:['ignore','ignore','ignore','ipc']}),closed=once(leader,'close'),message=once(leader,'message');
+  let record:Awaited<ReturnType<typeof recordOwnedProcess>>|undefined,member:Awaited<ReturnType<typeof processIdentity>>|undefined;
+  t.after(async()=>{
+    if(member)await stopOwnedProcess(member);
+    if(leader.exitCode===null&&leader.signalCode===null)leader.kill();await closed;
+    if(record){completeOwnedContainer(record);forgetOwnedProcess(record);}await temp.cleanup();
+  });
+  const [pid]=await message;member=await processIdentity(pid);
+  record=await recordOwnedProcess(home,{role:'host-control',identity:await processIdentity(leader.pid!),parent:await processIdentity(process.pid),posixGroup:true,proof:{kind:'spawn'}});
+  delete record.bootId;record.bootTime=Date.now()-uptime()*1000-86400000;atomicJson(path.join(processRegistryDirectory(home),record.id+'.json'),record);
+  leader.send('leave');await closed;
+  assert.equal(await ownedRecordState(record),'unknown');assert.equal(ownedContainerComplete(record),false);assert.equal(await ownedProcessState(member),'alive');
+  completeOwnedContainer(record);
+  assert.equal(await ownedContainerRetirementReady(record),false,'旧版按时钟写入的空凭据不能授权退休仍有成员的组');
+  assert.equal(await ownedProcessState(member),'alive');
 });

@@ -16,7 +16,8 @@ test('迁移只在停止前消费自己的额度，协调器重建和健康旧�
   assert.equal(unknown.state,'unknown');assert.equal(unknown.attempts,1);assert.equal(restarted.due(unknown),false);
   assert.equal(f.broker.managedRecovery.get(peer.id),undefined);
   const fresh={...endpoint,address:'persistent-inbox',epoch:'new-epoch',pid:12345,procStart:'new-generation'};
-  const ready=restarted.observe(peer,pair.id,fresh,[])!;assert.equal(ready.state,'ready');assert.equal(ready.attempts,1);
+  const paths=ownedTransportPaths(f.broker.home,peer,fresh,()=>assert.fail('Windows 不读取归属'),'win32');
+  const ready=restarted.observe(peer,pair.id,fresh,paths)!;assert.equal(ready.state,'ready');assert.equal(ready.attempts,1);
 });
 
 test('重启后仍发布临时地址只尝试一次，换配对或代次不能借用旧迁移预约',t=>{
@@ -41,14 +42,16 @@ test('未停止的迁移可在换配对或宿主能力更新后继续核验，�
 
 test('迁移盘点只选择当前自有连接和控制端点，Windows 与原生 Codex 固定地址不会触发迁移',t=>{
   const f=fixture(t),home=f.c.cwd,peer={...f.c,owner:'nxbridge' as const},endpoint={...f.store.endpoint(peer.id)!,address:path.join(home,'legacy','inbox.sock')};
-  assert.deepEqual(ownedTransportPaths(home,peer,endpoint,[],undefined,undefined,'win32'),[]);
-  assert.deepEqual(ownedTransportPaths(home,{...peer,owner:'user'},endpoint,[],undefined,undefined,'linux'),[]);
-  assert.deepEqual(ownedTransportPaths(home,peer,endpoint,[],undefined,undefined,'linux'),[endpoint.address]);
+  assert.deepEqual(ownedTransportPaths(home,peer,endpoint,()=>assert.fail('Windows 不读取归属'),'win32'),[]);
+  assert.deepEqual(ownedTransportPaths(home,{...peer,owner:'user'},endpoint,()=>assert.fail('用户窗口不读取归属'),'linux'),[]);
+  assert.deepEqual(ownedTransportPaths(home,peer,endpoint,()=>({owners:[]}),'linux'),[endpoint.address]);
   assert.equal(persistentTransportPath(home,path.join(home,'run','ci-current.sock')),true);
   assert.equal(persistentTransportPath(home,path.join(home,'run-foreign','inbox.sock')),false);
   const codex={...f.x,owner:'nxbridge' as const},native={...f.store.endpoint(codex.id)!,address:'unix:///tmp/codex-daemon-1000/native'};
-  assert.deepEqual(ownedTransportPaths(home,codex,native,[],undefined,undefined,'darwin'),[]);
+  assert.deepEqual(ownedTransportPaths(home,codex,native,()=>({owners:[]}),'darwin'),[]);
   const record={peerId:codex.id,posixControl:path.join(home,'legacy','native.sock'),proof:{kind:'spawn',launchId:'current'},native:{pid:native.pid!,startedAt:native.procStart!}} as OwnedProcessRecord;
-  assert.deepEqual(ownedTransportPaths(home,codex,native,[record],undefined,undefined,'darwin'),[record.posixControl]);
-  assert.deepEqual(ownedTransportPaths(home,codex,native,[{...record,native:{pid:native.pid!,startedAt:'old'}}],undefined,undefined,'darwin'),[]);
+  let inspections=0;
+  assert.deepEqual(ownedTransportPaths(home,codex,native,()=>{inspections++;return{owners:[record]};},'darwin'),[record.posixControl]);
+  assert.equal(inspections,1);
+  assert.deepEqual(ownedTransportPaths(home,codex,native,()=>({owners:[{...record,native:{pid:native.pid!,startedAt:'old'}}]}),'darwin'),[]);
 });

@@ -19,6 +19,7 @@ import { verifyCodexNativeGeneration, verifyDedicatedCodex } from './codex-isola
 import { codexParent, codexSubagent } from './codex-lineage.js';
 import { loadedCodexThreads } from './codex-restart.js';
 import { prepareRestartProfile } from './codex-restart-profile.js';
+import { timeCodexRestart } from './codex-restart-timing.js';
 import { builtinCodexPermission, normalizedPermission, planCodexResume, readSessionProfile, verifyRestartProfileCurrent, withPersistedCodexPermission, type SessionProfile } from './codex-session-profile.js';
 
 export type CodexRecycleObservation =
@@ -102,7 +103,7 @@ interface ThreadWork { active?:string; recent?:number; unknown?:string }
 interface TurnSummary {id?:string;status?:string}
 async function latestTurn(rpc:RpcClient,id:string):Promise<TurnSummary|null|undefined>{
   try{
-    const {data}=await rpc.request('thread/turns/list',{threadId:id,limit:1,sortDirection:'desc',itemsView:'summary'},{timeout:3000});
+    const {data}=await timeCodexRestart('native_turn_summary',()=>rpc.request('thread/turns/list',{threadId:id,limit:1,sortDirection:'desc',itemsView:'summary'},{timeout:3000}));
     return Array.isArray(data)?data[0]??null:undefined;
   }catch{return undefined;}
 }

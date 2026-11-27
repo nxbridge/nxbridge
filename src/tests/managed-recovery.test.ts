@@ -7,6 +7,30 @@ import { Takeovers, recordManagedAdoption, foregroundMatchesTakeover } from '../
 import { writeHosting } from '../broker/recovery/session-hosting.js';
 import {deliveryHealthKey,type RuntimeNotice} from '../broker/health/contracts.js';
 import { RECYCLE_CLEANUP_USER_STEP, RECYCLE_OLD_UNKNOWN_USER_STEP } from '../broker/stuck-session-text.js';
+import { beginNativeLaunch, saveNativeOwnership, nativeOwnership } from '../process/owned-native.js';
+
+for(const state of ['offline','ready'] as const)test(`无 handle 的原生启动意图超时后只保留人工诊断，不再循环恢复：${state}`,async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),peer=f.store.updatePeer(f.c.id,{owner:'nxbridge',state}),members=lifecycle(f.broker);
+  const intent={...await beginNativeLaunch(f.broker.home,peer,f.broker.home),createdAt:now-31000};saveNativeOwnership(intent);
+  const persistedIntent=nativeOwnership(f.broker.home,peer.id);
+  const incident=f.broker.managedRecovery.observe(peer,pair,f.store.endpoint(peer.id));
+  if(state==='ready')f.broker.managedRecovery.claim(incident);
+  else f.store.updatePeer(peer.id,{launchFailure:{at:now,code:'claude_start_pending',message:'启动尚未核验'}});
+  await Promise.all(members.schedulePairedRecoveries().values());
+  const blocked=f.broker.managedRecovery.get(peer.id)!;
+  assert.equal(blocked.state,'blocked');assert.equal(blocked.preconditionCode,'claude_release_unresolved');
+  assert.equal(blocked.attempts.length,state==='ready'?1:0);if(state==='ready')assert.equal(blocked.attempts[0]?.state,'unknown');
+  assert.equal(f.broker.managedRecovery.due(blocked),false);assert.equal(f.store.peer(peer.id).state,'unknown');
+  assert.equal(members.recoveryStatus(f.store.peer(peer.id))?.state,'blocked');
+  assert.match(members.recoveryStatus(f.store.peer(peer.id))?.user_step??'',/nxbridge doctor.*nxbridge pair/);
+  const before=JSON.stringify(blocked);now+=3600000;
+  f.store.updatePeer(peer.id,{state:'ready'});
+  await Promise.all(members.schedulePairedRecoveries().values());
+  assert.equal(f.store.peer(peer.id).state,'unknown');
+  assert.equal(JSON.stringify(f.broker.managedRecovery.get(peer.id)),before);
+  assert.deepEqual(nativeOwnership(f.broker.home,peer.id),persistedIntent);assert.equal(f.claude.created.length,0);assert.equal(f.claude.ensured,0);
+});
 
 test('普通托管接续取得新订阅后按原回收尝试结算未知消息一次',async t=>{
   let now=Date.now();t.mock.method(Date,'now',()=>now);
@@ -238,8 +262,8 @@ test('未知启动按退避只核对，适配器证明退出后继续；额外�
 test('未登记前台代次时，CLI 确认窗口结束仍可归还；旧租约不能归还新接管',async t=>{
   const f=fixture(t);f.store.pair(f.c.id,f.x.id);const peer=f.store.updatePeer(f.x.id,{owner:'nxbridge'});
   const leases=new Takeovers(f.store,async()=>['alive']),lease=leases.begin(peer,f.store.endpoint(peer.id));
-  assert.equal(await leases.returned(peer.id,lease.id),false);assert.equal(await leases.returned(peer.id,lease.id,true),true);
-  const fresh=leases.begin(peer,f.store.endpoint(peer.id));assert.equal(await leases.returned(peer.id,lease.id,true),false);assert.equal(leases.get(peer.id)!.id,fresh.id);
+  assert.equal(await leases.returned(peer.id,lease.id),false);assert.equal(await leases.returned(peer.id,lease.id,'ended'),true);
+  const fresh=leases.begin(peer,f.store.endpoint(peer.id));assert.equal(await leases.returned(peer.id,lease.id,'ended'),false);assert.equal(leases.get(peer.id)!.id,fresh.id);
 });
 
 test('CLI 在登记前退出：未知观察退避，发现原生窗口后保留，证明缺席才归还',async t=>{

@@ -3,6 +3,7 @@ import type { Store } from '../../storage/store.js';
 import type { Endpoint, Pair, Peer, RegisterInput } from '../../types.js';
 import type { CodexAdapter, CodexContextReceipt } from '../../hosts/codex/adapter.js';
 import { catchUpCodexHistory } from '../../hosts/codex/codex-history.js';
+import { timeCodexRestart, traceCodexRestartHeld, traceCodexRestartTarget, withCodexRestartTiming } from '../../hosts/codex/codex-restart-timing.js';
 import { runtimeFor } from '../../hosts/managed-runtimes.js';
 import { BridgeError } from '../../shared/errors.js';
 import { sameDirectory } from '../../shared/files.js';
@@ -213,11 +214,15 @@ export class CodexRecycleControl {
     };
     this.due.set(peer.id,Date.now()+5000);
     let unsubscribed:RegisterInput|undefined;
+    return withCodexRestartTiming({kind:'recycle',incidentId:incident.id},timing=>{
+      if(timing.stages.stop_process||timing.stages.start_replacement)store.event('codex.restart.timing',timing);
+    },async()=>{
+    traceCodexRestartTarget(peer,endpoint);
     const result=await this.engine.advance(incident,trigger,{
       ...host,guard,
       authorityLost:(current,loss)=>this.notifyAuthorityLost(peer,current,loss),
       observe:async kind=>{
-        const evidence=await host.observe(kind,()=>readLedger().held.length>0);
+        const evidence=await timeCodexRestart('recycle_evidence',()=>host.observe(kind,()=>readLedger().held.length>0));
         if(evidence.kind==='held'&&sameCandidate&&running?.id===candidate.runtimeId&&running.pid===candidate.pid&&running.procStart===candidate.procStart
           &&await host.inspectOld({runtimeId:running.id,endpoint:running.endpoint,pid:candidate.pid,procStart:candidate.procStart,bootId:running.bootId}).catch(()=>'unknown')==='dead')
           return {kind:'natural'};
@@ -231,8 +236,10 @@ export class CodexRecycleControl {
         }
         return evidence;
       },
-      stop:async(old,deadline,authorize,markSignal,force)=>{authorize();await this.services.noExternalHolder(peer);authorize();await host.stop(old,deadline,authorize,markSignal,force);},
-      launch:async(intent,authorize,profile)=>{authorize();await this.services.noExternalHolder(peer);authorize();await host.launch(intent,authorize,profile);},
+      stop:async(old,deadline,authorize,markSignal,force)=>{authorize();await this.services.noExternalHolder(peer);authorize();await timeCodexRestart('stop_process',()=>host.stop(old,deadline,authorize,markSignal,force));},
+      retireOld:(old,guard,work)=>timeCodexRestart('cleanup_owners',()=>host.retireOld(old,guard,work)),
+      launch:async(intent,authorize,profile)=>{authorize();await this.services.noExternalHolder(peer);authorize();await timeCodexRestart('start_replacement',()=>host.launch(intent,authorize,profile));},
+      verify:(fresh,profile,options)=>timeCodexRestart('restore_replacement',()=>host.verify(fresh,profile,options)),
       prepareUnsubscribed:async(fresh,profile)=>{unsubscribed=await host.prepareUnsubscribed(fresh,profile);},
       recoveredSubscription:()=>{
         const route=store.endpoint(peer.id),native=route?.native??route;
@@ -310,8 +317,10 @@ export class CodexRecycleControl {
         store.event('codex.recycle.ready',{incidentId:current.id,peerId:peer.id,sessionId:peer.sessionId,uncertain:unknown,userLine});
       },
     },acceptance);
-    this.finalizeProfile(result.incident);
+    timeCodexRestart('broker_post_ack',()=>this.finalizeProfile(result.incident));
     const stage=result.incident.state==='closed'?undefined:result.incident.recycle;
+    if(stage?.phase==='held')traceCodexRestartHeld(stage.code);
+    else if(stage&&stage.phase!=='ready'&&stage.phase!=='handback')traceCodexRestartHeld(stage.phase);
     if(result.retryObservation||!acceptance&&operation?.phase==='observing'&&stage?.phase==='observing'){
       const delay=Math.min(30000,2*(this.observationBackoff.get(peer.id)??5000));
       this.observationBackoff.set(peer.id,delay);this.due.set(peer.id,Date.now()+delay);
@@ -352,6 +361,7 @@ export class CodexRecycleControl {
     if(terminalStop(stage))return true;
     if(trigger==='loaded_unleased'&&!this.fenced(peer.id))return false;
     return result.kind!=='natural'&&!!result.incident.recycle&&result.incident.recycle.phase!=='ready'&&result.incident.recycle.phase!=='handback';
+    });
   }
 
   acceptanceText(peer:Peer,previous:ManagedIncident|undefined,acceptance:CodexRecycleAcceptance):string|undefined {

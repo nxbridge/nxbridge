@@ -22,7 +22,9 @@ export function initializeSchema(db: DatabaseSync): void {
       CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS questions(id TEXT PRIMARY KEY,pair_id TEXT NOT NULL,actor_key TEXT NOT NULL UNIQUE,status TEXT NOT NULL,expires_at INTEGER NOT NULL,data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS questions_active ON questions(status,expires_at);
-      CREATE INDEX IF NOT EXISTS events_age ON events(created_at)`));
+      CREATE INDEX IF NOT EXISTS events_age ON events(created_at);
+      CREATE INDEX IF NOT EXISTS events_restart_request ON events(json_extract(data,'$.requestId'),seq DESC)
+        WHERE type IN ('codex.restart.requested','codex.restart.result') AND json_valid(data)`));
     if (version < VERSION) {
       db.exec(                          embeddedSource("sql", `CREATE TABLE peers_v5(id TEXT PRIMARY KEY,host TEXT NOT NULL,session_id TEXT,data TEXT NOT NULL);
         INSERT INTO peers_v5 SELECT id,host,session_id,data FROM peers;

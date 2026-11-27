@@ -15,12 +15,13 @@ import {registration} from './support/registration.js';
 
 const row=(type:string,payload:unknown)=>JSON.stringify({type,payload})+'\n';
 
-async function fixture(t:TestContext,kind:'warm'|'cold'|'recycle',event:'before'|'after'|'busy'|'none'){
+async function fixture(t:TestContext,kind:'warm'|'cold'|'recycle',event:'before'|'after'|'busy'|'none',named=false){
   const home=temporary(t),store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home);
   t.after(()=>{adapter.close();store.close();});
   const id='resume-order',file=path.join(home,'history.jsonl');
+  const name='preserved_fixture',sandbox=named?{type:'managed',file_system:{type:'restricted',entries:[{path:{type:'special',value:{kind:'root'}},access:'read'}]},network:'restricted'}:{type:'disabled'};
   const settings={cwd:home,runtime_workspace_roots:[home],model:'model-a',model_provider:'fixture',reasoning_effort:'high',service_tier:'priority',
-    approval_policy:'never',approvals_reviewer:'user',permission_profile:{type:'disabled'}};
+    approval_policy:'never',approvals_reviewer:'user',permission_profile:sandbox,...(named?{active_permission_profile:{id:name}}:{})};
   const applied=()=>row('event_msg',{type:'thread_settings_applied',thread_id:id,thread_settings:settings});
   writeFileSync(file,row('session_meta',{id})+applied(),'utf8');
   const profile=await readSessionProfile(file,id),registered=store.register(registration('codex',id,{cwd:home}));
@@ -31,13 +32,15 @@ async function fixture(t:TestContext,kind:'warm'|'cold'|'recycle',event:'before'
     pid:process.pid,procStart:'fixture-native',endpoint:endpoint.address,createdAt:Date.now(),
     ...(kind==='recycle'?{sessionVerification:{sessionId:id,profile,restartSourceId:'original-source'}}:{})};
   saveManagedRuntime(home,runtime);
-  const calls:string[]=[];
+  const calls:string[]=[],resumes:unknown[]=[];
   const rpc=new CodexNativeRpc(message=>{
     calls.push(message.method!);
+    if(message.method==='thread/resume')resumes.push(message.params);
     if(message.method==='thread/settings/update')appendFileSync(file,applied(),'utf8');
     const result=message.method==='thread/loaded/list'?{data:kind==='warm'?[id]:[]}:message.method==='thread/resume'?
       {thread:{id,path:file,cwd:home,status:{type:'idle'}},cwd:home,runtimeWorkspaceRoots:[home],model:'model-a',modelProvider:'fixture',
-        reasoningEffort:'high',serviceTier:'priority',approvalPolicy:'never',approvalsReviewer:'user',sandbox:{type:'dangerFullAccess'}}:{};
+        reasoningEffort:'high',serviceTier:'priority',approvalPolicy:'never',approvalsReviewer:'user',
+        ...(named?{sandbox:{type:'readOnly',networkAccess:false},activePermissionProfile:{id:name}}:{sandbox:{type:'dangerFullAccess'}})}:{};
     queueMicrotask(()=>{
       if(message.method==='thread/resume'&&event==='before')unload();
       rpc.receive({id:message.id,result});
@@ -52,7 +55,7 @@ async function fixture(t:TestContext,kind:'warm'|'cold'|'recycle',event:'before'
   const unload=()=>rpc.receive({method:'thread/unloaded',params:{threadId:id}});
   const fresh={runtimeId,endpoint:endpoint.address,pid:runtime.pid,procStart:runtime.procStart};
   const source={sourceId:'original-source',sessionId:id,file,settingsKey:'fixture'};
-  return {adapter,peer,endpoint,rpc,calls,unload,fresh,source,profile,runtime};
+  return {adapter,peer,endpoint,rpc,calls,resumes,unload,fresh,source,profile,runtime};
 }
 
 for(const kind of ['warm','cold'] as const)for(const event of ['before','after','busy'] as const)
@@ -64,6 +67,16 @@ test('恢复回执只覆盖更早的失效，后到卸载和忙碌仍有效：'+
   assert.equal(f.adapter.hasSubscription(f.peer,f.endpoint),event!=='after');
   assert.equal(f.calls.filter(method=>method==='thread/resume').length,1);
   if(event==='busy')assert.equal((f.adapter as any).nativeStates.get(f.endpoint.address+'|'+f.peer.sessionId).state,'busy');
+});
+
+for(const kind of ['warm','cold'] as const)test('原生接管和冷恢复首帧使用落盘的原命名权限及精确定义：'+kind,async t=>{
+  const f=await fixture(t,kind,'none',true);
+  await f.adapter.attach(f.peer,f.endpoint,kind==='warm'?{subscribeLoaded:async()=>()=>{}}:undefined);
+  assert.equal(f.adapter.hasSubscription(f.peer,f.endpoint),true);
+  assert.equal(f.resumes.length,1);
+  const args=f.resumes[0] as {permissions:string;config:Record<string,unknown>;sandbox?:string};
+  assert.equal(args.permissions,'preserved_fixture');assert.equal(args.sandbox,undefined);
+  assert.deepEqual(args.config['permissions.preserved_fixture'],{filesystem:{':root':'read'},network:{enabled:false}});
 });
 
 for(const event of ['before','after','busy'] as const)test('回收替代后台的原始回执不能清掉后到状态：'+event,async t=>{

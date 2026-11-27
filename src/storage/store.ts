@@ -85,9 +85,9 @@ export class Store {
                                     
     if(cooperationIds?.length)this.onCooperationChange?.([...new Set(cooperationIds)]);
   }
-  restartResult(requestId:string):{response?:unknown;error?:{code:string;message:string;uncertain?:boolean}}|undefined{
-    const row=statement(this.db,"SELECT data FROM events WHERE type='codex.restart.result' AND json_extract(data,'$.requestId')=? ORDER BY seq DESC LIMIT 1").get(requestId);
-    return row?JSON.parse(row.data as string):undefined;
+  restartRequest(requestId:string):{type:string;response?:unknown;error?:{code:string;message:string;uncertain?:boolean}}|undefined{
+    const row=statement(this.db,"SELECT type,data FROM events WHERE type IN ('codex.restart.requested','codex.restart.result') AND json_valid(data) AND json_extract(data,'$.requestId')=? ORDER BY seq DESC LIMIT 1").get(requestId);
+    return row?{...JSON.parse(row.data as string),type:row.type}:undefined;
   }
   events(after = 0, limit = 100): Row[] { return statement(this.db,'SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT ?').all(after,limit).flatMap(row=>{const data=this.decode('event',String(row.seq),String(row.data));return data===undefined?[]:[{...row,data}];}); }
                                                 

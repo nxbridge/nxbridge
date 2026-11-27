@@ -122,6 +122,50 @@ test('按请求查询重启完成与失败，后续请求不会覆盖前一次�
   await assert.rejects(broker.dispatch('codex.restart.result',{request_id:'unknown-request'}),{code:'restart_result_missing'});
 });
 
+test('仅存活操作报告执行中，重复请求不会再次启动或覆盖原回执',async t=>{
+  const {store,broker,c,x,codex}=fixture(t);store.pair(c.id,x.id);store.updatePeer(x.id,{owner:'nxbridge'});
+  let entered!:()=>void,finish!:()=>void,attempts=0;
+  const started=new Promise<void>(resolve=>{entered=resolve;}),waiting=new Promise<void>(resolve=>{finish=resolve;});
+  (codex as any).restart=async()=>{
+    attempts++;entered();await waiting;
+    return{endpoint:'new',oldPid:1,pid:2,resumed:{model:'gpt-6.1-sol'}};
+  };
+  const request_id='pending-restart',work=broker.dispatch('codex.restart',{request_id});
+  await started;
+  try{
+    assert.deepEqual(await broker.dispatch('codex.restart.result',{request_id}),{request_id,state:'pending'});
+    await assert.rejects(broker.dispatch('codex.restart',{request_id}),{code:'restart_request_exists'});
+  }finally{finish();}
+  assert.deepEqual(await work,await broker.dispatch('codex.restart.result',{request_id}));
+  await assert.rejects(broker.dispatch('codex.restart',{request_id}),{code:'restart_request_exists'});
+  assert.equal(attempts,1);
+  store.event('codex.restart.requested',{requestId:'previous-broker-request',brokerPid:99});
+  await assert.rejects(broker.dispatch('codex.restart.result',{request_id:'previous-broker-request'}),{code:'restart_result_unknown',uncertain:true});
+  const timings=store.events().filter(event=>event.type==='codex.restart.timing').map(event=>event.data as any);
+  const timing=timings.find(value=>value.requestId===request_id);
+  assert.equal(timings.filter(value=>value.requestId===request_id).length,1);
+  assert.equal(timing.target.peerId,x.id);assert.equal(timing.replacement.pid,2);assert.equal(timing.outcome,'complete');
+  for(const phase of ['request_admission','target','refresh_children','wait_pump','wait_preparation','reconcile','guard','broker_post_ack','request_result'])
+    assert.ok(timing.stages[phase].count>0,phase);
+  assert.ok(timing.threadCpuMs.user>=0);assert.ok(timing.eventLoop.utilization>=0);
+});
+
+test('完成回执写入失败保留未知结果，不为已执行的重启写入失败回执',async t=>{
+  const {store,broker,c,x,codex}=fixture(t);store.pair(c.id,x.id);store.updatePeer(x.id,{owner:'nxbridge'});
+  let attempts=0,resultWrites=0;
+  (codex as any).restart=async()=>{attempts++;return{endpoint:'new',oldPid:1,pid:2,resumed:{model:'gpt-6.1-sol'}};};
+  const event=store.event.bind(store);
+  t.mock.method(store,'event',(type:string,data:unknown,ids?:readonly string[])=>{
+    if(type==='codex.restart.result'){resultWrites++;throw Error('隔离的回执写入失败');}
+    event(type,data,ids);
+  });
+  const request_id='missing-receipt';
+  await assert.rejects(broker.dispatch('codex.restart',{request_id}),{code:'restart_result_unknown',uncertain:true});
+  await assert.rejects(broker.dispatch('codex.restart.result',{request_id}),{code:'restart_result_unknown',uncertain:true});
+  await assert.rejects(broker.dispatch('codex.restart',{request_id}),{code:'restart_request_exists'});
+  assert.equal(attempts,1);assert.equal(resultWrites,1);
+});
+
 test('已卸载线程的终端表明确不存在时只读复核，重载、排队和其他失败仍阻止停止',async()=>{
   let status='notLoaded',loaded:string[]=[],queue:any[]=[],failure='thread not found: x';
   const methods:string[]=[];

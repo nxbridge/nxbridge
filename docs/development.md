@@ -46,6 +46,7 @@ Codex 插件包里的文件一旦有字节变化，用户就要在 Codex 里用 
 
 - 后台 Codex 会话被临时接手（`nxbridge open codex`，或 `codex resume` 连到正在后台运行的会话）时，投递和空闲唤醒照常；启动、停止、回收、重启、改模型设置和交接时的认领，都要显式检查接手状态。`ownedCodexRoute()` 只回答“有没有可用的物理订阅”，不能当作生命周期授权；新增调用点时要自己判断是否需要检查接手。
 - 发给 Codex 的消息为什么暂缓，只在 `src/broker/delivery/codex-delivery-gate.ts` 判断一次，唤醒、状态显示和投递提醒都读它，原因文字在 `codex-delivery-hold-text.ts`；不要在别处再推一遍。
+- 接手窗口里的权限改动：打开前记下原权限、全部关窗后比较、保留或改回的选择都归 `src/broker/recovery/takeover-permission.ts`（Codex 侧证据在 `src/hosts/codex/codex-takeover-permission.ts`），文案在 `takeover-permission-copy.ts`。没回答的选择按保留处理，不能让投递、重启或更新因此暂缓；只有改回已提交、结果还没核对清时才暂缓投递。
 
 ### 完成提醒的额度记录
 
