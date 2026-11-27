@@ -32,17 +32,19 @@ async function scope(t:TestContext){
   await once(child,'spawn');
   t.after(async()=>{if(child.exitCode===null&&child.signalCode===null)child.kill();await closed;});
   const identity=await processIdentity(child.pid!),parent=await processIdentity(process.pid);
-  return{home,child,identity,parent};
+  return{home,child,identity,parent,closed};
 }
 
 test('持久归属副本在 home 删除后仍能核验并释放本次启动进程',async t=>{
-  const {home,child,identity,parent}=await scope(t);
+  const {home,child,identity,parent,closed}=await scope(t);
   const record=await recordOwnedProcess(home,{role:'claude-child',identity,parent,proof:{kind:'spawn'}});
   assert.equal(ownedProcesses(home).records.length,1);
   rmSync(home,{recursive:true,force:true});
   assert.equal(ownedProcesses(home).records[0]?.identity.startedAt,identity.startedAt);
   await releaseOwnedProcess(record);assert.equal(await ownedProcessState(identity),'dead');
-  assert.equal(ownedProcesses(home).records.length,0);assert.notEqual(child.exitCode===null&&child.signalCode===null,true);
+  assert.equal(ownedProcesses(home).records.length,0);
+                                     
+  await closed;assert.notEqual(child.exitCode===null&&child.signalCode===null,true);
 });
 
 test('归属目录枚举后记录消失视为撤销，权限错误仍报告',async t=>{
