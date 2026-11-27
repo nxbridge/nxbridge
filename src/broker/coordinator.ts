@@ -116,6 +116,7 @@ import { ProviderRecovery } from './recovery/provider-recovery.js';
 import { captureLegacyTakeovers } from './recovery/legacy-takeover.js';
 import {hostingRecord,hostingGate,hostingStatus,writeHosting,closeHostedWindow,codexForegroundEnd,codexForegroundEndKey,type CodexForegroundEnd,SessionTransfers} from './recovery/session-hosting.js';
 import {CodexDeliveryGate} from './delivery/codex-delivery-gate.js';
+import {TAKEOVER_VERIFY_STEPS} from './delivery/codex-delivery-hold-text.js';
 import { readSessionProfile, sessionFile } from '../hosts/codex/codex-session-profile.js';
 import { stopCodexRuntime } from '../hosts/codex/codex-restart.js';
 import { codexUserWindow } from '../hosts/codex/codex-lineage.js';
@@ -432,7 +433,14 @@ export class Broker {
                                             
     on(adapters.codex,'sessionPolicy',({memberId,sessionId,policy,runtimeId})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.sessionId===sessionId&&this.store.pairFor(peer.id)&&(!hostingRecord(this.store,peer)?.verificationRuntimeId||hostingRecord(this.store,peer)?.verificationRuntimeId===runtimeId))writeHosting(this.store,peer,{policy,verifying:false,verified:true,verificationError:undefined});},true);
     on(adapters.codex,'sessionVerifying',({memberId,sessionId,runtimeId,endpoint})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.owner==='nxbridge'&&peer.sessionId===sessionId&&this.store.pairFor(peer.id))writeHosting(this.store,peer,{verifying:true,verified:false,verificationRuntimeId:runtimeId,verificationEndpoint:endpoint,verificationError:undefined});},true);
-    on(adapters.codex,'sessionVerificationFailed',({memberId,sessionId,runtimeId,error})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.owner==='nxbridge'&&peer.sessionId===sessionId&&this.store.pairFor(peer.id)&&hostingRecord(this.store,peer)?.verificationRuntimeId===runtimeId)writeHosting(this.store,peer,{verificationError:error});});
+    on(adapters.codex,'sessionVerificationFailed',({memberId,sessionId,runtimeId,endpoint,error,takeover})=>{
+      const peer=this.store.getPeer(memberId);
+      if(peer&&peer.owner==='nxbridge'&&peer.sessionId===sessionId&&this.store.pairFor(peer.id)&&(takeover||hostingRecord(this.store,peer)?.verificationRuntimeId===runtimeId)){
+        const step=takeover?TAKEOVER_VERIFY_STEPS[error.code as keyof typeof TAKEOVER_VERIFY_STEPS]:undefined;
+        writeHosting(this.store,peer,{...(takeover?{verifying:true,verified:false,verificationRuntimeId:runtimeId,verificationEndpoint:endpoint}:{}),
+          verificationError:{...error,message:step?[error.message,step].join(' '):error.message}});
+      }
+    });
     on(adapters.codex,'state',(id:string,state:PeerState,address?:string)=>{
       if(state==='offline'&&address){const runtime=runtimeFor(this.home,{endpoint:address})?.value;if(runtime?.peerId)clearManagedConflict(this.store,runtime.peerId,runtime.id,id);}
       const p=this.runtimePeer(id,address),newActivity=p&&!['busy','needsHuman'].includes(p.state);

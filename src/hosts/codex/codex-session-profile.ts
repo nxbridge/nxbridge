@@ -369,13 +369,17 @@ export function observedResumedTier(resumed:any,current:SessionProfile,original:
   return actual;
 }
 
-function firstResumeAck(original:SessionProfile,ack:any,cwd:string){
-  const id=original.sessionId,{plan}=planCodexResume(id,original,cwd,{exact:true});
+function resumeAckFile(original:SessionProfile,ack:any):string{
+  const id=original.sessionId;
   if(ack?.thread?.id!==id||ack.thread.status?.type==='notLoaded')
     throw new BridgeError('session_changed','原生恢复没有确认加载原会话，消息继续保留。');
   const file=ack.thread.path;
   if(typeof file!=='string'||!original.file||!sameDirectory(file,original.file))
     throw new BridgeError('policy_verification_failed','恢复回执没有指向原会话历史，消息继续保留。');
+  return file;
+}
+function firstResumeAck(original:SessionProfile,ack:any,cwd:string){
+  const {plan}=planCodexResume(original.sessionId,original,cwd,{exact:true});
   for(const key of ['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots']){
     if(original.settings[key]===undefined||!isDeepStrictEqual(ack[key],original.settings[key]))
       throw new BridgeError('policy_verification_failed','恢复回执未核验原会话设置：'+key+'。');
@@ -383,34 +387,62 @@ function firstResumeAck(original:SessionProfile,ack:any,cwd:string){
   const active=original.live?.activePermissionProfile??original.activePermission??null,returned=ack.activePermissionProfile;
   if((returned?.id??null)!==(active?.id??null)||(returned?.extends??null)!==(active?.extends??null))
     throw new BridgeError('policy_verification_failed','恢复回执未核验原生命名权限，消息继续保留。');
-  return {id,file,plan};
+  return {plan};
+}
+                                             
+function recordedTakeoverModelSettings(original:SessionProfile,current:SessionProfile):SessionProfile{
+  const values=Object.fromEntries(['model','reasoningEffort','serviceTier'].filter(key=>current.settings[key]!==undefined).map(key=>[key,current.settings[key]]));
+  const settings={...original.settings,...values};
+  const collaboration=original.settings.collaborationMode,mirrored=collaboration?.settings;
+                                                   
+  const collaborationMode=mirrored?{...collaboration,settings:{...mirrored,
+    ...(Object.hasOwn(mirrored,'model')?{model:settings.model}:{}),
+    ...(Object.hasOwn(mirrored,'reasoning_effort')?{reasoning_effort:settings.reasoningEffort}:{})}}:collaboration;
+  return {...original,settings:{...settings,...(collaboration?{collaborationMode}:{})},
+    ...(Object.hasOwn(values,'serviceTier')?{appliedServiceTier:current.appliedServiceTier}:{}),
+    ...(original.live?{live:{...original.live,...values}}:{})};
+}
+                                              
+export function planTakenOverCodexResume(id:string,original:SessionProfile,current:SessionProfile,cwd:string){
+  const profile=recordedTakeoverModelSettings(original,current);
+  return {...planCodexResume(id,profile,cwd,{exact:true}),profile};
+}
+                                          
+function takenOverModelSettings(original:SessionProfile,ack:any,current:SessionProfile):SessionProfile{
+  const tier=ack.serviceTier===null?knownTier(current):ack.serviceTier;
+  if(!['model','reasoningEffort'].every(key=>isDeepStrictEqual(ack[key],current.settings[key]))
+    ||observedServiceTier(tier)===undefined||observedServiceTier(tier)!==observedServiceTier(knownTier(current)))
+    throw new BridgeError('takeover_profile_unverified','接手窗口的模型设置尚未在原会话历史中得到确认，消息继续保留。');
+  return recordedTakeoverModelSettings(original,current);
 }
 
                                                    
 export async function materializeCodexResumeSettings(rpc:RpcClient,original:SessionProfile,ack:any,cwd:string,guard:()=>void):Promise<void>{
-  const {id,file,plan}=firstResumeAck(original,ack,cwd);
+  const id=original.sessionId,file=resumeAckFile(original,ack),{plan}=firstResumeAck(original,ack,cwd);
   await persistedAfter(rpc,id,file,original.offset,{approvalPolicy:plan.policy.approval},guard);
 }
 
                                         
 export async function verifyCodexResumeAck(original:SessionProfile,ack:any,options:{
-  cwd:string;guard?:()=>void;requireFreshSettings?:boolean;
+  cwd:string;guard?:()=>void;requireFreshSettings?:boolean;adoptLiveModelSettings?:true;
 }):Promise<{profile:SessionProfile;policy:SessionPolicy}>{
-  const {id,file,plan}=firstResumeAck(original,ack,options.cwd);
+  const id=original.sessionId,file=resumeAckFile(original,ack);
   options.guard?.();
   const current=await readAppliedSessionSettings(file,id,options.requireFreshSettings?original.offset:undefined);
-  await verifyRestartProfileCurrent(original,{exact:true,current});
+  const expected=options.adoptLiveModelSettings?takenOverModelSettings(original,ack,current):original;
+  const {plan}=firstResumeAck(expected,ack,options.cwd);
+  await verifyRestartProfileCurrent(expected,{exact:true,current});
   options.guard?.();
-  observedResumedTier(ack,current,original);
+  observedResumedTier(ack,current,expected);
   return {profile:current,policy:{...plan.policy,source:'persisted',sandbox:current.settings.permissionProfile,unknown:[],narrowed:[],reason:undefined}};
 }
 
                               
-export async function resumeSession(rpc:RpcClient,id:string,options:{file?:string;home?:string;cwd:string;profile?:SessionProfile;verify?:boolean;beforeResume?:()=>void;onResumed?:(thread:any)=>void;guard?:()=>void}):Promise<{resumed:any;policy:SessionPolicy;profile:SessionProfile}>{
+export async function resumeSession(rpc:RpcClient,id:string,options:{file?:string;home?:string;cwd:string;profile?:SessionProfile;verify?:boolean;beforeResume?:()=>void;onResponse?:()=>void;onResumed?:(thread:any)=>void;guard?:()=>void}):Promise<{resumed:any;policy:SessionPolicy;profile:SessionProfile}>{
   const original=options.profile??await readSessionProfile(options.file??(options.home?sessionFile(options.home,id):undefined),id),saved=original.settings;
   const {args,plan}=planCodexResume(id,original,options.cwd,{exact:!!options.beforeResume});
   let resumed:any;
-  try{resumed=await rpc.request('thread/resume',args,{timeout:30000,mutation:!!options.beforeResume,beforeSend:options.beforeResume});}
+  try{resumed=await rpc.request('thread/resume',args,{timeout:30000,mutation:!!options.beforeResume,beforeSend:options.beforeResume,onResponse:options.onResponse});}
   catch(error){if(plan.policy.unknown.includes('filesystem')&&/sandbox helper|codex-linux-sandbox|failed to load AGENTS/i.test(String((error as Error).message)))throw new BridgeError('policy_unknown_unstartable','原会话权限未知，原生宿主无法在禁止读取的策略下初始化。消息继续保留；请在正常窗口明确设置权限并完成一次交互后重试。');throw error;}
   if(resumed.thread?.id!==id)throw new BridgeError('session_changed','恢复结果的线程 ID 与原会话不符，未投递。');
   options.onResumed?.(resumed.thread);

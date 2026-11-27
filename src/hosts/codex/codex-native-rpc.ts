@@ -29,7 +29,7 @@ export class CodexNativeRpc extends RpcClient {
   hasHandoffPending():boolean{return [...this.waiting.values()].some(state=>state.checking);}
 
                                         
-  resumeForHandoff(args:Record<string,unknown>,options:Required<Pick<RpcRequestOptions,'timeout'|'beforeSend'>>):Promise<any>{
+  resumeForHandoff(args:Record<string,unknown>,options:Required<Pick<RpcRequestOptions,'timeout'|'beforeSend'>>&Pick<RpcRequestOptions,'onResponse'>):Promise<any>{
     return super.request('thread/resume',args,{...options,mutation:true});
   }
   protected override beforeWireSend():void{

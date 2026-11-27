@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import {DeliveryError} from '../shared/errors.js';
 
 export interface RpcMessage { jsonrpc?: string; id?: string | number; method?: string; params?: any; result?: any; error?: {code: number|string;message:string;data?:unknown} }
-export interface RpcRequestOptions { timeout?:number;mutation?:boolean;maxBytes?:number;beforeSend?:()=>void;onLateSuccess?:()=>void }
+export interface RpcRequestOptions { timeout?:number;mutation?:boolean;maxBytes?:number;beforeSend?:()=>void;onResponse?:()=>void;onLateSuccess?:()=>void }
 const circuits=new Map<string,{code:string;message:string;until:number}>();
 const MAX_LATE_REPLIES=64;
 const circuitKey=(endpoint:string,method:string,params:any)=>JSON.stringify([endpoint,method,params?.threadId??'']);
@@ -11,7 +11,7 @@ export function clearRpcFaults(endpoint:string):void{for(const key of circuits.k
                                        
 export class RpcClient extends EventEmitter {
   private sequence=0;
-  private pending=new Map<string|number,{resolve:(v:any)=>void;reject:(e:unknown)=>void;timer:NodeJS.Timeout;mutation:boolean;method:string;key?:string;maxBytes:number}>();
+  private pending=new Map<string|number,{resolve:(v:any)=>void;reject:(e:unknown)=>void;timer:NodeJS.Timeout;mutation:boolean;method:string;key?:string;maxBytes:number;onResponse?:()=>void}>();
   private late=new Map<string|number,()=>void>();
   readonly metrics={responses:0,bytes:0,parseMs:0,largestBytes:0,timeouts:0,rejected:0};
   closed=false;
@@ -34,7 +34,7 @@ export class RpcClient extends EventEmitter {
         if(pending.key&&String(message.error.code)==='-32601')circuits.set(pending.key,{code:String(message.error.code),message:message.error.message,until:Date.now()+900000});
         const data=message.error.data as {uncertain?:boolean;issues?:unknown[];phase?:string;operation?:string;sqliteCode?:number;enable_command?:string}|undefined;
         pending.reject(Object.assign(new DeliveryError(String(message.error.code),message.error.message,data?.uncertain===true),Array.isArray(data?.issues)?{issues:data.issues}:{},{...(typeof data?.enable_command==='string'?{enable_command:data.enable_command}:{}),...(data?.phase==='prepare'||data?.phase==='enqueue'?{phase:data.phase}:{}),...(data?.operation?{operation:data.operation}:{}),...(data?.sqliteCode===undefined?{}:{sqliteCode:data.sqliteCode})}));
-      }else pending.resolve(message.result);
+      }else try{pending.onResponse?.();pending.resolve(message.result);}catch(error){pending.reject(error);}
     }else if(message.method)this.emit(message.id===undefined?'notification':'request',message);
   }
   request<T=any>(method:string,params:unknown={},options:RpcRequestOptions={}):Promise<T>{
@@ -56,7 +56,7 @@ export class RpcClient extends EventEmitter {
         }
         this.metrics.timeouts++;reject(new DeliveryError('timeout',`${method} 等待确认超时。`,options.mutation??false));
       },options.timeout??15000);
-      this.pending.set(id,{resolve,reject,timer,mutation:options.mutation??false,method,key,maxBytes:options.maxBytes??4*1024*1024});
+      this.pending.set(id,{resolve,reject,timer,mutation:options.mutation??false,method,key,maxBytes:options.maxBytes??4*1024*1024,onResponse:options.onResponse});
       try{this.sendWire({jsonrpc:'2.0',id,method,params});}catch(error){clearTimeout(timer);this.pending.delete(id);reject(new DeliveryError('disconnected',error instanceof Error?error.message:String(error),options.mutation??false));}
     });
   }

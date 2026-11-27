@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { RpcClient } from '../ipc/rpc.js';
 import { Store } from '../storage/store.js';
-import { readSessionProfile, resumeSession, snapshotLiveSession } from '../hosts/codex/codex-session-profile.js';
+import { readSessionProfile, resumeSession, snapshotLiveSession, verifyCodexResumeAck, planTakenOverCodexResume } from '../hosts/codex/codex-session-profile.js';
 import { closeHostedWindow, hostingGate, hostingKey, hostingRecord, hostingStatus, SessionTransfers, writeHosting, profileVersionSupported } from '../broker/recovery/session-hosting.js';
 import { WindowRecovery } from '../broker/recovery/window-recovery.js';
 import { hostingArguments } from '../app/commands/hosting-command.js';
@@ -345,6 +345,128 @@ test('原配置目录不符或门禁写入失败时保留精确核验证据，�
   await adapter.attach(store.peer(peer.id),endpoint,{verify:true});
   assert.equal(hostingGate(store,store.peer(peer.id)),false);assert.equal(runtimeFor(home,{id:runtimeId})?.value.sessionVerification,undefined);
   assert.equal(resumeCalls.length,2);
+});
+
+for(const changed of ['model','reasoningEffort','serviceTier','all'] as const)test('只在接手订阅中采用原历史已确认的模型设置：'+changed,async t=>{
+  const home=temporary(t),id='takeover-model',file=path.join(home,'history.jsonl');
+  const saved={cwd:home,runtime_workspace_roots:[home],model:'model-a',model_provider:'fixture',reasoning_effort:'high',service_tier:'priority',
+    approval_policy:'never',approvals_reviewer:'user',permission_profile:{type:'disabled'},
+    collaboration_mode:{mode:'default',settings:{model:'model-a',reasoning_effort:'high',developer_instructions:null}}};
+  writeFileSync(file,row('session_meta',{id})+row('turn_context',saved),'utf8');
+  const original=await readSessionProfile(file,id),updated={...saved,
+    ...(['model','all'].includes(changed)?{model:'model-b'}:{}),...(['reasoningEffort','all'].includes(changed)?{reasoning_effort:'medium'}:{}),
+    ...(['serviceTier','all'].includes(changed)?{service_tier:'flex'}:{})};
+  updated.collaboration_mode={...saved.collaboration_mode,settings:{...saved.collaboration_mode.settings,model:updated.model,reasoning_effort:updated.reasoning_effort}};
+  appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:id,thread_settings:updated}),'utf8');
+  const ack={thread:{id,path:file,status:{type:'idle'}},cwd:home,runtimeWorkspaceRoots:[home],model:updated.model,modelProvider:'fixture',
+    reasoningEffort:updated.reasoning_effort,serviceTier:updated.service_tier,approvalPolicy:'never',approvalsReviewer:'user'};
+  const planned=planTakenOverCodexResume(id,original,await readSessionProfile(file,id),home);
+  assert.equal(planned.args.model,updated.model);assert.equal((planned.args.config as any).model_reasoning_effort,updated.reasoning_effort);
+  assert.equal(planned.profile.settings.serviceTier,updated.service_tier);assert.equal(planned.args.approvalPolicy,'never');
+  assert.equal(planned.profile.settings.collaborationMode.settings.developer_instructions,null);
+  await assert.rejects(verifyCodexResumeAck(original,ack,{cwd:home}));
+  const verified=await verifyCodexResumeAck(original,ack,{cwd:home,adoptLiveModelSettings:true});
+  assert.equal(verified.profile.settings.model,updated.model);assert.equal(verified.profile.settings.reasoningEffort,updated.reasoning_effort);
+  assert.equal(verified.profile.settings.serviceTier,updated.service_tier);assert.equal(verified.policy.approval,'never');
+  assert.deepEqual(original.settings.permissionProfile,{type:'disabled'});assert.equal(original.settings.reasoningEffort,'high');
+});
+
+for(const field of ['mode','developer_instructions'] as const)test('接手的模型变更不能顺带采用协作模式或开发者指令：'+field,async t=>{
+  const home=temporary(t),id='takeover-collaboration',file=path.join(home,'history.jsonl');
+  const saved={cwd:home,runtime_workspace_roots:[home],model:'model-a',model_provider:'fixture',reasoning_effort:'high',service_tier:'priority',
+    approval_policy:'never',approvals_reviewer:'user',permission_profile:{type:'disabled'},
+    collaboration_mode:{mode:'default',settings:{model:'model-a',reasoning_effort:'high',developer_instructions:null}}};
+  writeFileSync(file,row('session_meta',{id})+row('turn_context',saved),'utf8');const original=await readSessionProfile(file,id);
+  const collaboration={mode:field==='mode'?'plan':'default',settings:{...saved.collaboration_mode.settings,reasoning_effort:'medium',
+    developer_instructions:field==='developer_instructions'?'changed instructions':null}};
+  appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:id,thread_settings:{...saved,reasoning_effort:'medium',collaboration_mode:collaboration}}),'utf8');
+  const ack={thread:{id,path:file,status:{type:'idle'}},cwd:home,runtimeWorkspaceRoots:[home],model:'model-a',modelProvider:'fixture',
+    reasoningEffort:'medium',serviceTier:'priority',approvalPolicy:'never',approvalsReviewer:'user'};
+  await assert.rejects(verifyCodexResumeAck(original,ack,{cwd:home,adoptLiveModelSettings:true}),{code:'restart_profile_changed'});
+});
+
+for(const changed of ['model','reasoningEffort','serviceTier'] as const)test('只在 ACK 出现的模型设置不能成为接手依据：'+changed,async t=>{
+  const home=temporary(t),id='takeover-unpersisted',file=path.join(home,'history.jsonl');
+  writeFileSync(file,row('session_meta',{id})+row('turn_context',{cwd:home,runtime_workspace_roots:[home],model:'model-a',model_provider:'fixture',reasoning_effort:'high',
+    service_tier:'priority',approval_policy:'never',approvals_reviewer:'user',permission_profile:{type:'disabled'}}),'utf8');
+  const original=await readSessionProfile(file,id),ack={thread:{id,path:file,status:{type:'idle'}},cwd:home,runtimeWorkspaceRoots:[home],model:'model-a',
+    modelProvider:'fixture',reasoningEffort:'high',serviceTier:'priority',approvalPolicy:'never',approvalsReviewer:'user',
+    [changed]:changed==='model'?'model-b':changed==='reasoningEffort'?'medium':'flex'};
+  const planned=planTakenOverCodexResume(id,original,await readSessionProfile(file,id),home);
+  assert.equal(planned.args.model,'model-a');assert.equal((planned.args.config as any).model_reasoning_effort,'high');assert.equal(planned.profile.settings.serviceTier,'priority');
+  await assert.rejects(verifyCodexResumeAck(original,ack,{cwd:home,adoptLiveModelSettings:true}),{code:'takeover_profile_unverified'});
+});
+
+for(const failure of ['policy','unrecorded'] as const)for(const pending of [false,true])test('接手订阅的失败原因可见且核验证据保留：'+failure+'/'+pending,async t=>{
+  const home=temporary(t),id='takeover-policy',file=path.join(home,'history.jsonl'),store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home);
+  const broker=new Broker(store,DEFAULT_CONFIG,{codex:adapter,claude:new FakeAdapter()} as unknown as Adapters,home);
+  t.after(async()=>{await broker.stop();store.close();});
+  const peer=store.register(registration('codex',id,{cwd:home})),partner=store.register(registration('claude','takeover-partner'));store.pair(partner.id,peer.id);
+  store.updatePeer(peer.id,{owner:'nxbridge',state:'ready'});
+  const saved={cwd:home,runtime_workspace_roots:[home],model:'model-a',model_provider:'fixture',reasoning_effort:'high',service_tier:'priority',
+    approval_policy:'never',approvals_reviewer:'user',permission_profile:{type:'disabled'}};
+  writeFileSync(file,row('session_meta',{id})+row('turn_context',saved),'utf8');const original=await readSessionProfile(file,id);
+  if(failure==='policy')appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:id,thread_settings:{...saved,reasoning_effort:'medium',approval_policy:'on-request'}}),'utf8');
+  const endpoint=store.endpoint(peer.id)!,runtimeId=randomUUID();Object.assign(endpoint,{runtimeId,pid:process.pid,procStart:'fixture-native',nativeSession:{transcriptPath:file}});store.saveEndpoint(endpoint);
+  saveManagedRuntime(home,{id:runtimeId,peerId:peer.id,sessionId:id,configHome:home,owner:managedMarker(home),kind:'owned',state:'ready',pid:endpoint.pid!,procStart:endpoint.procStart!,
+    endpoint:endpoint.address,createdAt:Date.now(),...(pending?{sessionVerification:{sessionId:id,profile:original}}:{})});
+  let verifyingEvents=0;adapter.on('sessionVerifying',()=>{verifyingEvents++;});
+  const calls:string[]=[],rpc=new RpcClient(message=>{
+    calls.push(message.method!);queueMicrotask(()=>rpc.receive({id:message.id,result:message.method==='thread/loaded/list'?{data:[id]}:
+      {thread:{id,path:file,status:{type:'idle'}},cwd:home,runtimeWorkspaceRoots:[home],model:'model-a',modelProvider:'fixture',reasoningEffort:'medium',
+        serviceTier:'priority',approvalPolicy:failure==='policy'?'on-request':'never',approvalsReviewer:'user'}}));
+  },()=>{});t.after(()=>rpc.close());adapter.connect=async()=>rpc;(adapter as any).clients.set(endpoint.address,rpc);
+                                      
+  if(!pending)writeFileSync(file,row('session_meta',{id})+row('turn_context',saved),'utf8');
+  const request=rpc.request.bind(rpc);t.mock.method(rpc,'request',async(...args:Parameters<typeof rpc.request>)=>{
+    if(!pending&&failure==='policy'&&args[0]==='thread/resume')appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:id,thread_settings:{...saved,reasoning_effort:'medium',approval_policy:'on-request'}}),'utf8');
+    return request(...args);
+  });
+  const code=failure==='policy'?'policy_verification_failed':'takeover_profile_unverified';
+  await assert.rejects(adapter.attach(store.peer(peer.id),endpoint,{subscribeLoaded:async()=>()=>{}}),{code});
+  const status=hostingStatus(store,store.peer(peer.id));assert.equal(status?.phase,'blocked');assert.ok(status&&'reason' in status);assert.equal(status.reason,code);
+  assert.match(status.user_step!,failure==='policy'?/approvalPolicy.*权限改回/:/设置改动记进会话记录/);assert.equal(adapter.hasSubscription(store.peer(peer.id),endpoint),false);
+  assert.equal(!!runtimeFor(home,{id:runtimeId})!.value.sessionVerification,pending);assert.deepEqual(calls,['thread/loaded/list','thread/resume']);
+  if(pending||failure==='unrecorded'){
+    await assert.rejects(adapter.attach(store.peer(peer.id),endpoint,{subscribeLoaded:async()=>()=>{}}),{code});
+    assert.equal(hostingStatus(store,store.peer(peer.id))?.phase,'blocked');assert.equal(verifyingEvents,0,'相同失败重试不能清掉原原因、短暂显示为核验中');
+    assert.deepEqual(calls,['thread/loaded/list','thread/resume','thread/loaded/list','thread/resume']);
+  }
+  if(failure==='unrecorded'){
+    appendFileSync(file,row('event_msg',{type:'thread_settings_applied',thread_id:id,thread_settings:{...saved,reasoning_effort:'medium'}}),'utf8');
+    await adapter.attach(store.peer(peer.id),endpoint,{subscribeLoaded:async()=>()=>{}});
+    assert.equal(hostingStatus(store,store.peer(peer.id))?.phase,'background');assert.equal(runtimeFor(home,{id:runtimeId})!.value.sessionVerification,undefined);
+    assert.equal(adapter.hasSubscription(store.peer(peer.id),store.endpoint(peer.id)!),true);
+    assert.deepEqual(calls,['thread/loaded/list','thread/resume','thread/loaded/list','thread/resume','thread/loaded/list','thread/resume']);
+  }
+});
+
+for(const failure of ['timeout','busy','guard','plain','stale'] as const)test('接手的暂时连接失败不变成权限失败，也不阻断原窗口取件：'+failure,async t=>{
+  const home=temporary(t),id='takeover-transient',file=path.join(home,'history.jsonl'),store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home);
+  const broker=new Broker(store,DEFAULT_CONFIG,{codex:adapter,claude:new FakeAdapter()} as unknown as Adapters,home);
+  t.after(async()=>{await broker.stop();store.close();});
+  const peer=store.register(registration('codex',id,{cwd:home})),partner=store.register(registration('claude','transient-partner'));store.pair(partner.id,peer.id);
+  store.updatePeer(peer.id,{owner:'nxbridge',state:'ready'});
+  writeFileSync(file,row('session_meta',{id})+row('turn_context',{cwd:home,runtime_workspace_roots:[home],model:'model-a',model_provider:'fixture',reasoning_effort:'high',
+    service_tier:'priority',approval_policy:'never',approvals_reviewer:'user',permission_profile:{type:'disabled'}}),'utf8');
+  const endpoint=store.endpoint(peer.id)!,runtimeId=randomUUID();Object.assign(endpoint,{runtimeId,pid:process.pid,procStart:'fixture-native',nativeSession:{transcriptPath:file}});store.saveEndpoint(endpoint);
+  saveManagedRuntime(home,{id:runtimeId,peerId:peer.id,sessionId:id,configHome:home,owner:managedMarker(home),kind:'owned',state:'ready',pid:endpoint.pid!,procStart:endpoint.procStart!,
+    endpoint:endpoint.address,createdAt:Date.now()});
+  const replacement=new RpcClient(()=>{},()=>{});t.after(()=>replacement.close());
+  const rpc=new RpcClient(message=>queueMicrotask(()=>{
+    rpc.receive({id:message.id,result:message.method==='thread/loaded/list'?{data:[id]}:{thread:{id,path:file,status:{type:'idle'}},cwd:home,
+      runtimeWorkspaceRoots:[home],model:'model-a',modelProvider:'fixture',reasoningEffort:'medium',serviceTier:'priority',approvalPolicy:'never',approvalsReviewer:'user'}});
+    if(failure==='stale'&&message.method==='thread/resume')queueMicrotask(()=>(adapter as any).clients.set(endpoint.address,replacement));
+  }),()=>{});t.after(()=>rpc.close());adapter.connect=async()=>rpc;(adapter as any).clients.set(endpoint.address,rpc);
+  const fault=failure==='plain'?new Error('临时连接中断'):new BridgeError(failure==='busy'?'-32001':failure==='guard'?'takeover_unverified':'timeout','临时连接未就绪');
+  const request=rpc.request.bind(rpc);t.mock.method(rpc,'request',async(...args:Parameters<typeof rpc.request>)=>{
+    if(args[0]==='thread/resume'&&failure!=='stale'){args[2]?.beforeSend?.();throw fault;}return request(...args);
+  });
+  let failedEvents=0,verifyingEvents=0;adapter.on('sessionVerificationFailed',()=>{failedEvents++;});adapter.on('sessionVerifying',()=>{verifyingEvents++;});
+  await assert.rejects(adapter.attach(store.peer(peer.id),endpoint,{subscribeLoaded:async()=>()=>{if(failure==='guard')throw fault;}}),
+    failure==='stale'?{code:'owned_subscription_waiting'}:error=>error===fault);
+  assert.equal(failedEvents,0);assert.equal(verifyingEvents,0);assert.equal(hostingGate(store,store.peer(peer.id)),false);
+  assert.equal(hostingRecord(store,store.peer(peer.id))?.verificationError,undefined);
 });
 
 test('普通冷恢复的核验门禁成功后解除，显式接管仍保留自己的门禁',t=>{

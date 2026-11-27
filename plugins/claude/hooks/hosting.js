@@ -15,6 +15,8 @@ const BLOCK_REASON={
   session_conflict:'同一会话正开在别处，需要先选用哪一个',session_not_found:'原配置目录里找不到这个会话',profile_version_unsupported:'这个版本的 Codex 读不了原会话的格式',
   bootstrap_policy_unsupported:'这个 Codex 版本不支持 nxbridge 启动时用的严格权限，为免权限变宽先不启动',
   policy_unknown_unstartable:'读不到原来的权限，而最严格的权限下 Codex 起不来',
+  takeover_profile_unverified:'模型设置和记录的不一样，又没法确认是在打开的窗口里改的',
+  restart_profile_changed:'会话记录里的会话设置（如协作模式、指令、模型服务或目录）和 nxbridge 记录的不一样',
 };
                                       
 export function policyText(policy){

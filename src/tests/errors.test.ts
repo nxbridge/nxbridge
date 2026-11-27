@@ -40,6 +40,21 @@ test('RPC 断连、同步写失败和超时保留写入不确定性，已关闭�
   assert.equal(modelError(new BridgeError('unmapped','原始错误')).message,MODEL_ERROR_FALLBACK);
 });
 
+test('成功回执的同步观察早于后续通知和 Promise 续体，失败与迟到回执不冒充成功',async t=>{
+  const order:string[]=[],rpc=new RpcClient(()=>{},()=>{});t.after(()=>rpc.close());
+  rpc.on('notification',()=>order.push('notification'));
+  const response=rpc.request('resume',{}, {onResponse:()=>{order.push('response');}}).then(()=>order.push('continuation'));
+  rpc.receive({id:1,result:{}});rpc.receive({method:'unloaded'});
+  assert.deepEqual(order,['response','notification']);await response;
+  assert.deepEqual(order,['response','notification','continuation']);
+  const failed=rpc.request('failed',{}, {onResponse:()=>assert.fail('错误回执不能触发成功观察')});
+  rpc.receive({id:2,error:{code:'failed',message:'原生拒绝'}});await assert.rejects(failed,{code:'failed'});
+  const late=rpc.request('late',{}, {timeout:5,onResponse:()=>assert.fail('迟到回执不能触发当前成功观察')});
+  await assert.rejects(late,{code:'timeout'});rpc.receive({id:3,result:{}});
+  const fault=new Error('观察失败'),observed=rpc.request('observed',{}, {onResponse:()=>{throw fault;}});
+  rpc.receive({id:4,result:{}});await assert.rejects(observed,error=>error===fault);
+});
+
 test('成员关闭错误在直接与 IPC 路径均保留确切人工开启命令，模型提示保持英文',async t=>{
   const enable_command='nxbridge on codex --member disabled-member',error=Object.assign(new BridgeError('member_disabled','成员已关闭；用户可亲自执行 '+enable_command),{enable_command});
   const direct=modelError(error);assert.equal(direct.enable_command,enable_command);assert.ok(direct.message.includes(enable_command));assert.doesNotMatch(direct.message,/[\u4e00-\u9fff]|<host>|<id>/);

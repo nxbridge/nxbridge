@@ -50,3 +50,12 @@ const texts:Record<CodexDeliveryHoldCode,{status:string;model:string}>={
 };
 
 export function codexDeliveryHoldText(code:CodexDeliveryHoldCode):{status:string;model:string}{return texts[code];}
+
+                                                      
+                                                              
+                                                                    
+export const TAKEOVER_VERIFY_STEPS={
+  policy_verification_failed:'为安全不会采用窗口里改过的权限：请在那个窗口里把权限改回原来的设置',
+  restart_profile_changed:'为安全只沿用窗口里改过的模型、推理强度和服务档位，其他会话设置（协作模式、指令、模型服务、目录、插件等）要和原来一致：请在那个窗口里改回原来的设置',
+  takeover_profile_unverified:'等那个窗口里的设置改动记进会话记录后会自动接回，或在那个窗口里改回原来的设置',
+} as const;
