@@ -34,6 +34,7 @@ import {CodexRecycleControl} from '../recovery/codex-recycle-control.js';
 import type {CodexRecycleAcceptance} from '../recovery/codex-recycle.js';
 import type {OwnedCodexRoute} from '../../hosts/codex/codex-owned-routes.js';
 import {codexSocketAlias} from '../../ipc/unix-socket.js';
+import {codexDeliveryHoldText} from '../delivery/codex-delivery-hold-text.js';
 import type {RetirementRecord} from '../recovery/retirement-state.js';
 
 interface LifecycleEnvironment {readonly store:Store;readonly config:BridgeConfig;readonly adapters:Adapters;readonly home:string;}
@@ -75,6 +76,7 @@ export class BrokerLifecycleCoordinator {
   private retryAt=new Map<string,number>();
   private recoveryFailures=new Map<string,number>();
   private recoveryAt=new Map<string,number>();
+  private subscriptionHolds=new Map<string,{leaseId:string;code:'takeover_unverified'|'owned_subscription_waiting';reason:string;retryAt:number}>();
   private parkChecks=new Map<string,number>();
   private fastObserving?:Promise<void>;
   private restarting=new Set<string>();
@@ -98,7 +100,18 @@ export class BrokerLifecycleCoordinator {
   isPreparing(id:string):boolean{return this.preparing.has(id);}
   isRestarting(id:string):boolean{return this.restarting.has(id)||this.codexRecycle.fenced(id);}
   isRetiring(id:string):boolean{return this.retiring.has(id);}
-  blocksDeliveryActivation(id:string):boolean{return !!this.hooks.startupBlocked?.(id)||this.isRestarting(id)||this.isRetiring(id)||!!this.environment.store.setting('managedSessionConflict:'+id);}
+  deliveryActivationHold(id:string):'startup_route_pending'|'restart_in_progress'|'peer_retiring'|'session_conflict'|undefined{
+    if(this.hooks.startupBlocked?.(id))return'startup_route_pending';
+    if(this.isRestarting(id))return'restart_in_progress';
+    if(this.isRetiring(id))return'peer_retiring';
+    if(this.environment.store.setting('managedSessionConflict:'+id))return'session_conflict';
+  }
+  blocksDeliveryActivation(id:string):boolean{return !!this.deliveryActivationHold(id);}
+  codexSubscriptionHold(id:string):{code:'takeover_unverified'|'owned_subscription_waiting';reason?:string}|undefined{
+    const lease=this.services.takeovers.get(id);if(!lease)return;
+    const hold=this.subscriptionHolds.get(id);
+    return hold?.leaseId===lease.id?{code:hold.code,reason:hold.reason}:{code:'owned_subscription_waiting'};
+  }
   isRestoring(id:string):boolean{return this.restoringMembers.has(id);}
   preparation(id:string):Promise<void>|undefined{return this.preparing.get(id);}
   recoveryWork(id:string):Promise<boolean>|undefined{return this.memberRecoveries.get(id);}
@@ -140,10 +153,10 @@ export class BrokerLifecycleCoordinator {
     if(!peer?.sessionId||peer.host!=='codex'||peer.owner!=='nxbridge')return;
     const pair=store.pairFor(id);
     if(!pair||pair.paused||!this.enabled(id)
-      ||this.retiring.has(id)||this.codexRecycle.fenced(id)||this.services.takeovers.get(id)||store.setting('managedSessionConflict:'+id)
+      ||this.retiring.has(id)||this.codexRecycle.fenced(id)||store.setting('managedSessionConflict:'+id)
       ||hostingRecord(store,peer)?.released||store.bindings.current(id)?.transitioning)return;
     const endpoint=store.endpoint(id);
-    if(endpoint?.mode!=='app-server'||endpoint.daemon||endpoint.pendingContext)return;
+    if(endpoint?.mode!=='app-server'||endpoint.daemon||endpoint.pendingContext||!this.services.takeovers.allowsCodexSubscription(peer,endpoint))return;
     return {peer,endpoint};
   }
 
@@ -151,6 +164,7 @@ export class BrokerLifecycleCoordinator {
     if(this.hooks.startupBlocked?.(peer.id))throw new RuntimeRecoveryHold('startup_route_pending','原生历史正在补证，尚未启动或唤醒会话。');
     const {store,adapters}=this.environment;
     this.requireEnabled(peer);
+    if(this.services.takeovers.get(peer.id))throw new BridgeError('foreground_active','前台接管仍在使用原后台，未启动另一运行时。');
     this.codexRecycle.requireUnfenced(peer.id);
     try{this.services.profileCoordination.profiles.initialize(peer);}catch(error){store.updatePeer(peer.id,{state:'offline',launchFailure:{at:Date.now(),...(error instanceof BridgeError?{code:error.code}:{}),message:describeError(error).slice(0,1200)}});throw error;}
     if(claudeAutoHolds(store,peer))throw new BridgeError('claude_start_pending','自动权限恢复尚未结算，未重复启动原会话；请运行 nxbridge open claude 或 doctor。');
@@ -170,12 +184,12 @@ export class BrokerLifecycleCoordinator {
       const intent=provisional?store.setting<{peerId:string;sessionId:string}>('implicitPartner:'+provisional.peerId):undefined;
       this.requireEnabled(current);
       this.codexRecycle.requireUnfenced(current.id);
+      if(this.services.takeovers.get(peer.id))throw new BridgeError('foreground_active','前台接管仍在使用原后台，未启动另一运行时。');
       if(claudeAutoHolds(store,current))throw new BridgeError('claude_start_pending','自动权限恢复尚未结算，未重复启动原会话；请运行 nxbridge open claude 或 doctor。');
       if(this.hooks.stopped()||!selected&&pair?.id!==pairId||pair?.paused||!provisional&&current.sessionId!==sessionId||provisional&&(!this.enabled(provisional.peerId)||store.peer(provisional.peerId).sessionId!==provisional.sessionId||!selected&&(intent?.peerId!==peer.id||sourcePair))||current.owner!==peer.owner||this.retiring.has(peer.id)||store.setting('managedSessionConflict:'+peer.id))throw new BridgeError('session_changed','恢复期间配对、归属或会话已经改变，未启动。');
     };
     const beforeLaunch=async()=>{
       guard();await this.assertNoLiveSessionHolder(peer);guard();
-      if(this.services.takeovers.get(peer.id))throw new BridgeError('foreground_active','前台接管仍在使用原后台，未启动另一运行时。');
       if(!provisional&&peer.owner==='nxbridge'&&peer.sessionId){
         if(hostingRecord(store,peer)?.phase==='adopting')return;
         if(migration){this.transportMigrations.launchGuard(migration);return;}
@@ -242,7 +256,7 @@ export class BrokerLifecycleCoordinator {
         store.adopt(peer.id,registration);
       }
     })().then(async()=>{await this.verifyOwnedClaudeLaunch(peer.id);const actual=store.peer(peer.id);if(actual.host==='codex')this.services.profileCoordination.profiles.observed(actual,actual);await this.services.profileCoordination.verifyInitial(actual,true);await this.services.profileCoordination.reconcile(store.peer(peer.id));});
-    this.preparing.set(peer.id,work);
+    this.preparing.set(peer.id,work);let handoffToTakeover=false;
     try{
       await work;if(provisional)guard();
       if(peer.host==='codex')this.rememberManagedLaunch(peer.id);
@@ -253,16 +267,20 @@ export class BrokerLifecycleCoordinator {
       if(store.peer(peer.id).launchFailure)store.updatePeer(peer.id,{launchFailure:undefined});
     }
     catch(failure){
-      if(failure instanceof RuntimeRecoveryHold&&store.pairFor(peer.id)){
-        if(!migration)this.codexRecycle.noteHold(peer,failure);
-        const incident=this.recoveryIncident(peer);
-        this.services.managedRecovery.blocked(incident,failure);
-        this.publishRecovery(incident,peer,describeError(failure));
-        throw failure;
+      if(peer.host==='codex'&&failure instanceof BridgeError&&failure.code==='foreground_active'&&this.services.takeovers.get(peer.id)?.kind==='remote')handoffToTakeover=true;
+      else{
+        if(failure instanceof RuntimeRecoveryHold&&store.pairFor(peer.id)){
+          if(!migration)this.codexRecycle.noteHold(peer,failure);
+          const incident=this.recoveryIncident(peer);
+          this.services.managedRecovery.blocked(incident,failure);
+          this.publishRecovery(incident,peer,describeError(failure));
+          throw failure;
+        }
+        const error=this.services.profileCoordination.profiles.launchError(store.getPeer(peer.id)??peer,failure);if(peer.owner==='nxbridge'&&this.enabled(peer.id)&&!isCodexIdentityError(error)){store.updatePeer(peer.id,{state:'offline',launchFailure:{at:Date.now(),...(error instanceof BridgeError?{code:error.code}:{}),message:describeError(error).slice(0,1200)}});if(error instanceof BridgeError&&error.code==='bootstrap_policy_unsupported'&&store.pairFor(peer.id)){const key=(error as BridgeError&{bootstrapProbeKey?:string}).bootstrapProbeKey;writeHosting(store,peer,{verifying:false,reason:error.code,userStep:error.message,bootstrapProbeKey:key,nextAt:key?Number.MAX_SAFE_INTEGER:Date.now()+30000});}}throw error;
       }
-      const error=this.services.profileCoordination.profiles.launchError(store.getPeer(peer.id)??peer,failure);if(peer.owner==='nxbridge'&&this.enabled(peer.id)&&!isCodexIdentityError(error)){store.updatePeer(peer.id,{state:'offline',launchFailure:{at:Date.now(),...(error instanceof BridgeError?{code:error.code}:{}),message:describeError(error).slice(0,1200)}});if(error instanceof BridgeError&&error.code==='bootstrap_policy_unsupported'&&store.pairFor(peer.id)){const key=(error as BridgeError&{bootstrapProbeKey?:string}).bootstrapProbeKey;writeHosting(store,peer,{verifying:false,reason:error.code,userStep:error.message,bootstrapProbeKey:key,nextAt:key?Number.MAX_SAFE_INTEGER:Date.now()+30000});}}throw error;
     }
     finally{this.preparing.delete(peer.id);}
+    if(handoffToTakeover)await this.repairExistingCodexSubscription(store.peer(peer.id));
   }
   ownedClaudeLaunchReady(peer:Peer):boolean{
     if(peer.host!=='claude'||peer.owner!=='nxbridge')return true;
@@ -345,6 +363,7 @@ export class BrokerLifecycleCoordinator {
         }
         await this.prepare(peer,extraReason);
         if(store.peer(peer.id).state==='offline'||!store.endpoint(peer.id))throw new BridgeError('recovery_pending','原会话尚未恢复就绪。');
+        if(peer.host==='codex'&&this.services.takeovers.get(peer.id)&&!this.environment.adapters.codex.hasSubscription(store.peer(peer.id),store.endpoint(peer.id)!))return false;
       }else{
                                          
         const endpoint=store.endpoints(peer.id).filter(e=>e.mode==='app-server').sort((a,b)=>a.seenAt-b.seenAt).at(-1);
@@ -587,15 +606,19 @@ export class BrokerLifecycleCoordinator {
       }
     }
   }
-  private async repairFencedCodexSubscription(peer:Peer):Promise<void>{
+  private async repairExistingCodexSubscription(peer:Peer):Promise<void|typeof SKIPPED>{
     const {store,adapters}=this.environment,pair=store.pairFor(peer.id);
     if(peer.host!=='codex'||peer.owner!=='nxbridge'||!peer.sessionId||!pair||this.preparing.has(peer.id)||this.codexRecycle.fenced(peer.id))return;
     const endpoint=store.endpoint(peer.id)??store.endpoints(peer.id).filter(ep=>ep.mode==='app-server'&&!ep.daemon&&!ep.pendingContext).sort((a,b)=>b.seenAt-a.seenAt)[0];
     if(!endpoint||endpoint.mode!=='app-server'||endpoint.daemon||endpoint.pendingContext)return;
+    if(adapters.codex.hasSubscription(peer,endpoint)){this.subscriptionHolds.delete(peer.id);return;}
+    const lease=this.services.takeovers.get(peer.id),previous=this.subscriptionHolds.get(peer.id);
+    if(lease&&previous?.leaseId===lease.id&&previous.retryAt>Date.now())return SKIPPED;
     const guard=()=>{
       const current=store.peer(peer.id),paired=store.pairFor(peer.id);
+      if(!this.services.takeovers.allowsCodexSubscription(current,endpoint))throw new RuntimeRecoveryHold('takeover_unverified',codexDeliveryHoldText('takeover_unverified').status);
       if(this.hooks.producersPaused()||current.owner!=='nxbridge'||current.sessionId!==peer.sessionId||paired?.id!==pair.id||paired.paused
-        ||!this.enabled(peer.id)||!this.enabled(pair.claude)||this.retiring.has(peer.id)||this.restarting.has(peer.id)||this.services.takeovers.get(peer.id)
+        ||!this.enabled(peer.id)||!this.enabled(pair.claude)||this.retiring.has(peer.id)||this.restarting.has(peer.id)
         ||store.setting('managedSessionConflict:'+peer.id)||store.bindings.current(peer.id)?.transitioning||hostingRecord(store,current)?.released||this.codexRecycle.fenced(peer.id))
         throw new RuntimeRecoveryHold('owned_subscription_waiting','核对原订阅期间会话或归属已改变，等待重新核验。');
     };
@@ -603,20 +626,36 @@ export class BrokerLifecycleCoordinator {
     try{
       guard();
                                                         
-      await adapters.codex.attach(peer,endpoint,{prepare:guard});guard();
-    }catch(error){this.codexRecycle.noteHold(peer,error);throw error;}
+      await adapters.codex.attach(peer,endpoint,{prepare:guard,...(this.services.takeovers.get(peer.id)?{subscribeLoaded:()=>this.services.takeovers.codexSubscriptionGuard(peer,endpoint)}:{})});guard();
+      this.subscriptionHolds.delete(peer.id);
+    }catch(error){
+      const current=this.services.takeovers.get(peer.id);
+                                                           
+      if(current&&error instanceof BridgeError){
+        const code=error.code==='takeover_unverified'?'takeover_unverified':'owned_subscription_waiting';
+        const reason=describeError(error).slice(0,1200);
+        this.subscriptionHolds.set(peer.id,{leaseId:current.id,code,reason,retryAt:Date.now()+5000});
+        if(previous?.leaseId!==current.id||previous.code!==code)store.event('codex.subscription.held',{peerId:peer.id,leaseId:current.id,code,reason});
+        return SKIPPED;
+      }
+      this.codexRecycle.noteHold(peer,error);throw error;
+    }
     finally{this.restoringMembers.delete(peer.id);}
   }
-  private async recoverPairedPeer(id:string,hasPending:boolean):Promise<void>{
+  private async recoverPairedPeer(id:string,hasPending:boolean):Promise<void|typeof SKIPPED>{
     const {store}=this.environment;
     const peer=store.getPeer(id),pair=store.pairFor(id);
     if(this.hooks.stopped()||!peer)return;
     if(!pair||pair.paused||!this.enabled(id)||claudeAutoHolds(store,peer)||this.retiring.has(id)||this.restarting.has(id)
-      ||this.services.takeovers.get(id)||store.setting('managedSessionConflict:'+id)||hostingRecord(store,peer)?.released||['paused','needsHuman'].includes(peer.state)){
+      ||store.setting('managedSessionConflict:'+id)||hostingRecord(store,peer)?.released||['paused','needsHuman'].includes(peer.state)){
       if(peer.host==='codex')this.codexRecycle.reconcileAuthority(peer);
       return;
     }
-    if(this.hooks.startupBlocked?.(id)){await this.repairFencedCodexSubscription(peer);return;}
+    if(this.services.takeovers.get(id)){
+      if(peer.host==='codex'){this.codexRecycle.reconcileAuthority(peer);return this.repairExistingCodexSubscription(peer);}
+      return;
+    }
+    if(this.hooks.startupBlocked?.(id))return this.repairExistingCodexSubscription(peer);
     if(peer.state==='ready')this.services.deliveryHealth.promoteIdleNotices(pair.id,id);
     if(peer.host==='codex'){
       if(peer.owner==='nxbridge'&&!this.preparing.has(id)){

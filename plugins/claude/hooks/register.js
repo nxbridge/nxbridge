@@ -11,7 +11,7 @@ import { MOD_REVISION } from './integration-revision.js';
 import { deliverNotice, noticePrompt, noticeFailure, isMonitorRecipient, preSubmitBusy, retryable, hasHeld, takeHeld, settleHeld, noticePickup, upgradeHeld } from './notices.js';
 import { reloadStart, reloadCall, reloadComplete, autoReload, reloadUnapplied, reloadUnappliedText } from './reload.js';
 import { startProgress, progress, streamProgress } from './progress.js';
-import { hostingText, hostingModel } from './hosting.js';
+import { hostingText, hostingModel, hostingHoldText } from './hosting.js';
 import { HumanTurns } from './human-turns.js';
 import { providerText, failedText } from './provider.js';
 import { humanOrigin, humanPrompt, inputSource } from './human-origin.js';
@@ -674,6 +674,8 @@ export function register(on) {
                                                                
           : status.partner?.health?.state === 'silent' ? (status.partner.health.progressEvidence === false ? 'Codex 的进度暂时无法观测，不代表卡住（运行 nxbridge status 查看）' : 'Codex 长时间没有进展，原因未知（运行 nxbridge status 查看）')
           : status.partner?.health?.state === 'failed' ? failedText(status.partner.health)
+                                                         
+          : hostingHoldText(status.partner?.hosting) ? hostingHoldText(status.partner.hosting)
           : strikes >= 8 ? 'Codex 离线超过 2 分钟（运行 nxbridge status 查看）' : undefined));
         }finally{checkingStatus=false;}
       });

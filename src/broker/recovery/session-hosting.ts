@@ -14,6 +14,7 @@ import { nativeConfigHome, processIdentity, codexArguments, codexAppServerArgume
 import { knownNativeProcesses, type KnownNativeProcess } from '../../process/native-processes.js';
 import { ownedProcesses } from '../../process/owned-processes.js';
 import { parkLaunchFailure, type LaunchPark } from '../../hosts/launch-park.js';
+import type {CodexDeliveryHold} from '../delivery/codex-delivery-gate.js';
 
 export interface HostingRecord {
   pairId:string;memberId:string;sessionId:string;configHome:string;cwd:string;origin:'user'|'managed';
@@ -45,25 +46,30 @@ function verificationPending(peer:Peer,value:HostingRecord|undefined):boolean{
   return !!value?.verifying&&peer.owner==='nxbridge';
 }
                                              
-export function hostingGate(store:Store,peer:Peer):boolean{
-  if(peer.host!=='codex'||!peer.sessionId)return false;
-  if(store.setting('managedRuntimeConflict:'+peer.id))return true;
-  if(peer.owner==='user'&&codexForegroundEnd(store,peer))return true;
+export function hostingHold(store:Store,peer:Peer):'session_conflict'|'hosting_transition'|'hosting_window_closed'|'hosting_awaiting_window'|'hosting_blocked'|undefined{
+  if(peer.host!=='codex'||!peer.sessionId)return;
+  if(store.setting('managedRuntimeConflict:'+peer.id))return'session_conflict';
+  if(peer.owner==='user'&&codexForegroundEnd(store,peer))return'hosting_window_closed';
   const value=hostingRecord(store,peer);
-  if(verificationPending(peer,value)||peer.owner==='nxbridge'&&value?.reason==='bootstrap_policy_unsupported'||value?.phase==='adopting'||value?.phase==='releasing'||value?.phase==='awaiting_window')return true;
-  return peer.owner==='user'&&(!store.endpoint(peer.id)||peer.state==='offline');
+  if(peer.owner==='nxbridge'&&(value?.reason==='bootstrap_policy_unsupported'||verificationPending(peer,value)&&value?.verificationError)
+    ||value?.reason&&['adopting','releasing'].includes(value.phase??''))return'hosting_blocked';
+  if(value?.phase==='awaiting_window')return'hosting_awaiting_window';
+  if(verificationPending(peer,value)||value?.phase==='adopting'||value?.phase==='releasing')return'hosting_transition';
+  if(peer.owner==='user'&&(!store.endpoint(peer.id)||peer.state==='offline'))return'hosting_window_closed';
 }
-export function hostingStatus(store:Store,peer:Peer){
+export function hostingGate(store:Store,peer:Peer):boolean{return !!hostingHold(store,peer);}
+export function hostingStatus(store:Store,peer:Peer,deliveryHold?:CodexDeliveryHold|null){
   if(peer.host!=='codex'||!peer.sessionId||!store.pairFor(peer.id))return undefined;
   const value=hostingRecord(store,peer),endpoint=store.endpoint(peer.id),binding=store.bindings.current(peer.id),lease=store.setting<{foreground?:{pid:number;procStart:string}}>('takeover:'+peer.id);
   const holder=lease?.foreground??(binding?{pid:binding.pid,procStart:binding.procStart}:endpoint?.native??(endpoint?.pid&&endpoint.procStart?{pid:endpoint.pid,procStart:endpoint.procStart}:undefined));
   const preference=value?.background??peer.owner==='nxbridge'?'bg':'user';
-  const conflict=store.setting('managedRuntimeConflict:'+peer.id);
+  const hold=deliveryHold===undefined?hostingHold(store,peer):deliveryHold?.code,conflict=!!(store.setting('managedRuntimeConflict:'+peer.id)||store.setting('managedSessionConflict:'+peer.id));
   const verifying=verificationPending(peer,value),verificationError=verifying?value?.verificationError:undefined;
   const steadyPhase=peer.owner==='user'&&(!endpoint||peer.state==='offline')?'window_closed':peer.owner==='nxbridge'&&preference==='bg'&&!binding&&!lease?'background':'foreground';
   const phase=conflict||verificationError||peer.owner==='nxbridge'&&value?.reason==='bootstrap_policy_unsupported'||value?.reason&&['adopting','releasing'].includes(value.phase??'')?'blocked':value?.phase??(verifying?'verifying':steadyPhase);
   const pair=store.pairFor(peer.id)!,counts=store.deliveryCounts(pair.id,pair.claude===peer.id?pair.codex:pair.claude);
-  return{preference,phase,verifying:verifying&&!verificationError,name:peer.name,pair_id:store.pairFor(peer.id)!.id,member_id:peer.id,session_id:peer.sessionId,config_home:value?.configHome??endpoint?.configHome??store.endpoints(peer.id).find(ep=>ep.configHome)?.configHome,cwd:peer.cwd,wake_capable:!hostingGate(store,peer)&&!!endpoint&&(endpoint.mode==='app-server'&&!endpoint.daemon||endpoint.mode==='embedded'&&!!endpoint.bridge),...(holder?{holder:{mode:endpoint?.daemon?'daemon':endpoint?.mode??'foreground',pid:holder.pid,generation:holder.procStart}}:{}),held_unsent:hostingGate(store,peer)?counts.accepted:0,uncertain:counts.unknown+counts.sending+counts.runtimeQueued,...(value?.policy?{policy:value.policy}:{}),...(conflict?{reason:'session_conflict'}:verificationError?{reason:verificationError.code,user_step:verificationError.message}:value?.reason?{reason:value.reason}:{}),...(!verificationError&&value?.userStep?{user_step:value.userStep}:{})};
+  const held=!!hold;
+  return{preference,phase,verifying:verifying&&!verificationError,name:peer.name,pair_id:store.pairFor(peer.id)!.id,member_id:peer.id,session_id:peer.sessionId,config_home:value?.configHome??endpoint?.configHome??store.endpoints(peer.id).find(ep=>ep.configHome)?.configHome,cwd:peer.cwd,wake_capable:!!endpoint&&(endpoint.mode==='app-server'&&!endpoint.daemon||endpoint.mode==='embedded'&&!!endpoint.bridge),...(holder?{holder:{mode:endpoint?.daemon?'daemon':endpoint?.mode??'foreground',pid:holder.pid,generation:holder.procStart}}:{}),held_unsent:held?counts.accepted:0,uncertain:counts.unknown+counts.sending+counts.runtimeQueued,...(deliveryHold?{delivery_hold:{...deliveryHold}}:{}),...(value?.policy?{policy:value.policy}:{}),...(conflict?{reason:'session_conflict'}:verificationError?{reason:verificationError.code,user_step:verificationError.message}:value?.reason?{reason:value.reason}:{}),...(!verificationError&&value?.userStep?{user_step:value.userStep}:{})};
 }
 export function closeHostedWindow(store:Store,peer:Peer,epoch?:string):void{
   const record=hostingRecord(store,peer);store.deactivate(peer.id,epoch);
@@ -81,11 +87,13 @@ function holderTopology(store:Store,peer:Peer):string{
 export class SessionTransfers {
   private pending=new Map<string,{kind:'adopt'|'release';work:Promise<unknown>}>();
   constructor(private store:Store,private config:BridgeConfig,private home:string,private ops:{
+    hostingStatus?:(peer:Peer)=>ReturnType<typeof hostingStatus>;
     holder:(peer:Peer)=>Promise<'alive'|'dead'|'unknown'>;prepare:(peer:Peer)=>Promise<void>;stop:(peer:Peer,endpoint:Endpoint,guard:()=>void)=>Promise<void>;enabled:(peer:Peer)=>void;
     loaded?:(peer:Peer,endpoint:Endpoint)=>Promise<'alive'|'dead'|'unknown'>;daemon?:(peer:Peer,runtime:{pid:number;procStart:string})=>Promise<'alive'|'dead'|'unknown'>;cleanup?:(peer:Peer,endpoint:string)=>Promise<void>;
     inspect?:(runtime:ManagedRuntime,sessionId:string)=>Promise<{id:string;parentThreadId?:string|null;source?:any;threadSource?:string;status?:{type:string}}|undefined>;
     processes?:(host:'codex'|'claude')=>Promise<KnownNativeProcess[]>;identity?:typeof processIdentity;
   }){}
+  private view(peer:Peer){return this.ops.hostingStatus?this.ops.hostingStatus(peer):hostingStatus(this.store,peer);}
   private assert(peer:Peer):void{this.ops.enabled(peer);if(peer.host!=='codex'||!peer.sessionId||!this.store.pairFor(peer.id))throw new BridgeError('session_missing','托管切换需要已配对的 Codex 原会话。');}
   private human(peer:Peer):void{
     if(peer.state==='needsHuman'||this.store.questions(true).some(q=>q.from===peer.id||q.to===peer.id))throw new BridgeError('pending_approval','原会话仍有问题或审批待处理；请先 nxbridge open codex 打开并回答，再切换托管。');
@@ -94,7 +102,7 @@ export class SessionTransfers {
     const pending=this.pending.get(peer.id);if(pending?.kind===kind)return pending.work;
     const execute=pending?pending.work.catch(()=>{}).then(work):work(),next=execute.finally(()=>{if(this.pending.get(peer.id)?.work===next)this.pending.delete(peer.id);});this.pending.set(peer.id,{kind,work:next});return next;
   }
-  private waiting(peer:Peer):unknown{const live=!!this.store.endpoint(peer.id)&&peer.state!=='offline';this.store.updatePeer(peer.id,{owner:'user'});writeHosting(this.store,this.store.peer(peer.id),{background:false,released:true,phase:live?undefined:'awaiting_window',reason:undefined,userStep:live?undefined:'按平时方式重新打开原 Codex 会话。',attempts:0,nextAt:undefined});return{status:'paired',hosting:hostingStatus(this.store,this.store.peer(peer.id))};}
+  private waiting(peer:Peer):unknown{const live=!!this.store.endpoint(peer.id)&&peer.state!=='offline';this.store.updatePeer(peer.id,{owner:'user'});writeHosting(this.store,this.store.peer(peer.id),{background:false,released:true,phase:live?undefined:'awaiting_window',reason:undefined,userStep:live?undefined:'按平时方式重新打开原 Codex 会话。',attempts:0,nextAt:undefined});return{status:'paired',hosting:this.view(this.store.peer(peer.id))};}
   async wait(peer:Peer):Promise<unknown>{this.assert(peer);if(this.pending.has(peer.id)||runtimeFor(this.home,{peerId:peer.id}))return this.release(peer);return this.waiting(peer);}
   private failed(peer:Peer,error:unknown,phase:'adopting'|'releasing'):void{const record=hostingRecord(this.store,peer);if(!record||phase==='adopting'&&record.released)return;const attempts=(record.attempts??0)+1,key=(error as {bootstrapProbeKey?:string}).bootstrapProbeKey,launchPark=phase==='adopting'?parkLaunchFailure(error,this.home,this.config,peer,record.configHome,this.store.setting<any>('managedLaunchProof:'+peer.id)??{}):undefined;writeHosting(this.store,peer,{phase,reason:(error as BridgeError).code??'holder_unknown',userStep:describeError(error),attempts,bootstrapProbeKey:key,launchPark,nextAt:launchPark||(error as BridgeError).code==='bootstrap_policy_unsupported'&&key?Number.MAX_SAFE_INTEGER:Date.now()+Math.min(300000,5000*2**Math.min(attempts-1,6))});}
   async reconcileOwned(peer:Peer):Promise<boolean>{
@@ -126,12 +134,12 @@ export class SessionTransfers {
       let topology=holderTopology(this.store,peer);
       const guard=(checkHolder=true)=>{const current=this.store.peer(peer.id);this.ops.enabled(current);if(current.sessionId!==id||this.store.pairFor(current.id)?.id!==pair.id||hostingRecord(this.store,current)?.released||this.store.setting('managedSessionConflict:'+peer.id)||this.store.setting('managedRuntimeConflict:'+peer.id)||checkHolder&&holderTopology(this.store,current)!==topology)throw new BridgeError('session_changed','托管切换期间会话、配对或原生持有者已经改变。');};
       if(peer.owner==='nxbridge'&&this.store.endpoint(peer.id)&&peer.state!=='offline'){
-        await this.settleOwned(peer);return{status:hostingGate(this.store,this.store.peer(peer.id))?'held':'paired',hosting:hostingStatus(this.store,this.store.peer(peer.id))};
+        await this.settleOwned(peer);return{status:hostingGate(this.store,this.store.peer(peer.id))?'held':'paired',hosting:this.view(this.store.peer(peer.id))};
       }
       writeHosting(this.store,peer,{background:true,released:false,reason:undefined,userStep:undefined},home);
       try{
         const state=peer.owner==='nxbridge'?'dead':await this.ops.holder(peer);guard();
-        if(state==='alive'){writeHosting(this.store,peer,{phase:undefined,reason:'holder_active',userStep:'已记录后台托管选择；原窗口退出后继续原会话。'});return{status:'paired',hosting:hostingStatus(this.store,this.store.peer(peer.id))};}
+        if(state==='alive'){writeHosting(this.store,peer,{phase:undefined,reason:'holder_active',userStep:'已记录后台托管选择；原窗口退出后继续原会话。'});return{status:'paired',hosting:this.view(this.store.peer(peer.id))};}
         if(state==='unknown')throw new BridgeError('holder_unknown','原窗口或线程是否已退出尚无法核验，未启动第二个运行时。');
         this.human(peer);
         this.store.transaction(()=>{guard();const binding=this.store.bindings.current(peer.id);if(binding)this.store.bindings.save({...binding,active:false});this.store.deactivate(peer.id);this.store.updatePeer(peer.id,{owner:'nxbridge',state:'offline'});writeHosting(this.store,this.store.peer(peer.id),{background:true,released:false,phase:'adopting',verified:false},home);const proof=this.store.setting<any>('managedLaunchProof:'+peer.id);this.store.setSetting('managedLaunchProof:'+peer.id,{...(proof?.sessionId===id?proof:{}),sessionId:id,configHome:home,adopted:true});});
@@ -145,7 +153,7 @@ export class SessionTransfers {
         await this.ops.prepare(this.store.peer(peer.id));guard(false);
         if(!this.store.endpoint(peer.id)||this.store.peer(peer.id).state==='offline')throw new BridgeError('policy_verification_failed','原会话尚未完成权限核验，消息继续保留。');
         writeHosting(this.store,this.store.peer(peer.id),{phase:undefined,verified:true,reason:undefined,userStep:undefined,attempts:0,nextAt:undefined});this.store.event('hosting.adopted',{peerId:peer.id,pairId:pair.id,sessionId:id});
-        return{status:'paired',hosting:hostingStatus(this.store,this.store.peer(peer.id))};
+        return{status:'paired',hosting:this.view(this.store.peer(peer.id))};
       }catch(error){this.failed(this.store.peer(peer.id),error,'adopting');throw error;}
     });
   }
@@ -154,24 +162,24 @@ export class SessionTransfers {
     if(this.pending.get(peer.id)?.kind==='adopt'){this.store.updatePeer(peer.id,{owner:'user'});writeHosting(this.store,this.store.peer(peer.id),{background:false,released:true,phase:'releasing',verified:false});}
     return this.run(peer,'release',async()=>{
       peer=this.store.peer(peer.id);const prior=hostingRecord(this.store,peer),lease=this.store.setting<any>('takeover:'+peer.id);
-      if(prior?.released&&peer.owner==='user'&&(!prior.phase||prior.phase==='awaiting_window'&&prior.verified))return{status:'paired',hosting:hostingStatus(this.store,peer)};
+      if(prior?.released&&peer.owner==='user'&&(!prior.phase||prior.phase==='awaiting_window'&&prior.verified))return{status:'paired',hosting:this.view(peer)};
       if(lease?.foreground&&(await probeProcesses([lease.foreground]))[0]==='alive'){
-        this.store.transaction(()=>{this.store.updatePeer(peer.id,{owner:'user'});writeHosting(this.store,this.store.peer(peer.id),{background:false,released:true,phase:undefined,verified:true,reason:undefined});});return{status:'paired',hosting:hostingStatus(this.store,this.store.peer(peer.id))};
+        this.store.transaction(()=>{this.store.updatePeer(peer.id,{owner:'user'});writeHosting(this.store,this.store.peer(peer.id),{background:false,released:true,phase:undefined,verified:true,reason:undefined});});return{status:'paired',hosting:this.view(this.store.peer(peer.id))};
       }
       if(lease)throw new BridgeError('holder_unknown','临时接管窗口尚未核验退出，请返回原窗口后重试。');
       if(peer.owner==='user'&&!prior?.phase&&!runtimeFor(this.home,{peerId:peer.id}))return this.waiting(peer);
       this.human(peer);const runtime=runtimeFor(this.home,{peerId:peer.id});
-      if(!runtime&&prior?.released){closeHostedWindow(this.store,peer);writeHosting(this.store,this.store.peer(peer.id),{phase:'awaiting_window',verified:true,reason:undefined});return{status:'paired',hosting:hostingStatus(this.store,this.store.peer(peer.id))};}
-      if(runtime&&await this.retireExitedRuntime(runtime)){closeHostedWindow(this.store,peer);this.store.updatePeer(peer.id,{owner:'user'});writeHosting(this.store,this.store.peer(peer.id),{background:false,released:true,phase:'awaiting_window',verified:true,reason:undefined});return{status:'paired',hosting:hostingStatus(this.store,this.store.peer(peer.id))};}
+      if(!runtime&&prior?.released){closeHostedWindow(this.store,peer);writeHosting(this.store,this.store.peer(peer.id),{phase:'awaiting_window',verified:true,reason:undefined});return{status:'paired',hosting:this.view(this.store.peer(peer.id))};}
+      if(runtime&&await this.retireExitedRuntime(runtime)){closeHostedWindow(this.store,peer);this.store.updatePeer(peer.id,{owner:'user'});writeHosting(this.store,this.store.peer(peer.id),{background:false,released:true,phase:'awaiting_window',verified:true,reason:undefined});return{status:'paired',hosting:this.view(this.store.peer(peer.id))};}
       if(runtime&&runtime.value.state!=='ready'&&this.ops.cleanup){
         this.store.updatePeer(peer.id,{owner:'user'});writeHosting(this.store,this.store.peer(peer.id),{background:false,released:true,phase:'releasing'});
-        try{await this.ops.cleanup(this.store.peer(peer.id),runtime.value.endpoint);const remaining=runtimeFor(this.home,{peerId:peer.id});if(remaining&&!await this.retireExitedRuntime(remaining))throw new BridgeError('holder_unknown','启动中的原后台尚未核验退出。');closeHostedWindow(this.store,this.store.peer(peer.id));writeHosting(this.store,this.store.peer(peer.id),{phase:'awaiting_window',verified:true,reason:undefined});return{status:'paired',hosting:hostingStatus(this.store,this.store.peer(peer.id))};}catch(error){this.failed(this.store.peer(peer.id),error,'releasing');throw error;}
+        try{await this.ops.cleanup(this.store.peer(peer.id),runtime.value.endpoint);const remaining=runtimeFor(this.home,{peerId:peer.id});if(remaining&&!await this.retireExitedRuntime(remaining))throw new BridgeError('holder_unknown','启动中的原后台尚未核验退出。');closeHostedWindow(this.store,this.store.peer(peer.id));writeHosting(this.store,this.store.peer(peer.id),{phase:'awaiting_window',verified:true,reason:undefined});return{status:'paired',hosting:this.view(this.store.peer(peer.id))};}catch(error){this.failed(this.store.peer(peer.id),error,'releasing');throw error;}
       }
       const endpoint=this.store.endpoint(peer.id)??(runtime?{peerId:peer.id,address:runtime.value.endpoint,epoch:runtime.value.endpoint,mode:'app-server' as const,pid:runtime.value.pid??null,procStart:runtime.value.procStart??null,configHome:runtime.value.configHome,active:false,seenAt:Date.now()}:this.store.endpoints(peer.id).filter(ep=>ep.mode==='app-server').sort((a,b)=>b.seenAt-a.seenAt)[0]);
       if(!endpoint)throw new BridgeError('holder_unknown','没有可核验的原后台端点，未报告可以打开原会话。');
       const pairId=this.store.pairFor(peer.id)!.id,id=peer.sessionId!,guard=()=>{const current=this.store.peer(peer.id);this.ops.enabled(current);const record=hostingRecord(this.store,current);if(current.sessionId!==id||this.store.pairFor(current.id)?.id!==pairId||!record?.released)throw new BridgeError('session_changed','释放期间会话或选择已变化。');};
       this.store.transaction(()=>{this.store.updatePeer(peer.id,{owner:'user'});writeHosting(this.store,this.store.peer(peer.id),{background:false,released:true,phase:'releasing',reason:undefined,verified:false});});
-      try{await this.ops.stop(this.store.peer(peer.id),endpoint,guard);guard();closeHostedWindow(this.store,this.store.peer(peer.id));writeHosting(this.store,this.store.peer(peer.id),{phase:'awaiting_window',verified:true,userStep:`原后台已退出。按平时方式打开原会话 ${id}（目录 ${peer.cwd}）。`});return{status:'paired',hosting:hostingStatus(this.store,this.store.peer(peer.id))};}
+      try{await this.ops.stop(this.store.peer(peer.id),endpoint,guard);guard();closeHostedWindow(this.store,this.store.peer(peer.id));writeHosting(this.store,this.store.peer(peer.id),{phase:'awaiting_window',verified:true,userStep:`原后台已退出。按平时方式打开原会话 ${id}（目录 ${peer.cwd}）。`});return{status:'paired',hosting:this.view(this.store.peer(peer.id))};}
       catch(error){this.failed(this.store.peer(peer.id),error,'releasing');throw error;}
     });
   }

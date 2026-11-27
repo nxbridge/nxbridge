@@ -5,7 +5,10 @@ import {BridgeError} from '../../shared/errors.js';
 export interface CodexForegroundWindow {endpoint:string;sessionId?:string;foreground:{pid:number;procStart:string}}
 const setting='codexForegroundWindows';
 const key=(window:CodexForegroundWindow)=>JSON.stringify([window.endpoint,window.foreground.pid,window.foreground.procStart]);
-const overlaps=(left:CodexForegroundWindow,right:CodexForegroundWindow)=>left.endpoint===right.endpoint&&(!left.sessionId||!right.sessionId||left.sessionId===right.sessionId);
+const overlaps=(left:Pick<CodexForegroundWindow,'endpoint'|'sessionId'>,right:Pick<CodexForegroundWindow,'endpoint'|'sessionId'>)=>left.endpoint===right.endpoint&&(!left.sessionId||!right.sessionId||left.sessionId===right.sessionId);
+export function matchingCodexForegroundWindows(store:Store,endpoint:string,sessionId?:string):CodexForegroundWindow[]{
+  return(store.setting<CodexForegroundWindow[]>(setting)??[]).filter(window=>overlaps(window,{endpoint,sessionId}));
+}
 
                                          
 export class CodexForegroundWindows {

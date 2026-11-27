@@ -21,7 +21,15 @@ export class DeliveryHealth {
       if(this.policy.sameFact(recipientId,notice))return;
       const key=deliveryHealthKey(pairId,recipientId),value=this.storage.setting<DeliveryIncident>(key)??{id:randomUUID(),active:false,reasons:[],notices:[],checkedAt:Date.now()};
       const existing=value.notices.find(n=>n.id===notice.id);
-      if(existing){if(notice.source==='managed_recovery'&&!existing.admitted&&(existing.state==='pending'||existing.state==='sending')){Object.assign(existing,notice);this.storage.setSetting(key,value);}return;}
+      if(existing){
+                                                         
+        const cancelled=existing.state==='denied'&&existing.error==='condition resolved before delivery';
+        if(notice.source==='managed_recovery'&&!existing.admitted&&(existing.state==='pending'||existing.state==='sending'||cancelled)){
+          if(cancelled){delete existing.error;delete existing.claimedAt;}
+          Object.assign(existing,notice);this.storage.setSetting(key,value);
+        }
+        return;
+      }
       value.notices=value.notices.filter(n=>n.state==='pending'||n.state==='sending'||waitingIdle(n)&&n.kind!==notice.kind);value.notices.push(notice);this.storage.setSetting(key,value);
     });
   }

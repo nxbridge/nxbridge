@@ -5,7 +5,7 @@ import type { Endpoint, Host, Pair, Peer } from '../../types.js';
 import {BridgeError,describeError} from '../../shared/errors.js';
 import { normalizedHome } from '../../integration/hooks/session-bindings.js';
 import { deterministicLaunchFailure, type LaunchPark } from '../../hosts/launch-park.js';
-import { codexRecycleFenced, type CodexRecycleOperation } from './codex-recycle.js';
+import { codexRecycleFenced, type CodexRecycleOperation, type CodexRecycleDecision } from './codex-recycle.js';
 import { RECOVER_PARTNER_DESCRIPTION, RECYCLE_CLEANUP_USER_STEP, RECYCLE_OLD_UNKNOWN_USER_STEP } from '../stuck-session-text.js';
 
                                      
@@ -27,6 +27,8 @@ export interface ManagedIncident {
   noticeId:string;wakeAdmitted?:boolean;noticeAdmitted?:boolean;notice?:RecoveryNotice;
   userAuthorization?:{id:string;unused:boolean};
   recycle?:CodexRecycleOperation;
+                                      
+  recyclePublication?:CodexRecycleDecision;
 }
 export const managedRecoveryKey=(peerId:string)=>'managedRecovery:'+peerId;
 const blocksOrdinary=(value:ManagedIncident|undefined)=>!!value?.recycle&&value.recycle.phase!=='handback';
@@ -134,6 +136,11 @@ export class ManagedRecovery {
       if(!current||current.state==='closed'||current.id!==value.id||current.pairId!==value.pairId||current.sessionId!==value.sessionId||current.configHome!==value.configHome||current.recycle?.step!==expected?.step)
         throw new BridgeError('incident_changed','回收核验期间，当前会话或恢复阶段已经改变。');
       current.recycle=next;
+      if(next?.phase==='awaiting_partner'&&next.basis.decision.noticePosted)current.recyclePublication=next.basis.decision;
+                                          
+      else if(expected?.phase==='awaiting_partner'&&expected.basis.decision.noticePosted)current.recyclePublication=expected.basis.decision;
+                                                 
+      if(next?.observationGap?.lapsedRevision)delete current.recyclePublication;
       if(next?.phase==='held'||next?.phase==='awaiting_partner'){
         current.state='blocked';current.preconditionCode=next.phase==='held'?next.code:'codex_recycle_confirmation';current.precondition=next.phase==='held'?next.reason:undefined;
       }else if(next?.phase==='ready'){

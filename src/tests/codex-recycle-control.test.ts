@@ -338,6 +338,61 @@ test('忙碌根会话的进程快照反复截断三十分钟，只发布一次�
   assert.equal(emitted.length,2);assert.equal(f.effects.stops,0);
 });
 
+for(const mode of ['progressing','stalled','unknown','without_turn'] as const)test('进程变化只在活动轮次继续推进时不重复提醒，证据批准仍逐版核验：'+mode,async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const work:CodexRecycleWork={activeTurnIds:mode==='without_turn'?[]:['active'],progress:mode==='without_turn'?'progressing':mode,
+    ...(mode==='progressing'?{lastProgressAt:now}:{}),roles:['host'],unresolved:[]};
+  const f=recycleFixture(t,work);f.store.accept(f.pair,f.sender,'等待中的来信','roles-held');await f.advanceStable();
+  const incident=f.recovery.get(f.peer.id)!,initial=incident.recycle;assert.ok(initial?.phase==='awaiting_partner');
+  const first=initial.basis.decision,notice=f.notices('decision')[0]!;
+  assert.ok(f.delivery.prepare(f.pair.id,f.sender.id,notice.id,f.pair.id));f.delivery.outcome(f.pair.id,f.sender.id,notice.id,'submitted');
+  const approval={incidentId:incident.id,evidenceRevision:first.revision,reason:'只能同意此前核验的证据。'};
+  for(let change=0;change<3;change++){
+    now+=5001;f.setWork({...work,lastProgressAt:mode==='progressing'?now:undefined,roles:['host','tool-'+change]});
+    f.reopenControl(true);await f.advanceStable();
+    const current=f.recovery.get(f.peer.id)?.recycle;assert.ok(current?.phase==='awaiting_partner');
+    assert.notEqual(current.basis.decision.revision,first.revision);assert.equal(current.basis.decision.since,first.since);
+    const notices=f.notices('decision');assert.equal(notices.length,mode==='progressing'?0:1);
+    if(notices[0]){
+      assert.ok(notices[0].message.includes(current.basis.decision.revision));
+      assert.ok(f.delivery.prepare(f.pair.id,f.sender.id,notices[0].id,f.pair.id));f.delivery.outcome(f.pair.id,f.sender.id,notices[0].id,'submitted');
+    }
+    await f.control.advance(f.peer,approval);assert.deepEqual(f.effects,{stops:0,launches:0,subscriptions:0});
+  }
+  if(mode==='progressing'){
+    now+=5001;f.setWork({...work,progress:'stalled',roles:['host','tool-2']});await f.advanceStable();
+    const current=f.recovery.get(f.peer.id)?.recycle;assert.ok(current?.phase==='awaiting_partner');
+    assert.equal(f.notices('decision').length,1,'进度停滞是新事实，必须重新提醒');
+    assert.ok(f.notices('decision')[0]!.message.includes(current.basis.decision.revision));
+  }
+});
+
+for(const outcome of ['unadmitted','submitted','unknown','rejected'] as const)test('消息积压再次出现时沿用同一提醒，只有准入前已取消的提醒恢复首次投递：'+outcome,async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const f=recycleFixture(t,{activeTurnIds:['active'],progress:'progressing',lastProgressAt:now,roles:[],unresolved:[]},true);
+  const held=f.store.accept(f.pair,f.sender,'先前等待的来信','first-held');await f.advanceStable();
+  const initial=f.recovery.get(f.peer.id)?.recycle;assert.ok(initial?.phase==='awaiting_partner');
+  const {revision,noticeId,since}=initial.basis.decision;
+  const legacy=f.recovery.get(f.peer.id)!;delete legacy.recyclePublication;f.store.setSetting('managedRecovery:'+f.peer.id,legacy);
+  if(outcome==='submitted'){
+    assert.ok(f.delivery.prepare(f.pair.id,f.sender.id,noticeId,f.pair.id));f.delivery.outcome(f.pair.id,f.sender.id,noticeId,'submitted');
+  }else if(outcome==='unknown')f.delivery.outcome(f.pair.id,f.sender.id,noticeId,'unknown','原生结果未知');
+  else if(outcome==='rejected')f.delivery.outcome(f.pair.id,f.sender.id,noticeId,'denied','原生拒绝');
+  f.store.transition(held.id,'contextObserved');now+=60000;await f.advanceStable();
+  assert.equal(f.recovery.get(f.peer.id)?.recycle,undefined);assert.deepEqual(f.notices('decision'),[]);
+  const later=f.store.accept(f.pair,f.sender,'后来等待的来信','later-held');f.reopenControl(true);now+=60000;await f.advanceStable();
+  const returned=f.recovery.get(f.peer.id)?.recycle;assert.ok(returned?.phase==='awaiting_partner');
+  assert.equal(returned.basis.decision.revision,revision);assert.equal(returned.basis.decision.noticeId,noticeId);assert.equal(returned.basis.decision.since,since);
+  assert.deepEqual(f.notices('decision').map(notice=>notice.id),outcome==='unadmitted'?[noticeId]:[]);
+  if(outcome==='unadmitted'){
+    assert.ok(f.delivery.prepare(f.pair.id,f.sender.id,noticeId,f.pair.id));f.delivery.outcome(f.pair.id,f.sender.id,noticeId,'submitted');
+    f.store.transition(later.id,'contextObserved');now+=60000;await f.advanceStable();
+    f.store.accept(f.pair,f.sender,'下一条等待来信','third-held');f.reopenControl(true);now+=60000;await f.advanceStable();
+    assert.deepEqual(f.notices('decision'),[],'首次实际准入后，后续积压不能再重发同一事实');
+  }
+  assert.deepEqual(f.effects,{stops:0,launches:0,subscriptions:0});
+});
+
 test('排队确认超过时限即使当前读取恢复也已作废，同一份忙碌证据须重新确认',async t=>{
   let now=Date.now();t.mock.method(Date,'now',()=>now);
   const work:CodexRecycleWork={activeTurnIds:['active'],progress:'stalled',roles:[],unresolved:[]};
@@ -346,6 +401,8 @@ test('排队确认超过时限即使当前读取恢复也已作废，同一份�
   const incident=f.recovery.get(f.peer.id)!,decision=incident.recycle;
   assert.ok(decision?.phase==='awaiting_partner');
   const approval={incidentId:incident.id,evidenceRevision:decision.basis.decision.revision,reason:'此前已核对。'};
+  assert.ok(f.delivery.prepare(f.pair.id,f.sender.id,decision.basis.decision.noticeId,f.pair.id));
+  f.delivery.outcome(f.pair.id,f.sender.id,decision.basis.decision.noticeId,'submitted');
   f.timeOutObservation('throw');await f.control.advance(f.peer,approval);f.reopenControl();
   const engine=(f.control as unknown as {engine:CodexRecycle}).engine;
   const advance=engine.advance.bind(engine);

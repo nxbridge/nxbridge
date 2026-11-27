@@ -47,7 +47,7 @@ import { catalogCodexThreads, observeCodexThreadIdentity, readCodexThread, readC
 import { classifyCodexPermission, codexRuntimeEvidence } from './codex-permission.js';
 import { startOwnedCodex, unloadFailedOwnedCodex } from '../owned-launch-policy.js';
 import type { PermissionClass } from '../../types.js';
-import { materializeCodexResumeSettings, resumeSession, readSessionProfile, sessionFile, verifyCodexResumeAck, verifyResumedSession, verifyRestartProfileCurrent, readAppliedSessionSettings, persistedServiceTier, withPersistedCodexPermission, type SessionProfile, type SessionPolicy } from './codex-session-profile.js';
+import { materializeCodexResumeSettings, resumeSession, readSessionProfile, sessionFile, planCodexResume, verifyCodexResumeAck, verifyResumedSession, verifyRestartProfileCurrent, readAppliedSessionSettings, persistedServiceTier, withPersistedCodexPermission, type SessionProfile, type SessionPolicy } from './codex-session-profile.js';
 import { CodexOwnedRoutes, exitedOwnedCodexRoute, ownedCodexLease, type OwnedCodexRoute, type OwnedCodexLaunchProof } from './codex-owned-routes.js';
 import { CodexNativeRpc } from './codex-native-rpc.js';
 import { codexParent, codexSubagent, codexUserWindow } from './codex-lineage.js';
@@ -178,6 +178,7 @@ async function openAppServerTransport(endpoint:string,config:BridgeConfig,bearer
 const codexTransports=new WeakMap<RpcClient,{id:string;closed:Promise<void>;terminate:()=>void;detachAbort:()=>void}>();
 const creationControls=new Set(['thread/read','thread/resume','thread/settings/update','thread/name/set','thread/delete']);
 type ColdResumePlan={attempt:1|2;broker:OwnedIdentity};
+interface CodexAttachOptions {verify?:boolean;prepare?:()=>void;subscribeLoaded?:()=>Promise<()=>void>}
 
                                                
 async function deliveryStep<T>(work:()=>Promise<T>,signal?:AbortSignal,uncertain:boolean|(()=>boolean)=false):Promise<T>{
@@ -663,10 +664,10 @@ export class CodexAdapter extends EventEmitter {
     return restoreBootstrapKey(selectHostLaunch('codex',this.config,{home:this.home,sessionId:peer.sessionId!,cwd:peer.cwd,configHome,
       ...(proof?.executable?{executable:proof.executable,profileId:proof.profileId}:{})}));
   }
-  async attach(peer:Peer,endpoint:Endpoint,options:{verify?:boolean;prepare?:()=>void}={}):Promise<RpcClient>{
+  async attach(peer:Peer,endpoint:Endpoint,options:CodexAttachOptions={}):Promise<RpcClient>{
     return this.threadOperation(peer,endpoint,()=>this.attachThread(peer,endpoint,options));
   }
-  private async attachThread(peer:Peer,endpoint:Endpoint,options:{verify?:boolean;prepare?:()=>void}={}):Promise<RpcClient>{
+  private async attachThread(peer:Peer,endpoint:Endpoint,options:CodexAttachOptions={}):Promise<RpcClient>{
     this.requireMember(peer.id);
     const key=endpoint.address+'|'+peer.sessionId;
     const pending=this.attaching.get(key);if(pending)return pending;
@@ -706,7 +707,7 @@ export class CodexAdapter extends EventEmitter {
       this.invalidated.delete(key);
       let result:any,subscribed=true,revision=this.nativeStateRevision,verifying=false;
       try{
-        let cold=false;
+        let cold=false,loadedTakeover=false;
         if(peer.owner==='nxbridge'&&runtime?.kind==='owned'&&runtime.peerId===peer.id){
           if(!this.ownedRoutes.permits({peer,endpoint},rpc)){
                                                    
@@ -714,10 +715,15 @@ export class CodexAdapter extends EventEmitter {
               cold=!await codexThreadLoaded(rpc,peer.sessionId!);
             }
             catch(error){throw new RuntimeRecoveryHold('owned_subscription_waiting','暂时无法确认后台 Codex 的会话状态；消息已保留，稍后自动重试。'+describeError(error));}
-            if(!cold)throw Object.assign(new RuntimeRecoveryHold('owned_subscription_waiting','后台 Codex 还没重新接上，要等它空闲下来再按原设置恢复；消息已保留，恢复后自动送达。'),{recycleEvidence:'loaded_unleased'});
+            if(!cold){
+              if(options.subscribeLoaded)loadedTakeover=true;
+              else throw Object.assign(new RuntimeRecoveryHold('owned_subscription_waiting','后台 Codex 还没重新接上，要等它空闲下来再按原设置恢复；消息已保留，恢复后自动送达。'),{recycleEvidence:'loaded_unleased'});
+            }
           }
         }
-        if(peer.owner==='nxbridge'&&runtime?.kind==='owned'&&runtime.peerId===peer.id&&(cold||runtime.sessionVerification)){
+        if(loadedTakeover){
+          result=await this.subscribeTakenOverThread(peer,endpoint,rpc,currentRoute,options.subscribeLoaded!);
+        }else if(peer.owner==='nxbridge'&&runtime?.kind==='owned'&&runtime.peerId===peer.id&&(cold||runtime.sessionVerification)){
           verifying=true;
           const id=peer.sessionId!;
           if(runtime.sessionVerification&&runtime.sessionVerification.sessionId!==id)throw new RuntimeRecoveryHold('owned_subscription_waiting','上次恢复的记录和这个 Codex 会话对不上；消息已保留，没有送出。');
@@ -811,6 +817,29 @@ export class CodexAdapter extends EventEmitter {
       return rpc;
     })();
     this.attaching.set(key,work);try{return await work;}finally{if(this.attaching.get(key)===work)this.attaching.delete(key);}
+  }
+  private async subscribeTakenOverThread(peer:Peer,endpoint:Endpoint,rpc:RpcClient,currentRoute:()=>void,authorize:()=>Promise<()=>void>):Promise<any>{
+    const id=peer.sessionId!,runtime=runtimeFor(this.home,{endpoint:endpoint.address})!.value;
+    const original=runtime.sessionVerification?.profile??await readSessionProfile(endpoint.nativeSession?.transcriptPath??sessionFile(runtime.configHome??endpoint.configHome??'',id),id);
+    const {args}=planCodexResume(id,original,peer.cwd,{exact:true}),leaseGuard=await authorize();
+    const guard=()=>{currentRoute();leaseGuard();};
+                                                
+    this.coldControls.set(guard,{rpc,id});
+    try{
+      const ack=await rpc.request('thread/resume',args,{mutation:true,timeout:3000,beforeSend:guard});
+                                                   
+      const {policy}=await verifyCodexResumeAck(original,ack,{cwd:peer.cwd,guard:currentRoute});
+      if(runtime.sessionVerification){
+        const current=runtimeFor(this.home,{endpoint:endpoint.address})?.value;
+        if(current?.id!==runtime.id||current.pid!==runtime.pid||current.procStart!==runtime.procStart||current.sessionVerification&&current.sessionVerification.sessionId!==id)
+          throw new RuntimeRecoveryHold('owned_subscription_waiting','恢复过程中后台 Codex 进程换了；消息已保留，重新确认后再送。');
+        if(current.sessionVerification){
+          this.emit('sessionPolicy',{memberId:peer.id,sessionId:id,runtimeId:runtime.id,policy});
+          completeRestartProfile(this.home,current);delete current.sessionVerification;saveManagedRuntime(this.home,current);
+        }
+      }
+      return ack;
+    }finally{this.coldControls.delete(guard);}
   }
   private async verifyColdResumeRuntime(runtime:ManagedRuntime):Promise<void>{
     if(!runtime.dedicated||!runtime.pid||!runtime.procStart)throw new BridgeError('runtime_endpoint_unverified','无法确认后台 Codex 的进程只属于 nxbridge。');

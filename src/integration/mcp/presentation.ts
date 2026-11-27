@@ -74,6 +74,8 @@ export function formatStatus(status:any):string{
     `${status.paused?'配对已暂停（nxbridge resume'+(status.self?.id?' --member '+status.self.id:'')+' 恢复）':'已配对'}`,
     line('本窗口',status.self),line('搭档',status.partner),
     ...[status.self,status.partner].flatMap(p=>p.delivery_wait?[p.delivery_wait.message]:[]),
+                                                            
+    ...[status.self,status.partner].flatMap(p=>p?.hosting?.held_unsent&&p.hosting.delivery_hold?.status?[`消息暂缓：${p.hosting.delivery_hold.status}`]:[]),
     ...(status.self.enabled===false?['本窗口的 nxbridge 已关闭；窗口和配对保留。']:[]),
     ...(status.partner.enabled===false?['搭档的 nxbridge 已关闭；发信已停用，不会自动启动替代窗口。']:[]),
     ...(status.partner.retryBudget?.warning?[status.partner.retryBudget.warning]:[]),

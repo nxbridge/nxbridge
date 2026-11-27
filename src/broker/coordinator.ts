@@ -115,6 +115,7 @@ import { Takeovers } from './recovery/takeover.js';
 import { ProviderRecovery } from './recovery/provider-recovery.js';
 import { captureLegacyTakeovers } from './recovery/legacy-takeover.js';
 import {hostingRecord,hostingGate,hostingStatus,writeHosting,closeHostedWindow,codexForegroundEnd,codexForegroundEndKey,type CodexForegroundEnd,SessionTransfers} from './recovery/session-hosting.js';
+import {CodexDeliveryGate} from './delivery/codex-delivery-gate.js';
 import { readSessionProfile, sessionFile } from '../hosts/codex/codex-session-profile.js';
 import { stopCodexRuntime } from '../hosts/codex/codex-restart.js';
 import { codexUserWindow } from '../hosts/codex/codex-lineage.js';
@@ -141,6 +142,7 @@ export class Broker {
   readonly managedRecovery:ManagedRecovery;
   private takeovers:Takeovers;
   private transfers:SessionTransfers;
+  private codexDelivery:CodexDeliveryGate;
   readonly communicationTips:CommunicationTips;
   readonly configuration:InHostConfiguration;
   private readonly configurationReload:ConfigurationReload;
@@ -242,7 +244,7 @@ export class Broker {
       retire:id=>{const ids=this.memberLifecycle.queueRetirements([id]);this.background('deleted_replacement_retirement:'+id,()=>this.memberLifecycle.releaseOwned(ids));},
       notifyFailure:(peer,loss)=>this.background('deleted_replacement_notice:'+loss.id,()=>this.runtimeHealth.notifyDeletedReplacementFailure(peer,loss)),
     });
-    this.transfers=new SessionTransfers(store,config,home,{holder:peer=>this.memberLifecycle.nativeSessionState(peer),loaded:(peer,endpoint)=>adapters.codex.sessionState(peer,endpoint),daemon:async(peer,runtime)=>{
+    this.transfers=new SessionTransfers(store,config,home,{hostingStatus:peer=>this.hostingStatus(peer),holder:peer=>this.memberLifecycle.nativeSessionState(peer),loaded:(peer,endpoint)=>adapters.codex.sessionState(peer,endpoint),daemon:async(peer,runtime)=>{
       const configHome=hostingRecord(store,peer)?.configHome;if(!configHome)return'unknown';
       try{const connection=await this.daemons.scan(configHome,runtime,true);return connection?connection.threads.some(thread=>thread.id===peer.sessionId)?'alive':'dead':'unknown';}catch{return'unknown';}
     },inspect:(runtime,id)=>adapters.codex.inspectThread(runtime,id),cleanup:async(peer,address)=>{const note=await adapters.codex.releaseRuntime([],address,[{...peer,owner:'nxbridge'}]);if(note)throw new BridgeError('holder_unknown',note);},prepare:peer=>this.memberLifecycle.prepare(peer),enabled:peer=>{this.requireEnabled(peer);this.memberLifecycle.codexRecycle.requireUnfenced(peer.id);},stop:async(peer,endpoint,guard)=>{
@@ -294,7 +296,7 @@ export class Broker {
     };
     this.claudeInbound=new ClaudeInbound(store,this.deliveryHealth);
     this.idleNotices=new IdleNotices(store,this.deliveryHealth);
-    this.pairAnomalies=new PairAnomalies(store,this.deliveryHealth,VERSION,resources,home);
+    this.pairAnomalies=new PairAnomalies(store,this.deliveryHealth,VERSION,resources,home,peer=>this.codexDelivery.hold(peer));
     this.hookTrust=new CodexHookTrust((configHome,cwd)=>readCodexHookTrust(this.config,this.home,configHome,cwd));
     this.references=new References(store);
     this.communicationTips=new CommunicationTips(store,{
@@ -304,7 +306,7 @@ export class Broker {
     });
     store.onCooperationChange=ids=>{for(const id of ids)store.faults.sync('cooperation_clock:'+id,()=>this.communicationTips.cooperation.changed(store.peer(id)));};
     this.configurationReload=new ConfigurationReload(home);this.configuration=new InHostConfiguration(home,Date.now,()=>this.applyConfiguration(),(name,data)=>this.store.event(name,data));
-    this.runtimeHealth=new BrokerHealthCoordinator({store,config,adapters,home,resources},{incidents:this.incidents,deliveryHealth:this.deliveryHealth,communicationTips:this.communicationTips,pairAnomalies:this.pairAnomalies,idleNotices:this.idleNotices,profiles:this.profiles,foregroundHealth:this.foregroundHealth,managedRecovery:this.managedRecovery,health:this.health,codexDirect:this.codexDirect,daemons:this.daemons,questions:this.questions,turnEnds:this.turnEnds},{stopped:()=>this.producersPaused,startupPending:id=>this.startupBlocked(id),actor:(...args)=>this.actor(...args),enabled:(...args)=>this.enabled(...args),requireEnabled:(...args)=>this.requireEnabled(...args),ownedClaudeLaunchReady:(...args)=>this.memberLifecycle.ownedClaudeLaunchReady(...args),ownedClaudeLaunchFailure:(...args)=>this.memberLifecycle.ownedClaudeLaunchFailure(...args),signalCodexWake:(...args)=>this.signalCodexWake(...args),signalEmbeddedWake:(...args)=>this.signalEmbeddedWake(...args),refreshHookTrust:(...args)=>this.refreshHookTrust(...args),pumpStage:(...args)=>this.pumpStage(...args)});
+    this.runtimeHealth=new BrokerHealthCoordinator({store,config,adapters,home,resources},{incidents:this.incidents,deliveryHealth:this.deliveryHealth,communicationTips:this.communicationTips,pairAnomalies:this.pairAnomalies,idleNotices:this.idleNotices,profiles:this.profiles,foregroundHealth:this.foregroundHealth,managedRecovery:this.managedRecovery,health:this.health,codexDirect:this.codexDirect,daemons:this.daemons,questions:this.questions,turnEnds:this.turnEnds},{hostingStatus:peer=>this.hostingStatus(peer),stopped:()=>this.producersPaused,startupPending:id=>this.startupBlocked(id),actor:(...args)=>this.actor(...args),enabled:(...args)=>this.enabled(...args),requireEnabled:(...args)=>this.requireEnabled(...args),ownedClaudeLaunchReady:(...args)=>this.memberLifecycle.ownedClaudeLaunchReady(...args),ownedClaudeLaunchFailure:(...args)=>this.memberLifecycle.ownedClaudeLaunchFailure(...args),signalCodexWake:(...args)=>this.signalCodexWake(...args),signalEmbeddedWake:(...args)=>this.signalEmbeddedWake(...args),refreshHookTrust:(...args)=>this.refreshHookTrust(...args),pumpStage:(...args)=>this.pumpStage(...args)});
     this.memberLifecycle=new BrokerLifecycleCoordinator({store,config,adapters,home},{profileCoordination:this.profileCoordination,deletedSessions:this.deletedSessions,takeovers:this.takeovers,managedRecovery:this.managedRecovery,transfers:this.transfers,runtimeHealth:this.runtimeHealth,deliveryHealth:this.deliveryHealth,daemons:this.daemons,codexDirect:this.codexDirect,subagentCompletions:this.subagentCompletions},{
       stopped:()=>this.stopped,
       producersPaused:()=>this.producersPaused,
@@ -315,6 +317,15 @@ export class Broker {
       foldRecycleReceipt:(peer,receipt)=>this.observeCodexContext(peer,receipt,'回收前后的原生持久历史'),
       pumpAfterCurrent:()=>{const pumping=this.pumping;return pumping?pumping.then(()=>this.pump()):this.pump();},
     });
+    this.codexDelivery=new CodexDeliveryGate(store,{
+      paused:()=>this.producersPaused,enabled:id=>this.enabled(id),
+      activationHold:id=>this.memberLifecycle.deliveryActivationHold(id),
+      subscribed:(peer,endpoint)=>adapters.codex.hasSubscription(peer,endpoint),
+      profileHeld:peer=>this.profiles.blocks(peer),childRunning:peer=>this.subagentCompletions.running(peer),
+      profilePending:peer=>this.profiles.intent(peer)?.status==='pending',takingOver:id=>!!this.takeovers.get(id),
+      subscriptionHold:id=>this.memberLifecycle.codexSubscriptionHold(id),
+    });
+    store.selections.setHostingView(peer=>this.hostingStatus(peer));
     adapters.codex.bindOwnedRoutes?.(id=>this.memberLifecycle.ownedCodexRoute(id),id=>{
       const peer=this.stopped?undefined:this.store.getPeer(id);
       return peer?.host==='codex'&&peer.owner==='nxbridge'?peer.sessionId??undefined:undefined;
@@ -676,6 +687,7 @@ export class Broker {
   }
   private handoffRoutes(){
     return this.store.pairs().flatMap(pair=>{
+      if(this.takeovers.get(pair.codex))return[];
       const route=this.memberLifecycle.ownedCodexRoute(pair.codex);
       return route&&this.enabled(pair.codex)?[route]:[];
     });
@@ -956,7 +968,7 @@ export class Broker {
       const result=this.store.selections.commit(p.actor,p,this.config,intent=>this.selectionSend(intent,false)) as {hosting_action:string},pair=this.store.pairFor(root.id);if(!pair)throw new BridgeError('selection_expired','原配对已经改变。');
       const target=this.store.peer(pair.codex);
       try{const applied=result.hosting_action==='adopt'?await this.transfers.adopt(target):target.owner==='nxbridge'?await this.transfers.release(target):await this.transfers.wait(target);queueMicrotask(()=>void this.pump());return this.store.selections.hostingResult(p.actor,p.selection_id,{...result,...applied as object});}
-      catch(error){return this.store.selections.hostingResult(p.actor,p.selection_id,{...result,hosting:hostingStatus(this.store,this.store.peer(target.id)),error:{code:(error as BridgeError).code,message:describeError(error)}});}
+      catch(error){return this.store.selections.hostingResult(p.actor,p.selection_id,{...result,hosting:this.hostingStatus(this.store.peer(target.id)),error:{code:(error as BridgeError).code,message:describeError(error)}});}
     }
     if(this.store.selections.committed(p.actor,p.selection_id)){const sender=this.actor(p.actor),pair=this.store.pairFor(sender.id);if(pair)await this.finalizeSelection(sender,pair);return pair?{...await this.selectionDelivery(view,this.store.peer(pair[otherHost(sender.host)])) as object,selection_id:p.selection_id}:view;}
     if(view.status==='selection_declined'||view.status==='unpaired')return view;
@@ -1216,7 +1228,7 @@ export class Broker {
     const message=this.store.message(saved.message_id),sender=this.store.peer(message.from),partner=this.store.peer(message.to),pair=this.store.pairById(message.pairId)!;
     const tip=this.runtimeHealth.communicationTip(sender,input.message,'partner',input.actor,message.id);
     if(hostingGate(this.store,partner)&&message.state==='accepted'){
-      const hosting=hostingStatus(this.store,partner),record=hostingRecord(this.store,partner),choice=partner.owner==='user'&&!record?.released&&!record?.background?this.store.selections.hosting(sender,input.actor,this.config,message.id):undefined;
+      const hosting=this.hostingStatus(partner),record=hostingRecord(this.store,partner),choice=partner.owner==='user'&&!record?.released&&!record?.background?this.store.selections.hosting(sender,input.actor,this.config,message.id):undefined;
       return{...saved,persisted:true,delivery_state:message.state,read_confirmed:false,status:'held',holding_reason:hosting?.phase??'window_closed',hosting,...(tip?{tip}:{}),...(choice as object??{})};
     }
     const newPartner=stagedPartner||!previouslyPaired&&partner.owner==='nxbridge'&&!partner.sessionId;
@@ -1392,7 +1404,7 @@ export class Broker {
     if(!this.enabled(peer.id))return{...this.offResult(peer),messages:[]};
     if(!pair||pair[peer.host]!==peer.id)throw new BridgeError('unpaired','当前窗口不是已配对成员。');
     if(!this.enabled(pair.claude)||!this.enabled(pair.codex))return{...this.offResult(this.store.peer(!this.enabled(pair.claude)?pair.claude:pair.codex)),messages:[]};
-    if(hostingGate(this.store,peer))return{messages:[],status:'held',hosting:hostingStatus(this.store,peer)};
+    if(hostingGate(this.store,peer))return{messages:[],status:'held',hosting:this.hostingStatus(peer)};
     if(this.profiles.blocks(peer))return{messages:[],status:'held',partner_profile:this.profiles.view(peer)};
     if(pair.paused||peer.state==='paused'||peer.state==='needsHuman')return{messages:[],status:'paused'};
                            
@@ -1717,13 +1729,9 @@ export class Broker {
     this.codexWakeWork.set(peer.id,next);return next;
   }
   private codexWakeAllowed(peer:Peer,endpoint:Endpoint,pairId:string):boolean{
-    const current=this.store.peer(peer.id),pair=this.store.pairFor(peer.id),active=this.store.endpoint(peer.id);
-    return !this.producersPaused&&!this.startupBlocked(peer.id)&&pair?.id===pairId&&!pair.paused&&this.enabled(pair.claude)&&this.enabled(pair.codex)
-      &&current.sessionId===peer.sessionId&&current.state==='ready'&&!this.subagentCompletions.running(current)&&!hostingGate(this.store,current)&&!this.profiles.blocks(current)
-      &&!this.memberLifecycle.blocksDeliveryActivation(peer.id)
-      &&!!active?.active&&active.epoch===endpoint.epoch&&active.address===endpoint.address&&active.bindingEpoch===endpoint.bindingEpoch
-      &&!active.pendingContext&&!this.store.bindings.current(peer.id)?.transitioning;
+    return !this.codexDelivery.hold(peer,endpoint,pairId);
   }
+  private hostingStatus(peer:Peer){return hostingStatus(this.store,peer,this.codexDelivery.hold(peer)??null);}
   private completionGate(background:Peer,foreground:Peer,boundaryPeerId?:string):CompletionHold|undefined{
     const pair=this.store.pairFor(background.id);if(this.producersPaused||!pair)return'runtime_unavailable';
     if(this.startupBlocked(background.id))return'native_state_unverified';
@@ -1862,7 +1870,6 @@ export class Broker {
     if(hostingGate(this.store,peer))return SKIPPED;
     const pair=this.store.pairFor(peer.id),current=this.store.peer(peer.id);
     if(!pair||!peer.sessionId||!this.codexWakeAllowed(peer,endpoint,pair.id)||this.subagentCompletions.blocked(peer))return SKIPPED;
-    if(this.waitingOwnedCodexSubscription(current,endpoint))return SKIPPED;
     if(endpoint.daemon&&!await this.daemons.wakeReady(peer,endpoint))return SKIPPED;
     if(this.subagentCompletions.pending(peer)&&!this.codexDirect.status(peer.id)?.continuation?.uncertain)return this.signalSubagentWake(peer,endpoint,pair);
     if(localCodexEndpoint(this.home,endpoint.address)){
@@ -1931,11 +1938,14 @@ export class Broker {
     if(!pair||pair.paused)throw new BridgeError('unowned_runtime','当前配对不可用或已暂停，未执行恢复；请先查看配对状态。');
     if(peer.owner!=='nxbridge')throw new BridgeError('unowned_runtime','目标由用户窗口管理，未执行自动恢复；请在原生窗口中断。');
     if(endpoint?.mode!=='app-server')throw new BridgeError('unowned_runtime','当前托管 Codex 尚未登记可核验的 App Server 端点，未执行恢复；请等待原宿主完成登记后查看状态。');
+    const noTakeover=()=>{if(this.takeovers.get(peer.id))throw new BridgeError('foreground_active','接管窗口仍在使用该会话，未中断或发送恢复输入。');};
+    if(!preview)noTakeover();
     const health=await this.runtimeHealth.probeTurnHealth(peer,endpoint);
     const failed=health?.state==='failed',failedKey='codexFailedRecovery:'+peer.id,previous=this.store.setting<{sessionId:string;turnId:string;noticeId:string}>(failedKey),alreadyRequested=failed&&previous?.sessionId===peer.sessionId&&previous.turnId===health.turnId;
     const guard=()=>{
       const current=this.store.peer(peer.id),active=this.store.endpoint(peer.id);
       this.requireEnabled(current);
+      noTakeover();
       if(this.stopped||current.owner!=='nxbridge'||current.sessionId!==peer.sessionId||this.store.pairFor(peer.id)?.id!==pair.id||!active?.active||active.epoch!==endpoint.epoch||active.address!==endpoint.address)throw new BridgeError('session_changed','目标会话、配对或原生端点已经变化，未执行恢复。');
       if(this.store.pairFor(peer.id)?.paused||current.state==='paused'||active.pendingContext||this.store.bindings.current(peer.id)?.transitioning)throw new BridgeError('turn_waiting','目标已暂停或正在切换上下文，未执行恢复。');
       if(current.state==='needsHuman'||this.store.questions(true).some(q=>q.from===peer.id||q.to===peer.id))throw new BridgeError('turn_waiting','目标正在等待问题或审批，未执行恢复；请先处理等待。');
@@ -1943,7 +1953,7 @@ export class Broker {
     if(preview){
       const eligible=health&&health.progressEvidence!==false&&!health.tools.length&&!health.humanRequests?.length&&health.state!=='needsHuman'&&!this.memberLifecycle.isRestarting(peer.id)&&!alreadyRequested&&(failed||health.state!=='ready'&&health.state!=='networkRetrying'&&!providerBlocked(health)&&Date.now()-health.lastProgressAt>=RECENT_PROGRESS_MS);
       let available=!!eligible;try{guard();}catch{available=false;}
-      return{session_id:peer.sessionId,peer_id:peer.id,pair_id:pair.id,runtime:endpoint.pid&&endpoint.procStart?{pid:endpoint.pid,procStart:endpoint.procStart}:undefined,health,...(alreadyRequested?{recoveryBlocked:'recovery_already_requested',notice_id:previous!.noticeId}:{}),recoveryCommand:available?`nxbridge recover codex --member ${peer.id} --turn ${health!.turnId}`:null};
+      return{session_id:peer.sessionId,peer_id:peer.id,pair_id:pair.id,runtime:endpoint.pid&&endpoint.procStart?{pid:endpoint.pid,procStart:endpoint.procStart}:undefined,health,...(this.takeovers.get(peer.id)?{recoveryBlocked:'foreground_active'}:alreadyRequested?{recoveryBlocked:'recovery_already_requested',notice_id:previous!.noticeId}:{}),recoveryCommand:available?`nxbridge recover codex --member ${peer.id} --turn ${health!.turnId}`:null};
     }
     if(health?.state==='networkRetrying')await requireExternalTerminal(terminalOrigin);
     if(!health||health.turnId!==turnId)throw new BridgeError('turn_changed','活动 turn 已改变，未中断；请重新查看 status。');
@@ -1970,7 +1980,7 @@ export class Broker {
       }else{
         if(fresh?.turnId!==turnId||['ready','failed'].includes(fresh.state)||Date.now()-fresh.lastProgressAt<RECENT_PROGRESS_MS)throw new BridgeError('turn_recovered','执行前复核发现 Codex 已有新进展，或这一轮已经变化，未中断。');
         this.store.setSetting('codexRecoveryFence:'+peer.id,{sessionId:peer.sessionId,endpointEpoch:endpoint.epoch,pairId:pair.id,turnId});
-        try{await rpc.request('turn/interrupt',{threadId:peer.sessionId,turnId},{mutation:true,timeout:10000});}
+        try{await rpc.request('turn/interrupt',{threadId:peer.sessionId,turnId},{mutation:true,timeout:10000,beforeSend:guard});}
         catch(error){if((error as {uncertain?:boolean}).uncertain===false)this.store.setSetting('codexRecoveryFence:'+peer.id,null);throw error;}
         const deadline=Date.now()+10000;
         while(true){
@@ -1980,6 +1990,7 @@ export class Broker {
           if(Date.now()>=deadline)throw new DeliveryError('recovery_uncertain','没能确认这一轮已中断；不会重复中断，也不会重发任务，请用 nxbridge status 查看。',true);await delay(100);
         }
       }
+      noTakeover();
       if(this.store.pairFor(peer.id)?.id!==pair.id||this.store.pairFor(peer.id)?.paused)throw new BridgeError('session_changed','中断后配对改变或暂停，未继续目标。');
       const noticeId=randomUUID();
       this.store.transaction(()=>{
@@ -2214,7 +2225,7 @@ export class Broker {
     this.questions.sweep();
     this.syncLaunchPreferences();
     switch(method){
-      case'hosting.status':{const p=targetSchema.extend({home:text.optional(),cwd:text.optional()}).strict().parse(raw??{}),peer=await this.hostingTarget(p);return{hosting:hostingStatus(this.store,peer)};}
+      case'hosting.status':{const p=targetSchema.extend({home:text.optional(),cwd:text.optional()}).strict().parse(raw??{}),peer=await this.hostingTarget(p);return{hosting:this.hostingStatus(peer)};}
       case'hosting.adopt':case'hosting.release':{
         const p=targetSchema.extend({home:text.optional(),cwd:text.optional(),terminal_origin:terminalOriginSchema.optional()}).strict().parse(raw??{});if(!p.terminal_origin)throw new BridgeError('user_terminal_required',HOSTING_TERMINAL_MESSAGE);await requireExternalTerminal(p.terminal_origin);
         const peer=await this.hostingTarget(p,method==='hosting.adopt');this.requireEnabled(peer);
@@ -2450,7 +2461,7 @@ export class Broker {
         if(p.loaded_only&&!runtime)return{};
         if(runtime?.peerId&&(!this.store.pairFor(runtime.peerId)||this.memberLifecycle.isRetiring(runtime.peerId)||this.memberLifecycle.retirements()[runtime.peerId]))return{unavailable:'此会话刚解除配对或仍在后台收尾，尚不能打开。请稍等几秒再运行 codex resume '+p.session_id+'，或用 nxbridge status 查看状态。'};
         const matches=this.store.peers().filter(peer=>peer.host==='codex'&&peer.sessionId===p.session_id&&this.store.pairFor(peer.id)&&this.store.endpoints(peer.id).some(ep=>ep.configHome&&sameDirectory(ep.configHome,p.home)&&(!runtime||ep.address===runtime.endpoint)));
-        if(matches.length>1)throw new BridgeError('ambiguous_context','同一会话有多个活动成员，请用 nxbridge open/release --member 指定。');const peer=matches[0];return{...(runtime?{endpoint:runtime.endpoint}:{}),...(peer?{member_id:peer.id,owner:peer.owner,cwd:peer.cwd,hosting:hostingStatus(this.store,peer)}:{})};
+        if(matches.length>1)throw new BridgeError('ambiguous_context','同一会话有多个活动成员，请用 nxbridge open/release --member 指定。');const peer=matches[0];return{...(runtime?{endpoint:runtime.endpoint}:{}),...(peer?{member_id:peer.id,owner:peer.owner,cwd:peer.cwd,hosting:this.hostingStatus(peer)}:{})};
       }
       case'codex.endpoint':{const p=z.object({cwd:text.optional(),session_id:text.optional(),home:text.optional()}).parse(raw??{});return{endpoint:await this.adapters.codex.ensureEndpoint(p.cwd,undefined,undefined,p.session_id,p.home)};}
       case'codex.foreground.started':{const p=z.object({endpoint:text,session_id:text.optional(),foreground:processSchema}).strict().parse(raw);this.codexForeground.register({endpoint:p.endpoint,sessionId:p.session_id,foreground:p.foreground});if(p.session_id)this.store.setSetting(codexForegroundEndKey(p.endpoint,p.session_id),null);return{registered:true};}

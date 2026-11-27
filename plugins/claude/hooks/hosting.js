@@ -3,6 +3,10 @@ const named=h=>h?.name?`「${h.name}」`:'';
 const held=h=>h?.held_unsent?`，${h.held_unsent} 条消息在等`:'';
 const uncertain=h=>h?.uncertain?`；${h.uncertain} 条消息结果不明，不会自动重发`:'';
 const step=h=>h?.user_step?`（${h.user_step}）`:'';
+                                                                           
+const QUIET_HOLDS=new Set(['session_busy','subagent_active']);
+                                                    
+export const hostingHoldText=h=>h?.held_unsent&&h.delivery_hold?.status&&!QUIET_HOLDS.has(h.delivery_hold.code)?`${h.held_unsent} 条消息在等：${h.delivery_hold.status}`:undefined;
 const POLICY_PART={filesystem:'文件',network:'网络',approval:'审批方式',reviewer:'审批人'};
 const BLOCK_REASON={
   policy_unrepresentable:'原来的权限没法安全套用',policy_verification_failed:'恢复后的权限核对没通过',
@@ -46,7 +50,7 @@ export function hostingModel(h){
   if(!h?.phase)return '';
   const p=h.policy;
   return [`hosting pref=${h.preference??'unknown'} phase=${h.phase}${h.verifying===true?' (verifying policy, delivery held)':''}`,h.session_id?`session ${h.session_id}`:'',h.cwd?`cwd ${h.cwd}`:'',
-    h.wake_capable===false?'no wake (picks up only on user input in that window)':'',h.held_unsent?`${h.held_unsent} held`:'',h.uncertain?`${h.uncertain} uncertain (never resend)`:'',
+    h.wake_capable===false?'no wake (picks up only on user input in that window)':'',h.held_unsent?`${h.held_unsent} held${h.delivery_hold?.model?': '+h.delivery_hold.model:''}`:'',h.uncertain?`${h.uncertain} uncertain (never resend)`:'',
     p?`policy ${p.source}${p.unknown?.length?' unknown='+p.unknown.join('/'):''}${p.narrowed?.length?' narrowed='+p.narrowed.length:''}`:'',
     h.reason?`reason ${h.reason}`:'',h.holder?.pid?`holder ${h.holder.mode??'?'} pid ${h.holder.pid}`:'',h.user_step?`user step \`${h.user_step}\``:'',
     h.phase==='window_closed'?'next send asks user: continue in bg / wait for window / new / unpair (never adopt yourself)':''].filter(Boolean).join(', ');

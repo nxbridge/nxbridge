@@ -9,7 +9,7 @@ import { sameDirectory } from '../../shared/files.js';
 import type { DeliveryHealth } from '../health/delivery.js';
 import { memberEnabled } from '../member-control.js';
 import { hostingRecord, writeHosting } from './session-hosting.js';
-import { CodexRecycle, codexRecycleFenced, codexRecycleWorkKind, type CodexRecycleAcceptance, type CodexRecycleOperation, type CodexRecycleTrigger, type CodexRecycleWork } from './codex-recycle.js';
+import { CodexRecycle, codexRecycleFenced, codexRecycleNoticeKey, codexRecycleWorkKind, type CodexRecycleAcceptance, type CodexRecycleOperation, type CodexRecycleTrigger, type CodexRecycleWork } from './codex-recycle.js';
 import { recoveryUserStep, type ManagedIncident, type ManagedRecovery } from './managed-recovery.js';
 import { RECYCLE_AMBIGUOUS_USER_STEP, RECYCLE_CLEANUP_USER_STEP, RECYCLE_OLD_UNKNOWN_USER_STEP, recycleAcceptanceLapsedNotice, recycleAcceptanceQueuedResult, recycleAuthorityLostNotice, recycleCleanupBlockedNotice, recycleDoneNotice, recycleHeldNotice, recycleLaunchUnknownNotice, recycleOldUnknownNotice, recycleStopFailedNotice, recycleStopFailedPendingNotice, recycleRefusedResult, staleRevisionResult, stuckNotice, stuckStatusText, stuckUserLine, type AuthorityLoss, type OldOutcome, type RecycleStage, type StaleChange, type StuckProgress, type StuckTrigger, type SuspendReason } from '../stuck-session-text.js';
 
@@ -268,7 +268,7 @@ export class CodexRecycleControl {
         const {decision}=basis;
         cancelDecisions(decision.noticeId);
         delivery.enqueue(pair.id,owner.id,{id:decision.noticeId,source:'managed_recovery',kind:'codex_recycle_decision:'+peer.id,incidentId:current.id,
-          scope:this.services.scope(pair,owner),state:'pending',wake:true,tier:4,factKey:decision.revision,
+          scope:this.services.scope(pair,owner),state:'pending',wake:true,tier:4,factKey:codexRecycleNoticeKey(current.id,basis),
           message:stuckNotice({peerName:peer.name,peerHost:'codex',recipientHost:owner.host,trigger:copyTrigger(trigger),since:decision.since,
             ...copyWork(decision.work),held:ledger.held.length,
             incidentId:current.id,revision:decision.revision,updated:operation?.phase==='awaiting_partner'})});

@@ -2343,3 +2343,16 @@ test('Mod 状态栏：后台做完一轮停下、自动提醒已用完时常驻�
   h.response('status',guard({state:'pending',hold:'foreground_busy',user_text:'后台 Codex 做完一轮停下了，等前台这一轮结束后再提醒'}));await h.tick();
   assert.doesNotMatch(h.statuses.at(-1)??'',/后台 Codex/);
 });
+
+test('状态栏：消息暂缓的原因只作兜底，不盖住审批、启动失败等更具体的提示',async()=>{
+  const h=await harness();await h.run('session.start',{});
+  const delivery_hold={code:'pending_user',status:'对方在等你批准操作或回答问题，处理完再送',model:'held: partner awaits user approval/answer; delivers after user acts'};
+  const hosting={preference:'bg',phase:'background',wake_capable:true,held_unsent:1,delivery_hold};
+  const show=async(partner:any,issues:any[]=[])=>{h.response('status',{paired:true,self:{state:'ready'},partner:{hosting,...partner},integrationIssues:issues});await h.tick();return h.statuses.at(-1);};
+                        
+  assert.equal(await show({state:'needsHuman',delivery_wait:{state:'needs_human',open_command:'nxbridge open codex --member c'}}),'Codex在等你处理：在这个项目目录的终端运行 nxbridge open codex --member c 打开原会话处理（不会自动批准）');
+                       
+  assert.equal(await show({state:'offline'},[{code:'launch_failed',peerId:'c',message:'后台 codex 启动失败：项目目录没被信任；修复原因后运行 nxbridge open codex --member c 重试'}]),'后台 codex 启动失败：项目目录没被信任；修复原因后运行 nxbridge open codex --member c 重试');
+                      
+  assert.equal(await show({state:'ready'}),'1 条消息在等：对方在等你批准操作或回答问题，处理完再送');
+});

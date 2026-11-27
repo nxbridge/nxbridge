@@ -132,6 +132,11 @@ function decisionFacts(evidence:Available,progressGate:boolean):string {
     uniqueSorted(work.activeTurnIds),work.progress,uniqueSorted(work.roles),uniqueSorted(work.unresolved),progressGate,
   ]);
 }
+                                                              
+export function codexRecycleNoticeKey(incidentId:string,basis:CodexRecycleBasis):string {
+  const {decision}=basis,work=decision.work.activeTurnIds.length&&decision.work.progress==='progressing'?{...decision.work,roles:[]}:decision.work;
+  return JSON.stringify([incidentId,decision.since,decisionFacts({kind:'available',old:basis.old,profile:basis.profile,work},decision.autoEligible)]);
+}
 function heldError(error:unknown):{code:string;reason:string} {
   return {code:error instanceof BridgeError?error.code:'codex_recycle_failed',reason:describeError(error).slice(0,1200)};
 }
@@ -290,9 +295,10 @@ export class CodexRecycle {
         }
         if(lapseIfOverdue(queued))return result(acceptance?'stale':'current');
         const gate=!stopFailed&&progressGate(),facts=decisionFacts(evidence,gate);
-        const previous=awaiting?.decision;
+                                                     
+        const previous=awaiting?.decision??incident.recyclePublication;
         const decision:CodexRecycleDecision=previous?.facts===facts?
-          {...previous,work:evidence.work}:{facts,revision:randomUUID(),noticeId:randomUUID(),since:previous?.since??this.now(),work:evidence.work,autoEligible:gate};
+          {...previous,work:evidence.work,...(!awaiting?{noticePosted:undefined}:{})}:{facts,revision:randomUUID(),noticeId:randomUUID(),since:previous?.since??this.now(),work:evidence.work,autoEligible:gate};
         const basis:Basis={old:evidence.old,profile:evidence.profile,decision};
                                                       
         if(queued&&(awaiting?.acceptance||previous?.facts!==facts)){

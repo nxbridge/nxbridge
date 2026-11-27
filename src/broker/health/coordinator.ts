@@ -44,6 +44,7 @@ import type {TurnEndCoordinator} from '../turn-end.js';
 interface HealthEnvironment {readonly store:Store;readonly config:BridgeConfig;readonly adapters:Adapters;readonly home:string;readonly resources?:ResourceHealth;}
 interface HealthServices {readonly incidents:RuntimeIncidents;readonly deliveryHealth:DeliveryHealth;readonly communicationTips:CommunicationTips;readonly pairAnomalies:PairAnomalies;readonly idleNotices:IdleNotices;readonly profiles:PartnerProfiles;readonly foregroundHealth:ForegroundHealth;readonly managedRecovery:ManagedRecovery;readonly health:TurnHealthTracker;readonly codexDirect:CodexDirectDelivery;readonly daemons:CodexDaemons;readonly questions:Questions;readonly turnEnds:TurnEndCoordinator;}
 interface HealthHooks {
+ hostingStatus(peer:Peer):ReturnType<typeof hostingStatus>;
  stopped():boolean;
  startupPending?(id:string):boolean;
  actor(input:Actor):Peer;
@@ -96,7 +97,7 @@ export class BrokerHealthCoordinator {
     const {store}=this.environment;
       const endpoint=store.endpoint(peer.id),pair=store.pairFor(peer.id);
       const count=pending??(pair?.paused?store.deliveryCounts(pair.id,pair[otherHost(peer.host)]).accepted:store.pendingCount(peer.id));
-      const hosting=hostingStatus(store,peer);
+      const hosting=this.hooks.hostingStatus(peer);
       const pauseDetail=peer.state==='paused'&&peer.pauseReason==='restart_incomplete'&&hosting?.phase==='blocked'?hostingRecord(store,peer)?.verificationError?.pauseDetail:undefined;
       const auto=claudeAutoStatus(store,peer);
       const failure=this.hooks.ownedClaudeLaunchFailure(peer);

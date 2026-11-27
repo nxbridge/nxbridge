@@ -145,6 +145,34 @@ test('有真实轮次与积压输入时，当前搭档同意可回收；工作�
   assert.equal(f.seen.effects.filter(effect=>effect==='stop').length,1);
 });
 
+test('同一事故来信清空后再次积压沿用展示版本，进展建议未变时不生成新决定',async()=>{
+  const f=fixture();f.work({activeTurnIds:['turn'],progress:'progressing',lastProgressAt:1000});
+  await f.run('loaded_unleased');const initial=f.want('awaiting_partner');assert.ok(initial.phase==='awaiting_partner');
+  for(let index=0;index<3;index++){
+    f.ledger.held=[];await f.sample('loaded_unleased');assert.equal(f.current().recycle,undefined);
+    f.restore();f.tick(60000);f.ledger.held=['later-'+index];f.work({lastProgressAt:61000+index*60000});
+    await f.run('loaded_unleased');const next=f.want('awaiting_partner');assert.ok(next.phase==='awaiting_partner');
+    assert.equal(next.basis.decision.revision,initial.basis.decision.revision);assert.equal(next.basis.decision.since,initial.basis.decision.since);
+    assert.equal(new Set(f.seen.notices).size,1);
+  }
+  f.work({progress:'stalled'});await f.run('loaded_unleased');
+  assert.equal(new Set(f.seen.notices).size,2);assert.notEqual(f.seen.notices.at(-1),initial.basis.decision.revision);assert.deepEqual(f.seen.effects,[]);
+});
+
+test('无积压周期清除已暂存的回收同意，复用展示版本也不能恢复原同意',async()=>{
+  const f=fixture(),observe=f.ports.observe;f.work({activeTurnIds:['turn'],progress:'progressing'});
+  await f.run('loaded_unleased');const approval=accept(f);
+  f.ports.observe=async()=>{throw new BridgeError('restart_profile_pending_tail','等待完整记录');};
+  await f.sample('loaded_unleased',approval);
+  const queued=f.want('awaiting_partner');assert.ok(queued.phase==='awaiting_partner'&&queued.basis.acceptance);
+  f.ports.observe=observe;f.ledger.held=[];await f.sample('loaded_unleased');assert.equal(f.current().recycle,undefined);
+  f.restore();f.ledger.held=['newly-held'];await f.run('loaded_unleased',approval);
+  const next=f.want('awaiting_partner');assert.ok(next.phase==='awaiting_partner');
+  assert.equal(next.basis.decision.revision,approval.evidenceRevision);assert.equal(next.basis.acceptance,undefined);
+  await f.run('loaded_unleased');assert.deepEqual(f.seen.effects,[]);assert.equal(new Set(f.seen.notices).size,1);
+  await f.run('loaded_unleased',{...accept(f)});f.want('ready');assert.equal(f.seen.effects.filter(effect=>effect==='stop').length,1);
+});
+
 test('普通重连的停止前预检发现活动轮次消失时撤销批准并回到自然接续',async()=>{
   const f=fixture();f.work({activeTurnIds:['turn'],progress:'stalled'});
   await f.run('loaded_unleased');const acceptance=accept(f),observe=f.ports.observe;

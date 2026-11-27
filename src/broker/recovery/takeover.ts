@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import type { Store } from '../../storage/store.js';
 import type { Endpoint, Peer, RegisterInput } from '../../types.js';
-import {BridgeError} from '../../shared/errors.js';
+import {BridgeError,RuntimeRecoveryHold} from '../../shared/errors.js';
 import { codexArguments, codexAppServerArguments, liveProcess, processAncestors, processIdentity, probeProcesses } from '../../process/process.js';
 import { registrationWindow } from '../../integration/hooks/session-bindings.js';
 import { hostingRecord, writeHosting } from './session-hosting.js';
 import {sameDirectory} from '../../shared/files.js';
+import {matchingCodexForegroundWindows} from '../../hosts/codex/codex-foreground.js';
+import {codexDeliveryHoldText} from '../delivery/codex-delivery-hold-text.js';
 
 export interface Takeover {id:string;peerId:string;pairId:string;sessionId:string;kind:'remote'|'child';startedAt:number;endpoint?:Endpoint;foreground?:{pid:number;procStart:string};controller?:{pid:number;procStart:string};handle?:string;nextObservation?:number;handoffId?:string;adopted?:{endpoint?:Endpoint;retirementChecked?:boolean}}
 const key=(peerId:string)=>'takeover:'+peerId;
@@ -28,6 +30,34 @@ async function observeForeground(store:Store,value:Takeover,host:Peer['host']):P
 export class Takeovers {
   constructor(private store:Store,private probe=probeProcesses,private observe=(value:Takeover,host:Peer['host'])=>observeForeground(store,value,host),private sessionState?:(peer:Peer)=>Promise<'alive'|'dead'|'unknown'>,private alive=liveProcess,private ancestors=processAncestors){}
   get(id:string):Takeover|undefined{return this.store.setting(key(id));}
+  allowsCodexSubscription(peer:Peer,endpoint:Endpoint):boolean{
+    const lease=this.get(peer.id);if(!lease)return true;
+    const original=lease.endpoint,native=endpoint.native??endpoint,held=original?.native??original;
+                                                
+    return lease.kind==='remote'&&lease.peerId===peer.id&&lease.sessionId===peer.sessionId&&lease.pairId===this.store.pairFor(peer.id)?.id
+      &&original?.mode==='app-server'&&original.address===endpoint.address&&original.epoch===endpoint.epoch
+      &&original.bindingEpoch===endpoint.bindingEpoch&&!!endpoint.runtimeId&&original.runtimeId===endpoint.runtimeId
+      &&!!native.pid&&!!native.procStart&&held?.pid===native.pid&&held.procStart===native.procStart;
+  }
+  async codexSubscriptionGuard(peer:Peer,endpoint:Endpoint):Promise<()=>void>{
+    const lease=this.get(peer.id),native=endpoint.native??endpoint;
+    const holders=()=>{const current=this.get(peer.id);return[...(current?.foreground?[current.foreground]:[]),
+      ...matchingCodexForegroundWindows(this.store,endpoint.address,peer.sessionId??undefined).filter(window=>window.sessionId===peer.sessionId).map(window=>window.foreground)];};
+    const same=(left:NonNullable<Takeover['foreground']>,right:NonNullable<Takeover['foreground']>)=>left.pid===right.pid&&left.procStart===right.procStart;
+    const held=()=>{throw new RuntimeRecoveryHold('takeover_unverified',codexDeliveryHoldText('takeover_unverified').status);};
+    let holder:Takeover['foreground'];
+    const guard=()=>{
+      const current=this.store.peer(peer.id),active=this.store.endpoint(peer.id);
+      if(!lease||this.get(peer.id)?.id!==lease.id||!this.allowsCodexSubscription(current,endpoint)
+        ||active&&!this.allowsCodexSubscription(current,active)||!holder||!holders().some(value=>same(value,holder!))||!this.alive(holder.pid))held();
+    };
+    if(!lease||!native.pid||!native.procStart||!this.allowsCodexSubscription(peer,endpoint))held();
+    const candidates=[...new Map(holders().map(value=>[value.pid+':'+value.procStart,value])).values()];
+    if(!candidates.length)held();
+    const states=await this.probe([...candidates,{pid:native.pid!,procStart:native.procStart!}]);
+    if(states.at(-1)!=='alive')held();
+    holder=candidates.find((_value,index)=>states[index]==='alive');guard();return guard;
+  }
   async registration(input:RegisterInput):Promise<Peer|undefined>{
     const window=registrationWindow(input);if(!window||input.kind==='subagent')return;
     const candidates=this.store.peers().filter(peer=>peer.host===input.host&&peer.sessionId===input.sessionId&&this.store.endpoints(peer.id).some(endpoint=>endpoint.configHome&&sameDirectory(endpoint.configHome,window.configHome))).flatMap(peer=>{const lease=this.get(peer.id);return lease?.kind==='child'&&!lease.adopted&&lease.sessionId===input.sessionId&&lease.pairId===this.store.pairFor(peer.id)?.id?[{peer,lease}]:[];});
@@ -61,10 +91,15 @@ export class Takeovers {
   async returned(peerId:string,id:string,foregroundEnded=false):Promise<boolean>{
     const value=this.get(peerId);if(!value)return true;if(value.id!==id)return false;
     const backend=value.endpoint?.pid&&value.endpoint.procStart?{pid:value.endpoint.pid,procStart:value.endpoint.procStart}:undefined;
-    const identities=[...(value.foreground?[value.foreground]:[]),...(backend?[backend]:[])];
+    const identityKey=(holder:Takeover['foreground'])=>holder?holder.pid+':'+holder.procStart:'';
+    const holders=()=>value.kind==='remote'&&value.endpoint?matchingCodexForegroundWindows(this.store,value.endpoint.address,value.sessionId).map(window=>window.foreground):[];
+    const holderSet=()=>holders().map(identityKey).sort().join('|'),before=holderSet();
+    const others=[...new Map(holders().filter(holder=>identityKey(holder)!==identityKey(value.foreground)).map(holder=>[identityKey(holder),holder])).values()];
+    const identities=[...(value.foreground?[value.foreground]:[]),...others,...(backend?[backend]:[])];
                                    
     const states=identities.every(native=>this.alive(native.pid))?identities.map(()=>'alive' as const):await this.probe(identities);
     const tui=value.foreground?states[0]:undefined,server=backend?states.at(-1):undefined;
+    if(server!=='dead'&&states.slice(value.foreground?1:0,(value.foreground?1:0)+others.length).some(state=>state!=='dead'))return false;
     let observedAbsent=false;
     if(!value.foreground&&!foregroundEnded&&(value.adopted||value.controller&&!liveProcess(value.controller.pid)&&Date.now()-value.startedAt>=5000)&&(value.nextObservation??0)<=Date.now()){
       value.nextObservation=Date.now()+30000;this.store.setSetting(key(peerId),value);
@@ -75,7 +110,9 @@ export class Takeovers {
       observedAbsent=matches.length===0&&await this.sessionState?.(this.store.peer(peerId))==='dead';
     }
     if(tui!=='dead'&&!(foregroundEnded&&!value.foreground)&&!observedAbsent&&!(value.kind==='remote'&&server==='dead'))return false;
-    if(this.get(peerId)?.id!==id)return false;
+    const current=this.get(peerId);
+                                         
+    if(current?.id!==id||identityKey(current.foreground)!==identityKey(value.foreground)||holderSet()!==before)return false;
     this.store.setSetting(key(peerId),null);this.store.event('takeover.returned',{peerId,leaseId:id,backend:server??'unknown'});return true;
   }
 }

@@ -17,6 +17,7 @@ import { daemonDelivery } from '../delivery/delivery-guidance.js';
 import { mergeObservedFields, type FieldObservation } from '../../storage/observed-fields.js';
 import { modStaleNotice, MOD_STALE_NOTICE_MS } from '../../integration/mod/mod-reload.js';
 import {memberEnabled} from '../member-control.js';
+import type {CodexDeliveryHold} from '../delivery/codex-delivery-gate.js';
 
 export interface IntegrationEvidence {
   nativeHookDurations?:{event:string;durationMs:number}[];
@@ -39,6 +40,7 @@ export interface PairIssue {kind:string;message:string;factKey?:string;terminal?
                                               
 const FACT_KINDS=new Set(['turn_failed','continuation_failed','pickup_exhausted','subagent_completion_held']);
 export interface PairObservation {
+  deliveryHold?:CodexDeliveryHold;
   nativeHistory?:{status:string;reason?:string};
                                                         
   continuation?:{anchor:string;attempts:number;uncertain?:boolean;error?:string;scope?:string};
@@ -106,7 +108,7 @@ export function pairIssues(value:PairObservation):PairIssue[]{
     if(['accepted','sending','runtimeQueued'].includes(state)&&peer.state!=='ready'&&!stalled)continue;
     const rows=pending.filter(m=>m.state===state);
     const daemonWait=state==='accepted'?daemonDelivery(peer,endpoint,rows.length,value.transitioning).delivery_wait:undefined;
-    add('delivery_'+state,`${rows.length} msg(s) remain ${state} for 2+ min: ${rows.slice(-5).map(m=>m.id).join(', ')}; ${daemonWait?daemonWait.message:state==='runtimeQueued'?'native queued != observed in context; an interrupted turn may discard its pending output; inspect original history/replies before any manual resend':state==='unknown'?'submission outcome unknown; never auto-replay':state==='held'?'native admission held; inspect original window':'inspect delivery/status before any resend'}`,state==='unknown'?JSON.stringify([value.pair.id,...rows.map(m=>m.id).sort()]):undefined);
+    add('delivery_'+state,`${rows.length} msg(s) remain ${state} for 2+ min: ${rows.slice(-5).map(m=>m.id).join(', ')}; ${daemonWait?daemonWait.message:state==='runtimeQueued'?'native queued != observed in context; an interrupted turn may discard its pending output; inspect original history/replies before any manual resend':state==='unknown'?'submission outcome unknown; never auto-replay':state==='held'?'native admission held; inspect original window':'inspect delivery/status before any resend'}`+(state==='accepted'&&value.deliveryHold?'; '+value.deliveryHold.model+' ['+value.deliveryHold.code+']':''),state==='unknown'?JSON.stringify([value.pair.id,...rows.map(m=>m.id).sort()]):undefined);
   }
   if(value.transitioning&&pending.length)add('context_stuck','window context transition still holds pending msgs after 2+ min; next verified native context required');
   if(peer.state==='busy'&&!value.questionPending){
@@ -179,7 +181,7 @@ const FLAP_MS=120_000;
                                                                             
 const DEPENDENCY_MS=5*60_000,QUIET_MS=15*60_000,DELIVERY_STUCK_MS=3*60_000;
 export class PairAnomalies {
-  constructor(private store:Store,private notices:DeliveryHealth,private version:string,private resources?:ResourceHealth,private home?:string){}
+  constructor(private store:Store,private notices:DeliveryHealth,private version:string,private resources?:ResourceHealth,private home?:string,private deliveryHold?:(peer:Peer)=>CodexDeliveryHold|undefined){}
   async reconcileAtStartup():Promise<void>{
     for(const pair of this.store.pairs())for(const id of [pair.claude,pair.codex])await this.store.faults.run('startup_integration:'+id,()=>{
       const peer=this.store.getPeer(id);
@@ -253,7 +255,7 @@ export class PairAnomalies {
       const binding=this.store.bindings.current(peer.id),peerScope=JSON.stringify([peer.sessionId,binding?.epoch]),scope=JSON.stringify([pair.id,peerScope]);
       const key='pairIssues:'+peer.id,previous=this.store.setting<Incidents>(key),recipient=pair[peer.host==='codex'?'claude':'codex'],partner=this.store.peer(recipient),partnerBinding=this.store.bindings.current(recipient),endpoint=this.store.endpoint(peer.id),now=Date.now();
       const integration=this.currentEvidence(peer,peerScope),direct=this.store.setting<{scope?:string;continuation?:{anchor:string;attempts:number;uncertain?:boolean;error?:string}}>('codexDirect:'+peer.id),lastMessage=this.store.lastMessageFacts(pair.id,peer.id),messages=eligible?this.store.deliveryIssueFacts(pair.id,peer.id):[];
-      const value:Incidents={scope,issues:pairIssues({nativeHistory:this.store.setting('codexHistoryCompatibility:'+peer.id),continuation:direct?.continuation?{...direct.continuation,scope:direct.scope}:undefined,pair,peer,endpoint,partnerPermission:partner.permission,home:this.home,now,messages,transitioning:binding?.transitioning??false,questionPending:this.store.questions(true).some(q=>q.from===peer.id||q.to===peer.id),health,integration,version:this.version,modRevision:MOD_REVISION,replyContractActive:!!this.store.setting('replyContract:'+peer.id),syncReminder,unanswered:syncReminder?this.store.seenSinceLastSendFacts(pair.id,peer.id,binding?.activatedAt??pair.createdAt):undefined,lastMessage:syncReminder?lastMessage:undefined}),notices:[]};
+      const value:Incidents={scope,issues:pairIssues({deliveryHold:this.deliveryHold?.(peer),nativeHistory:this.store.setting('codexHistoryCompatibility:'+peer.id),continuation:direct?.continuation?{...direct.continuation,scope:direct.scope}:undefined,pair,peer,endpoint,partnerPermission:partner.permission,home:this.home,now,messages,transitioning:binding?.transitioning??false,questionPending:this.store.questions(true).some(q=>q.from===peer.id||q.to===peer.id),health,integration,version:this.version,modRevision:MOD_REVISION,replyContractActive:!!this.store.setting('replyContract:'+peer.id),syncReminder,unanswered:syncReminder?this.store.seenSinceLastSendFacts(pair.id,peer.id,binding?.activatedAt??pair.createdAt):undefined,lastMessage:syncReminder?lastMessage:undefined}),notices:[]};
       const receipt=this.store.setting<{sessionId?:string;reportedAt?:number;diagnostic:{consecutive:number;last_error:{at:number}}}>('modReceiptDiagnostic:'+peer.id);
                                                                           
       const same=(row:{kind:string;message:string;factKey?:string},issue:PairIssue)=>row.kind===issue.kind&&(issue.kind==='mod_stale'?row.message===issue.message:FACT_KINDS.has(issue.kind)?row.factKey===issue.factKey:true);
