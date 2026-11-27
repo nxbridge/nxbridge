@@ -87,6 +87,7 @@ export class CodexNativeRpc extends RpcClient {
         this.waiting.set(id,state);
         const current=state;
         void this.independentEvidence(id,current).finally(()=>{current.checking=false;});
+        this.emit('threadUnconfirmed',id);
       }
       state.pending.add(evidence);
                            

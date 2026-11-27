@@ -65,7 +65,7 @@ test('独立目录覆盖间接父链且不查询有问题的线程控制队列',
   assert.deepEqual(requests.map(request=>request.method),['thread/loaded/list','thread/list','thread/list']);
 });
 
-test('独立范围使用原生状态目录，不触发大历史修补，普通查询仍保留修补模式',async()=>{
+test('普通与独立范围都使用原生状态目录，不触发大历史修补',async()=>{
   const rpc=new RpcClient(request=>queueMicrotask(()=>{
     if(request.method==='thread/list'&&request.params.useStateDbOnly!==true){
       rpc.receive({id:request.id,error:{code:'timeout',message:'JSONL 大历史修补未能在查询期限内完成'}});return;
@@ -73,9 +73,20 @@ test('独立范围使用原生状态目录，不触发大历史修补，普通�
     rpc.receive({id:request.id,result:{data:request.method==='thread/loaded/list'?['root','child']:[root,parent,child]}});
   }),()=>{},'mock');
   assert.deepEqual([...(await readCodexRecycleScope(rpc,root.id)).threads.keys()],['root','child','parent']);
-  const ordinary=inspector([],[root]);
-  assert.equal((await catalogCodexThreads(ordinary.rpc,new Set([root.id]))).get(root.id)?.id,root.id);
-  assert.equal(ordinary.requests[0]!.params.useStateDbOnly,undefined);
+  assert.equal((await catalogCodexThreads(rpc,new Set([root.id]))).get(root.id)?.id,root.id);
+});
+
+test('状态目录缺项时，普通查询只保留当前连接的身份，不沿用缓存空闲状态',async()=>{
+  const {rpc}=inspector([],[]),observed={...child,status:{type:'idle'}};
+  observeCodexThreadIdentity(rpc,observed);
+  assert.deepEqual((await catalogCodexThreads(rpc,new Set([child.id]))).get(child.id),{...observed,status:undefined});
+  assert.equal((await catalogCodexThreads(rpc,new Set([child.id]),{independent:true})).has(child.id),false);
+});
+
+test('只查根线程时直接使用全局状态目录，不浪费后代查询预算',async()=>{
+  const {rpc,requests}=inspector([],[root]);let complete=false;
+  assert.equal((await catalogCodexThreads(rpc,new Set([root.id]),{ancestorThreadId:root.id,onComplete:()=>{complete=true;}})).get(root.id)?.id,root.id);
+  assert.equal(requests.length,1);assert.equal(requests[0]!.params.ancestorThreadId,undefined);assert.equal(complete,true);
 });
 
 test('目录缺少已加载线程或父辈时保留原进程，连接缓存不能补齐原生证据',async()=>{

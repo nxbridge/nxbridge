@@ -10,7 +10,7 @@ import { closeHostedWindow, hostingGate, hostingKey, hostingRecord, hostingStatu
 import { WindowRecovery } from '../broker/recovery/window-recovery.js';
 import { hostingArguments } from '../app/commands/hosting-command.js';
 import { managedCodexRegistration } from '../hosts/managed-registration.js';
-import { saveManagedRuntime, runtimeFor, removeManagedRuntime } from '../hosts/managed-runtimes.js';
+import { saveManagedRuntime, runtimeFor, removeManagedRuntime, runtimeFile } from '../hosts/managed-runtimes.js';
 import { managedMarker } from '../install/installation.js';
 import {BridgeError} from '../shared/errors.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
@@ -26,6 +26,29 @@ import { processIdentity } from '../process/process.js';
 import { Takeovers } from '../broker/recovery/takeover.js';
 
 const row=(type:string,payload:unknown)=>JSON.stringify({type,payload})+'\n';
+
+test('后台托管对账只读取待接管成员的归属，原生读取后重核代次',async t=>{
+  const {store,x,c}=fixture(t),home=temporary(t),runtimeId=randomUUID();
+  store.pair(c.id,x.id);store.updatePeer(x.id,{owner:'nxbridge',state:'ready'});
+  const peer=store.peer(x.id),endpoint={...store.endpoint(x.id)!,runtimeId,configHome:home};
+  store.saveEndpoint(endpoint);
+  const runtime={id:runtimeId,peerId:peer.id,sessionId:peer.sessionId!,configHome:home,owner:managedMarker(home),
+    kind:'owned' as const,state:'ready' as const,pid:endpoint.pid!,procStart:endpoint.procStart!,endpoint:endpoint.address,createdAt:Date.now()};
+  saveManagedRuntime(home,runtime);
+  writeFileSync(runtimeFile(home,runtimeId),'{','utf8');
+  let inspected=0;
+  const transfers=new SessionTransfers(store,DEFAULT_CONFIG,home,{holder:async()=> 'dead',prepare:async()=>{},stop:async()=>{},enabled:()=>{},inspect:async()=>{
+    inspected++;saveManagedRuntime(home,{...runtime,procStart:'new-generation'});
+    return{id:peer.sessionId!,cwd:peer.cwd,status:{type:'idle'}};
+  }});
+  assert.equal(await transfers.reconcileOwned(peer),false);
+  writeHosting(store,peer,{background:true,released:false,phase:'adopting'},home);
+  await assert.rejects(transfers.reconcileOwned(peer),{code:'runtime_record_invalid'});
+  saveManagedRuntime(home,runtime);
+  assert.equal(await transfers.reconcileOwned(peer),false);
+  assert.equal(inspected,1);
+  assert.equal(hostingRecord(store,peer)?.phase,'adopting');
+});
 
 test('持有者快照中的进程已退出时继续核验，未知身份或代次变化仍阻止接管',async t=>{
   const {store,x}=fixture(t),home=temporary(t);let failure:unknown=new BridgeError('process_missing','快照后退出');

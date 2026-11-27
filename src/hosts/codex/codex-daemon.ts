@@ -60,12 +60,16 @@ export class CodexDaemons {
     if(!endpoint)return false;const scope=this.wakeScope(peer,endpoint),checked=this.wakeChecks.get(peer.id);
     return !!scope&&checked?.scope===scope&&checked.ready&&Date.now()-checked.at<2000;
   }
+  wakeMayAdvance(peer:Peer,endpoint:Endpoint):boolean{
+    const scope=this.wakeScope(peer,endpoint),checked=this.wakeChecks.get(peer.id);
+    return !!scope&&(checked?.scope!==scope||checked.ready||Date.now()-checked.at>=5000);
+  }
   async wakeReady(peer:Peer,endpoint:Endpoint):Promise<boolean>{
     const scope=this.wakeScope(peer,endpoint);if(!scope){this.wakeChecks.delete(peer.id);return false;}
     try{
       const {thread}=await this.readTarget(peer,endpoint,false),ready=thread.status?.type==='idle';
       const current=this.wakeScope(peer,endpoint);this.wakeChecks.set(peer.id,{scope,at:Date.now(),ready:ready&&current===scope});return ready&&current===scope;
-    }catch{this.wakeChecks.delete(peer.id);return false;}
+    }catch{this.wakeChecks.set(peer.id,{scope,at:Date.now(),ready:false});return false;}
   }
                                           
   async queueWakeReady(peer:Peer,endpoint:Endpoint):Promise<boolean>{

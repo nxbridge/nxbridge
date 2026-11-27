@@ -51,17 +51,25 @@ test('首次注入前没有历史游标时按提交时间找到新落盘调用�
 });
 
 test('活动轮次、等待标记或未知状态保留原消息，并去重记录等待原因供 status 和模型读取',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:100000});
   const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),endpoint=f.store.endpoint(f.x.id)!,message=f.store.accept(pair,f.c,'先等原生状态','native-wait');
   const read=f.codex.injectionState.bind(f.codex);let type='systemError',flags:string[]=[],running=true;
   f.codex.injectionState=async(...args)=>{const value=await read(...args);return{...value,thread:{...value.thread,status:{type,activeFlags:flags},turns:[{id:'native-turn',status:running?'inProgress':'failed'}]}};};
   const delivery=(f.broker as any).codexDirect as CodexDirectDelivery,run=()=>delivery.deliver(f.x,endpoint,f.store.pending(f.x.id),async m=>JSON.stringify({messages:[{message_id:m.id,message:m.body}]}),()=>true,receipt=>f.store.transition(receipt.messageId,'contextObserved'));
   for(const scenario of [{type:'systemError',flags:[],running:true,state:'busy'},{type:'idle',flags:[],running:true,state:'busy'},{type:'systemError',flags:['waitingOnApproval'],running:false,state:'needsHuman'},{type:'systemError',flags:['waitingOnUserInput'],running:false,state:'needsHuman'},{type:'systemError',flags:['futureFlag'],running:false,state:'unknown'},{type:'futureStatus',flags:[],running:false,state:'unknown'},{type:'active',flags:[],running:false,state:'busy'}]){
+    t.mock.timers.tick(10000);
     ({type,flags,running}=scenario);assert.equal(threadRegistration((await f.codex.injectionState(f.x,endpoint)).thread,endpoint.address)?.state,scenario.state);
     await run();await run();assert.equal(f.store.message(message.id).state,'accepted');assert.equal(f.store.message(message.id).attempts,0);
     const view=(f.broker.status() as any).peers.find((peer:any)=>peer.id===f.x.id).delivery_wait;assert.equal(view.reason,'native_thread_state');assert.equal(view.native_status,type);assert.match(view.message,/消息保留/);
   }
   assert.equal(f.store.events(0,1000).filter(event=>event.type==='codex.delivery.wait').length,7);assert.equal(f.codex.injected.length,0);assert.equal(f.codex.woken.length,0);
-  type='systemError';flags=[];running=false;await run();assert.equal(f.store.message(message.id).state,'contextObserved');assert.equal(delivery.status(f.x.id)?.wait,undefined);assert.equal(f.store.events(0,1000).filter(event=>event.type==='codex.delivery.resumed').length,1);
+  type='systemError';flags=[];running=false;
+  assert.equal(delivery.ready(f.x,endpoint,pair.id,true),false);
+  delivery.nativeReady(f.x,{...endpoint,epoch:'old-epoch'},pair.id);
+  assert.equal(delivery.ready(f.x,endpoint,pair.id,true),false);
+  delivery.nativeReady(f.x,endpoint,pair.id);
+  assert.equal(delivery.ready(f.x,endpoint,pair.id,true),true);
+  await run();assert.equal(f.store.message(message.id).state,'contextObserved');assert.equal(delivery.status(f.x.id)?.wait,undefined);assert.equal(f.store.events(0,1000).filter(event=>event.type==='codex.delivery.resumed').length,1);
   assert.equal((f.broker.status() as any).peers.find((peer:any)=>peer.id===f.x.id).delivery_wait,undefined);
 });
 

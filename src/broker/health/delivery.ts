@@ -183,7 +183,17 @@ export class DeliveryHealth {
       if(pending.length)this.storage.setSetting(key,value);return this.groups(pending,senderId);
     });
   }
-  get(pairId:string,senderId:string,id:string):RuntimeNotice|undefined{const notice=this.storage.setting<DeliveryIncident>(deliveryHealthKey(pairId,senderId))?.notices.find(n=>n.id===id&&(n.state==='pending'||n.state==='sending')&&!n.admitted);return notice?{...notice,tier:noticeTier(notice),wake:this.policy.canWake(senderId,notice)}:undefined;}
+  private recordedNotice(pairId:string,recipient:string,id:string):RuntimeNotice|undefined{
+    return this.storage.setting<DeliveryIncident>(deliveryHealthKey(pairId,recipient))?.notices.find(notice=>notice.id===id);
+  }
+  noticeState(pairId:string,recipient:string,id:string):RuntimeNotice['state']|undefined{
+    return this.recordedNotice(pairId,recipient,id)?.state;
+  }
+  get(pairId:string,senderId:string,id:string):RuntimeNotice|undefined{
+    const notice=this.recordedNotice(pairId,senderId,id);
+    if(notice&&!notice.admitted&&(notice.state==='pending'||notice.state==='sending'))
+      return {...notice,tier:noticeTier(notice),wake:this.policy.canWake(senderId,notice)};
+  }
   recordedCanWake(pairId:string,recipient:string,id:string):boolean{return this.storage.setting<DeliveryIncident>(deliveryHealthKey(pairId,recipient))?.notices.some(n=>(n.id===id||n.batchId===id)&&(n.admitted?noticeCanWake(n,recipient):this.policy.canWake(recipient,n)))===true;}
   eligible(pairId:string,recipient:string,id:string):boolean{const notice=this.get(pairId,recipient,id);return !!notice&&this.policy.eligible(recipient,notice);}
   retryHold(pairId:string,recipient:string,id:string):'notice_retry_held'|undefined{const notice=this.get(pairId,recipient,id);return notice?this.policy.retryHold(recipient,notice):undefined;}

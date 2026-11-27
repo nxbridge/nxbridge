@@ -10,7 +10,7 @@ import type {BrokerHealthCoordinator} from '../broker/health/coordinator.js';
 import type {CompletionHold} from '../broker/turn-end-text.js';
 import {fixture,lifecycle} from './support/broker-fixture.js';
 import {temporary} from './support/temporary.js';
-import {saveManagedRuntime} from '../hosts/managed-runtimes.js';
+import {runtimeFile,saveManagedRuntime} from '../hosts/managed-runtimes.js';
 import {managedMarker} from '../install/installation.js';
 import {MOD_REVISION} from '../mod-revision.js';
 import {StartupRoutes} from '../broker/startup-routes.js';
@@ -352,6 +352,19 @@ function managedFixture(t:TestContext){
   const native=(method:string,extra:object)=>f.codex.emit('native',{address:previous.address,message:{jsonrpc:'2.0',method,params:{threadId:f.x.sessionId,...extra}}});
   return{...f,pair,native,previous};
 }
+
+test('当前搭档端点缺失时，转录补证不读取后台归属账本',async t=>{
+  const f=managedFixture(t),bg=f.store.peer(f.x.id),endpoint=f.store.endpoint(bg.id)!;
+  const file=path.join(f.broker.home,'history.jsonl');
+  completedHistory(file,bg.sessionId!,'completed',1000,2000,3000);
+  f.store.saveEndpoint({...endpoint,nativeSession:{transcriptPath:file}});
+  const foreground=f.store.endpoint(f.c.id)!;f.store.deactivate(f.c.id,foreground.epoch);
+  writeFileSync(runtimeFile(f.broker.home,endpoint.runtimeId!),'{','utf8');
+  assert.equal(await f.broker.turnEnds.scan(bg),false);
+  assert.equal(f.broker.turnEnds.status(bg).state,'not_applicable');
+  f.store.saveEndpoint(foreground);
+  assert.throws(()=>f.broker.turnEnds.status(bg),{code:'runtime_record_invalid'});
+});
 
 for(const inactive of [false,true])test('投递栅栏内只修复原 Codex 订阅，真实回执前不激活离线端点：'+inactive,async t=>{
   const f=managedFixture(t),life=lifecycle(f.broker),b=f.broker as unknown as {startupRoutes:StartupRoutes;catchUpOwnedRoutes(ids:Iterable<string>):Promise<void>};

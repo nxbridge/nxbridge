@@ -9,6 +9,17 @@ export class CodexWakeSignals {
   private active=new Set<string>();
   constructor(private store:Store,private now=Date.now){}
   status(peerId:string):WakeReservation|undefined{return this.store.setting<WakeReservation>('codexWake:'+peerId);}
+  private disposition(previous:WakeReservation|undefined,scope:string,anchor:string):'fresh'|'retry'|'waiting'|'exhaust'|'exhausted'{
+    if(previous?.scope!==scope||previous.anchor!==anchor)return'fresh';
+    if(previous.exhausted)return'exhausted';
+    if(this.now()-previous.at<CODEX_WAKE_RETRY_MS)return'waiting';
+    return previous.attempts>=CODEX_WAKE_MAX_ATTEMPTS?'exhaust':'retry';
+  }
+  ready(peerId:string,scope:string,anchor:string):boolean{
+    if(this.active.has(peerId))return false;
+    const state=this.disposition(this.status(peerId),scope,anchor);
+    return state!=='waiting'&&state!=='exhausted';
+  }
   clear(peerId:string):void{if(this.status(peerId))this.store.setSetting('codexWake:'+peerId,null);}
   restartCandidate(peerId:string,scope:string):WakeReservation|undefined{
     const value=this.status(peerId);
@@ -23,13 +34,13 @@ export class CodexWakeSignals {
     if(this.active.has(peerId))return;
     this.active.add(peerId);
     try{
-      const previous=this.status(peerId),same=previous?.scope===scope&&previous.anchor===anchor;
-      if(same&&this.now()-previous.at<CODEX_WAKE_RETRY_MS)return;
-      if(same&&previous.attempts>=CODEX_WAKE_MAX_ATTEMPTS){
-        if(!previous.exhausted){this.store.setSetting('codexWake:'+peerId,{...previous,exhausted:true});this.store.event('wake.exhausted',{peerId,attempts:previous.attempts});}
+      const previous=this.status(peerId),state=this.disposition(previous,scope,anchor);
+      if(state==='waiting'||state==='exhausted')return;
+      if(state==='exhaust'){
+        this.store.setSetting('codexWake:'+peerId,{...previous!,exhausted:true});this.store.event('wake.exhausted',{peerId,attempts:previous!.attempts});
         return;
       }
-      const reservation:WakeReservation={scope,anchor,attempts:same?previous.attempts+1:1,at:this.now()};
+      const reservation:WakeReservation={scope,anchor,attempts:state==='retry'?previous!.attempts+1:1,at:this.now()};
       this.store.setSetting('codexWake:'+peerId,reservation);
       try{
         const accepted=(turnId:string)=>{if(this.status(peerId)?.at===reservation.at){reservation.turnId=turnId;this.store.setSetting('codexWake:'+peerId,reservation);}};

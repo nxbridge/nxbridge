@@ -8,7 +8,8 @@ import {describeError} from '../shared/errors.js';
 
 interface NativeWake {id:string;clientId:string}
 export type WakeQueue = {items:NativeWake[];error?:never}|{items?:never;error:string};
-interface OutstandingWake {scope:string;at:number;nativeId?:string;clientId?:string}
+interface OutstandingWake {scope:string;at:number;checkedAt?:number;nativeId?:string;clientId?:string}
+const QUEUE_RECHECK_MS=5000,WAKE_SPACING_MS=30000;
 
                                                      
 export function readWakeQueue(home:string,sessionId:string):WakeQueue{
@@ -34,17 +35,25 @@ export function readWakeQueue(home:string,sessionId:string):WakeQueue{
 export class EmbeddedWakeSignals {
   private active=new Set<string>();
   constructor(private store:Store,private read=readWakeQueue){}
-  consumed(peerId:string):void{this.store.setSetting('embeddedWake:'+peerId,null);}
+  private key(peerId:string):string{return'embeddedWake:'+peerId;}
+  private canCheck(previous:OutstandingWake|undefined,scope:string):boolean{
+    return previous?.scope!==scope||Date.now()>=Math.max(previous.at+WAKE_SPACING_MS,(previous.checkedAt??0)+QUEUE_RECHECK_MS);
+  }
+  ready(peerId:string,scope:string):boolean{return !this.active.has(peerId)&&this.canCheck(this.store.setting(this.key(peerId)),scope);}
+  consumed(peerId:string):void{this.store.setSetting(this.key(peerId),null);}
   async signal(peerId:string,scope:string,home:string,sessionId:string,submit:()=>Promise<void>):Promise<string|null>{
     if(this.active.has(peerId))return null;
     this.active.add(peerId);
     try{
-      const key='embeddedWake:'+peerId,previous=this.store.setting<OutstandingWake>(key),queue=this.read(home,sessionId),native=queue.items?.[0];
-      if(native){this.store.setSetting(key,{scope,at:previous?.scope===scope?previous.at:Date.now(),nativeId:native.id,clientId:native.clientId});return null;}
+      const key=this.key(peerId),previous=this.store.setting<OutstandingWake>(key);
+      if(!this.canCheck(previous,scope))return null;
+      const at=Date.now(),queue=this.read(home,sessionId),native=queue.items?.[0];
+      if(native){this.store.setSetting(key,{scope,at:previous?.scope===scope?previous.at:at,checkedAt:at,nativeId:native.id,clientId:native.clientId});return null;}
                                                   
-      const wait=queue.error?600000:30000;
-      if(previous?.scope===scope&&Date.now()-previous.at<wait)return queue.error??null;
-      const reservation:OutstandingWake={scope,at:Date.now()};this.store.setSetting(key,reservation);
+      if(queue.error&&previous?.scope===scope&&at-previous.at<600000){
+        this.store.setSetting(key,{...previous,checkedAt:at});return queue.error;
+      }
+      const reservation:OutstandingWake={scope,at};this.store.setSetting(key,reservation);
       try{await submit();}
       catch(error){this.store.event('wake.unknown',{peerId,error:describeError(error)});return queue.error??'原生唤醒提交结果未知；保留预约，核对队列后再重试。';}
       const after=this.read(home,sessionId),item=after.items?.[0],current=this.store.setting<OutstandingWake>(key);

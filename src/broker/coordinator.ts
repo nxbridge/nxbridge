@@ -135,6 +135,11 @@ export interface Adapters {
   claude:ClaudeAdapter;
 }
 
+interface TurnRecoveryNotice {
+  request_id?:string;pair_id:string;peer_id:string;session_id:string|null;turn_id?:string;notice_id:string;
+  action:'continue_failed'|'interrupt_stalled';providerIssue:boolean;
+}
+
 export class Broker {
   private readonly memberLifecycle:BrokerLifecycleCoordinator;
   readonly profiles:PartnerProfiles;
@@ -156,6 +161,7 @@ export class Broker {
   private configurationWindows=new Map<string,{epoch:string;pid:number;procStart:string}>();
   private timer?:NodeJS.Timeout;
   private pumping?:Promise<void>;
+  private readonly deliveryWakes=new Set<string>();
   private stopped=false;
   private handoff:'draining'|'acquiring'|'sealed'|undefined;
   private startupActive=false;
@@ -287,23 +293,22 @@ export class Broker {
     });
     this.takeovers.permissions=this.takeoverPermissions;
     adapters.codex.acceptedTakeoverPermission=id=>this.takeoverPermissions.accepted(id);
-    const codexSource=(peer:Peer)=>{
-        const endpoint=store.endpoint(peer.id),known=store.setting<{sessionId:string;file:string}>('codexTranscript:'+peer.id);
-        const file=endpoint?.nativeSession?.transcriptPath??(known?.sessionId===peer.sessionId?known.file:undefined)??(endpoint?.configHome&&peer.sessionId?sessionFile(endpoint.configHome,peer.sessionId):undefined);
-        const runtime=endpoint?runtimeFor(home,{endpoint:endpoint.address})?.value:undefined;
-        const proof=store.setting<StoredLaunchProof>('managedLaunchProof:'+peer.id);
-        const sessionMatches=runtime?.sessionId===peer.sessionId||proof?.sessionId===peer.sessionId&&proof.runtimeId===runtime?.id&&!!proof.configHome&&!!runtime?.configHome&&sameDirectory(proof.configHome,runtime.configHome);
-        const owned=peer.owner==='nxbridge'&&runtime?.kind==='owned'&&runtime.state==='ready'&&runtime.dedicated===true&&runtime.peerId===peer.id&&sessionMatches
-          &&!!runtime.configHome&&!!endpoint?.configHome&&sameDirectory(runtime.configHome,endpoint.configHome)&&runtime.pid===endpoint.pid&&runtime.procStart===endpoint.procStart
-          &&(endpoint.address.startsWith('unix://')||runtime.authenticatedLoopback===true&&/^ws:\/\/127\.0\.0\.1:\d+$/.test(endpoint.address));
-        return{file,owned};
+    this.codexTranscript=peer=>{
+      const endpoint=store.endpoint(peer.id),known=store.setting<{sessionId:string;file:string}>('codexTranscript:'+peer.id);
+      return endpoint?.nativeSession?.transcriptPath??(known?.sessionId===peer.sessionId?known.file:undefined)??(endpoint?.configHome&&peer.sessionId?sessionFile(endpoint.configHome,peer.sessionId):undefined);
     };
-    this.codexTranscript=peer=>codexSource(peer).file;
     this.turnEnds=new TurnEndCoordinator(store,this.deliveryHealth,{
-      source:peer=>codexSource(peer).file,
-      owned:peer=>{
-        if(peer.host==='codex')return codexSource(peer).owned;
-        const endpoint=store.endpoint(peer.id);if(!endpoint||peer.owner!=='nxbridge')return false;
+      source:this.codexTranscript,
+      owned:(peer,endpoint)=>{
+        if(peer.owner!=='nxbridge')return false;
+        if(peer.host==='codex'){
+          const runtime=runtimeFor(home,{endpoint:endpoint.address})?.value;
+          if(runtime?.kind!=='owned'||runtime.state!=='ready'||runtime.dedicated!==true||runtime.peerId!==peer.id)return false;
+          const proof=store.setting<StoredLaunchProof>('managedLaunchProof:'+peer.id);
+          const sessionMatches=runtime.sessionId===peer.sessionId||proof?.sessionId===peer.sessionId&&proof.runtimeId===runtime.id&&!!proof.configHome&&!!runtime.configHome&&sameDirectory(proof.configHome,runtime.configHome);
+          return sessionMatches&&!!runtime.configHome&&!!endpoint.configHome&&sameDirectory(runtime.configHome,endpoint.configHome)&&runtime.pid===endpoint.pid&&runtime.procStart===endpoint.procStart
+            &&(endpoint.address.startsWith('unix://')||runtime.authenticatedLoopback===true&&/^ws:\/\/127\.0\.0\.1:\d+$/.test(endpoint.address));
+        }
         const child=claudeChild(home,peer.id),native=nativeOwnership(home,peer.id);
         return child?.phase==='active'&&child.sessionId===peer.sessionId&&child.native?.pid===endpoint.pid&&child.native.startedAt===endpoint.procStart
           ||native?.phase==='bound'&&!native.releasedToUser&&native.sessionId===peer.sessionId&&native.native?.pid===endpoint.pid&&native.native.startedAt===endpoint.procStart;
@@ -334,8 +339,8 @@ export class Broker {
     });
     store.onCooperationChange=ids=>{for(const id of ids)store.faults.sync('cooperation_clock:'+id,()=>this.communicationTips.cooperation.changed(store.peer(id)));};
     this.configurationReload=new ConfigurationReload(home);this.configuration=new InHostConfiguration(home,Date.now,()=>this.applyConfiguration(),(name,data)=>this.store.event(name,data));
-    this.runtimeHealth=new BrokerHealthCoordinator({store,config,adapters,home,resources},{incidents:this.incidents,deliveryHealth:this.deliveryHealth,communicationTips:this.communicationTips,pairAnomalies:this.pairAnomalies,idleNotices:this.idleNotices,profiles:this.profiles,foregroundHealth:this.foregroundHealth,managedRecovery:this.managedRecovery,health:this.health,codexDirect:this.codexDirect,daemons:this.daemons,questions:this.questions,turnEnds:this.turnEnds},{hostingStatus:peer=>this.hostingStatus(peer),stopped:()=>this.producersPaused,startupPending:id=>this.startupBlocked(id),actor:(...args)=>this.actor(...args),enabled:(...args)=>this.enabled(...args),requireEnabled:(...args)=>this.requireEnabled(...args),ownedClaudeLaunchReady:(...args)=>this.memberLifecycle.ownedClaudeLaunchReady(...args),ownedClaudeLaunchFailure:(...args)=>this.memberLifecycle.ownedClaudeLaunchFailure(...args),signalCodexWake:(...args)=>this.signalCodexWake(...args),signalEmbeddedWake:(...args)=>this.signalEmbeddedWake(...args),refreshHookTrust:(...args)=>this.refreshHookTrust(...args),pumpStage:(...args)=>this.pumpStage(...args)});
-    this.memberLifecycle=new BrokerLifecycleCoordinator({store,config,adapters,home},{profileCoordination:this.profileCoordination,deletedSessions:this.deletedSessions,takeovers:this.takeovers,takeoverPermissions:this.takeoverPermissions,managedRecovery:this.managedRecovery,transfers:this.transfers,runtimeHealth:this.runtimeHealth,deliveryHealth:this.deliveryHealth,daemons:this.daemons,codexDirect:this.codexDirect,subagentCompletions:this.subagentCompletions},{
+    this.runtimeHealth=new BrokerHealthCoordinator({store,config,adapters,home,resources},{incidents:this.incidents,deliveryHealth:this.deliveryHealth,communicationTips:this.communicationTips,pairAnomalies:this.pairAnomalies,idleNotices:this.idleNotices,profiles:this.profiles,foregroundHealth:this.foregroundHealth,managedRecovery:this.managedRecovery,health:this.health,codexDirect:this.codexDirect,daemons:this.daemons,questions:this.questions,turnEnds:this.turnEnds},{hostingStatus:peer=>this.hostingStatus(peer),stopped:()=>this.producersPaused,startupPending:id=>this.startupBlocked(id),actor:(...args)=>this.actor(...args),enabled:(...args)=>this.enabled(...args),requireEnabled:(...args)=>this.requireEnabled(...args),ownedClaudeLaunchReady:(...args)=>this.memberLifecycle.ownedClaudeLaunchReady(...args),ownedClaudeLaunchFailure:(...args)=>this.memberLifecycle.ownedClaudeLaunchFailure(...args),signalCodexWake:(...args)=>this.signalCodexWake(...args),signalEmbeddedWake:(...args)=>this.signalEmbeddedWake(...args),refreshHookTrust:(...args)=>this.refreshHookTrust(...args),runtimeProbeFailed:id=>this.wakeMemberRecovery(id),pumpStage:(...args)=>this.pumpStage(...args)});
+    this.memberLifecycle=new BrokerLifecycleCoordinator({store,config,adapters,home},{profileCoordination:this.profileCoordination,deletedSessions:this.deletedSessions,takeovers:this.takeovers,takeoverPermissions:this.takeoverPermissions,managedRecovery:this.managedRecovery,transfers:this.transfers,runtimeHealth:this.runtimeHealth,deliveryHealth:this.deliveryHealth,daemons:this.daemons},{
       stopped:()=>this.stopped,
       producersPaused:()=>this.producersPaused,
       startupBlocked:id=>this.startupBlocked(id),
@@ -343,7 +348,8 @@ export class Broker {
       migrateCodexIdentity:(...args)=>this.migrateCodexIdentity(...args),
       restartCodexTransport:(peer,endpoint,options)=>this.restartCodex({peer_id:peer.id},{endpoint,options}),
       foldRecycleReceipt:(peer,receipt)=>this.observeCodexContext(peer,receipt,'回收前后的原生持久历史'),
-      pumpAfterCurrent:()=>{const pumping=this.pumping;return pumping?pumping.then(()=>this.pump()):this.pump();},
+      queuedDelivery:(id,accepted)=>this.queuedDelivery(id,accepted),
+      wakeDelivery:id=>this.wakeScheduledDelivery(id,true),
     });
     this.codexDelivery=new CodexDeliveryGate(store,{
       paused:()=>this.producersPaused,enabled:id=>this.enabled(id),
@@ -445,17 +451,17 @@ export class Broker {
     on(adapters.codex,'providerRetries',({address,budget})=>{this.providerRetries.set(address,budget);this.store.setSetting('providerRetries:'+address,budget);});
     on(adapters.codex,'register',async(r:RegisterInput,memberId?:string)=>{
       if(memberId&&!this.enabled(memberId)||this.disabledRegistration(r))return;
-      if(memberId){const peer=this.store.peer(memberId);if(peer.host!=='codex'||peer.sessionId!==r.sessionId||this.store.bindings.current(peer.id))return;this.store.adopt(peer.id,r);const ep=this.runtimeEndpoint(peer.id);if(ep)this.deletedSessions.observe(this.store.peer(peer.id),ep);this.background('codex_observe:'+peer.id,()=>this.observeActiveCodex(this.store.peer(peer.id)));return;}
+      if(memberId){const peer=this.store.peer(memberId);if(peer.host!=='codex'||peer.sessionId!==r.sessionId||this.store.bindings.current(peer.id))return;this.store.adopt(peer.id,r);const ep=this.runtimeEndpoint(peer.id);if(ep)this.deletedSessions.observe(this.store.peer(peer.id),ep);this.background('codex_observe:'+peer.id,()=>this.observeActiveCodex(this.store.peer(peer.id)));this.wakeScheduledDelivery(peer.id);return;}
       const runtime=runtimeFor(this.home,{endpoint:r.endpoint.address})?.value;
       if(runtime?.peerId){
         const peer=this.store.peer(runtime.peerId);if(!peer.sessionId)return;
         if(r.kind==='subagent'||managedDescendant(this.store,peer,r)){r.kind='subagent';this.store.register(r);clearManagedChildConflict(this.store,peer,runtime.id,r);return;}
-        if(peer.sessionId===r.sessionId){if(!this.store.setting('managedSessionConflict:'+peer.id)){this.store.adopt(peer.id,r);const ep=this.runtimeEndpoint(peer.id);if(ep)this.deletedSessions.observe(this.store.peer(peer.id),ep);}return;}
+        if(peer.sessionId===r.sessionId){if(!this.store.setting('managedSessionConflict:'+peer.id)){this.store.adopt(peer.id,r);const ep=this.runtimeEndpoint(peer.id);if(ep)this.deletedSessions.observe(this.store.peer(peer.id),ep);this.wakeScheduledDelivery(peer.id);}return;}
         addManagedConflict(this.store,peer.id,runtime.id,r.sessionId);return;
       }
       const matches=this.store.peers().filter(p=>p.host==='codex'&&p.sessionId===r.sessionId&&this.store.endpoints(p.id).some(e=>e.mode==='app-server'&&e.address===r.endpoint.address)&&!this.store.bindings.current(p.id));
       if(matches.length>1)return;
-      const peer=await this.windowRecovery.register(r),ep=this.runtimeEndpoint(peer.id);if(ep)this.deletedSessions.observe(peer,ep);this.background('codex_observe:'+peer.id,()=>this.observeActiveCodex(peer));
+      const peer=await this.windowRecovery.register(r),ep=this.runtimeEndpoint(peer.id);if(ep)this.deletedSessions.observe(peer,ep);this.background('codex_observe:'+peer.id,()=>this.observeActiveCodex(peer));this.wakeScheduledDelivery(peer.id);
     });
                                             
     on(adapters.codex,'sessionPolicy',({memberId,sessionId,policy,runtimeId})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.sessionId===sessionId&&this.store.pairFor(peer.id)&&(!hostingRecord(this.store,peer)?.verificationRuntimeId||hostingRecord(this.store,peer)?.verificationRuntimeId===runtimeId))writeHosting(this.store,peer,{policy,verifying:false,verified:true,verificationError:undefined});},true);
@@ -472,7 +478,14 @@ export class Broker {
     on(adapters.codex,'state',(id:string,state:PeerState,address?:string)=>{
       if(state==='offline'&&address){const runtime=runtimeFor(this.home,{endpoint:address})?.value;if(runtime?.peerId)clearManagedConflict(this.store,runtime.peerId,runtime.id,id);}
       const p=this.runtimePeer(id,address),newActivity=p&&!['busy','needsHuman'].includes(p.state);
-      if(p&&this.enabled(p.id)&&(p.state!=='paused'||p.kind==='subagent'))this.store.updatePeer(p.id,{state});
+      if(p&&this.enabled(p.id)&&(p.state!=='paused'||p.kind==='subagent')){
+        this.store.updatePeer(p.id,{state});
+        if(state==='ready'){
+          const pair=this.store.pairFor(p.id),endpoint=this.store.endpoint(p.id);
+          if(pair&&endpoint)this.codexDirect.nativeReady(p,endpoint,pair.id);
+          this.wakeScheduledDelivery(p.id);
+        }
+      }
       if(p?.kind==='subagent'&&state==='offline')for(const endpoint of this.store.endpoints(p.id))if(endpoint.mode==='app-server'&&endpoint.address===address)this.store.deactivate(p.id,endpoint.epoch);
       if(p&&['busy','needsHuman'].includes(state))return this.observeActiveCodex(this.store.peer(p.id),newActivity);
     });
@@ -481,6 +494,10 @@ export class Broker {
     on(adapters.codex,'interrupted',(id:string,address?:string,turnId?:string)=>{const p=this.runtimePeer(id,address);if(p&&this.enabled(p.id)&&!this.recoveredCodexInterrupt(p,turnId,address)){this.questions.cancelPeer(p.id);this.store.updatePeer(p.id,{state:'paused'});}});
     on(adapters.codex,'turnStarted',(id:string,address?:string)=>{const p=this.runtimePeer(id,address);if(p&&this.enabled(p.id)&&(p.state!=='paused'||p.kind==='subagent'))this.store.updatePeer(p.id,{state:'busy'});});
     on(adapters.codex,'runtimeStopped',(runtime:Endpoint)=>this.retireCodexRuntime(runtime));
+    on(adapters.codex,'threadUnconfirmed',(id:string,address:string)=>{
+      const peer=this.runtimePeer(id,address),endpoint=peer?this.store.endpoint(peer.id):undefined;
+      if(peer&&endpoint?.address===address)this.runtimeHealth.recordRuntimeProbeFailure(peer,endpoint);
+    });
     on(adapters.codex,'disconnected',(address:string)=>{this.turnEndEvidence.disconnected(address,this.store.peers(),peer=>this.store.endpoint(peer.id));this.disconnected(address);});
     on(adapters.codex,'turnOriginObserved',(peerId:string,turnId:string,cause:string)=>{
       const peer=this.store.getPeer(peerId),endpoint=peer?this.store.endpoint(peer.id):undefined;
@@ -663,22 +680,125 @@ export class Broker {
     this.startupActive=false;
   }
   private armSchedulers(caughtUp?:ReadonlySet<string>):void{
+    let patrolAt=0;
     const tick=()=>{
       if(this.producersPaused)return;
-      this.background('member_recovery_tick',()=>Promise.all(this.schedulePairedRecoveries().values()));
-      this.background('managed_exits',()=>this.memberLifecycle.observeManagedExits());this.background('timer_pump',()=>this.pump());
+      let accepted:string[]=[];
+      this.store.faults.sync('timer_pending',()=>{accepted=this.store.pendingRecipients();});
+      const targets=this.deliveryCandidates(accepted);
+      let deliverable=false;
+      for(const id of targets)if(this.deliveryMayAdvance(id))deliverable=true;
+      const now=performance.now();
+      if(now>=patrolAt||deliverable){
+        patrolAt=now+5000;
+        this.background('member_recovery_tick',()=>Promise.all(this.schedulePairedRecoveries(targets).values()));
+        this.background('managed_exits',()=>this.memberLifecycle.observeManagedExits());
+        this.background('timer_pump',()=>this.pump());
+      }else{
+                                         
+        for(const id of targets)this.wakeQueuedRecovery(id);
+      }
       observeBrokerReachable(this.home);
-      let interval=5000;this.store.faults.sync('timer_pending',()=>{if(this.store.pendingCount())interval=1000;});
-      if(!this.producersPaused)this.timer=setTimeout(tick,interval);
+      if(!this.producersPaused)this.timer=setTimeout(tick,Math.min(targets.size?1000:5000,Math.max(1,Math.ceil(patrolAt-performance.now()))));
     };
     tick();
     this.background('reconcile',()=>this.reconcile(undefined,caughtUp));
+  }
+  private queuedDelivery(id:string,accepted?:boolean):boolean{
+    if(accepted===true)return true;
+    let queued=false;
+    this.store.faults.sync('delivery_queued:'+id,()=>{
+      if(accepted===undefined&&this.store.pendingCount(id)>0){queued=true;return;}
+      const peer=this.store.getPeer(id);
+      queued=peer?.host==='codex'&&!!peer.sessionId&&(this.codexDirect.pending(id)||this.subagentCompletions.pending(peer))
+        &&this.store.pairFor(id)?.paused===false;
+    });
+    return queued;
+  }
+  private deliveryCandidates(accepted:Iterable<string>):Set<string>{
+    const targets=new Set(accepted);
+    this.store.faults.sync('delivery_candidates',()=>{
+      for(const pair of this.store.pairs())if(!pair.paused&&!targets.has(pair.codex)&&this.queuedDelivery(pair.codex,false))targets.add(pair.codex);
+    });
+    return targets;
+  }
+  private wakeScope(peer:Peer,endpoint:Endpoint,pair:Pair):string{
+    return JSON.stringify([pair.id,peer.sessionId,endpoint.epoch,endpoint.bindingEpoch]);
+  }
+  private subagentWakeAnchor(peer:Peer,endpoint:Endpoint,pair:Pair):string|undefined{
+    return this.codexDirect.continuationUncertain(peer,endpoint,pair.id)?undefined:this.subagentCompletions.batch(peer);
+  }
+  private deliveryTarget(id:string):{peer:Peer;endpoint:Endpoint}|undefined{
+    const peer=this.store.getPeer(id);
+    if(!peer?.sessionId||this.memberLifecycle.retryPending(id))return;
+    const pair=this.store.pairFor(id);
+    if(!pair||pair.paused)return;
+    const endpoint=this.store.endpoint(id);
+    if(!endpoint?.active||!this.incidents.canAttempt(peer,endpoint))return;
+    if(peer.host==='codex'){
+      if(!this.codexWakeAllowed(peer,endpoint,pair.id)||this.codexWakeWork.has(id)||this.subagentCompletions.blocked(peer))return;
+      const scope=this.wakeScope(peer,endpoint,pair),anchor=this.store.firstPendingId(id);
+      if(endpoint.mode==='embedded'&&!endpoint.daemon){
+        if(this.config.compatibilityWake!=='notify'||!(endpoint.configHome??this.config.codexHome)||!this.wakeSignals.ready(id,scope))return;
+        if(!anchor&&!this.subagentCompletions.pending(peer))return;
+      }else{
+        if(endpoint.daemon&&!this.daemons.wakeMayAdvance(peer,endpoint))return;
+        const batch=this.subagentWakeAnchor(peer,endpoint,pair);
+        if(batch){if(!this.codexWake.ready(id,scope,batch))return;}
+        else if(localCodexEndpoint(this.home,endpoint.address)){
+          if(!this.codexDirect.ready(peer,endpoint,pair.id,!!anchor))return;
+        }else if(!anchor||!this.codexWake.ready(id,scope,anchor))return;
+      }
+    }else{
+      if(this.producersPaused||!this.enabled(pair.claude)||!this.enabled(pair.codex)||['offline','paused','needsHuman'].includes(peer.state)
+        ||this.memberLifecycle.blocksDeliveryActivation(id)
+        ||endpoint.pendingContext||this.store.bindings.current(id)?.transitioning||claudeAutoHolds(this.store,peer)||this.profiles.blocks(peer))return;
+      const child=process.platform==='linux'&&peer.owner==='nxbridge'?claudeChild(this.home,id):undefined;
+      if(child&&['handoff','user'].includes(child.phase))return;
+    }
+    return{peer,endpoint};
+  }
+  private deliveryMayAdvance(id:string):boolean{
+    if(!this.store.faults.ready('delivery:'+id)||!this.store.faults.ready('member_recovery:'+id))return false;
+    let ready=false;
+    this.store.faults.sync('delivery_ready:'+id,()=>{ready=!!this.deliveryTarget(id);});
+    return ready;
+  }
+  private wakeScheduledDelivery(id:string,explicit=false):void{
+    if((!this.scheduling&&!explicit)||this.producersPaused)return;
+    const waking=this.deliveryWakes.size>0;
+    this.deliveryWakes.add(id);
+    if(waking)return;
+    void this.runtimeHealth.trackHealth((async()=>{
+                                          
+      await this.pumping;
+      const ids=[...this.deliveryWakes];this.deliveryWakes.clear();
+      if(this.producersPaused)return;
+      let ready=false;
+      for(const id of ids)if(this.queuedDelivery(id)&&this.deliveryMayAdvance(id))ready=true;
+      if(ready)await this.pump();
+    })());
+  }
+  private wakeQueuedRecovery(id:string):void{
+    this.background('queued_member_recovery:'+id,async()=>{
+      if(this.memberLifecycle.queuedRecoveryDue(id)&&await this.memberLifecycle.schedulePairedRecovery(id,true))this.wakeScheduledDelivery(id);
+    });
+  }
+  private wakeMemberRecovery(id:string):void{
+    if(!this.scheduling||this.producersPaused)return;
+    this.background('member_recovery_signal:'+id,async()=>{
+                                       
+      await this.memberLifecycle.recoveryWork(id);
+      if(this.producersPaused)return;
+      if(await this.memberLifecycle.schedulePairedRecovery(id,this.queuedDelivery(id)))this.wakeScheduledDelivery(id);
+    });
   }
   private disconnected(address:string):void{
     for(const ep of this.store.endpoints())if(ep.mode==='app-server'&&ep.address===address){
       if(!this.enabled(ep.peerId))continue;
       this.store.saveEndpoint({...ep,active:false});const peer=this.store.peer(ep.peerId);
       if(peer.state!=='offline')this.store.updatePeer(peer.id,{state:'offline'});
+      if(ep.active&&peer.owner==='nxbridge')this.wakeMemberRecovery(peer.id);
     }
   }
   private maintain():void{
@@ -736,10 +856,16 @@ export class Broker {
       await yieldToIo();if(this.producersPaused)return;
       const stage='handoff_catchup:'+id;
       try{
-      const route=this.memberLifecycle.ownedCodexRoute(id);if(!route||!this.adapters.codex.hasSubscription(route.peer,route.endpoint))return;
+      const route=this.memberLifecycle.ownedCodexRoute(id);if(!route)return;
       const {peer,endpoint}=route;
+      if(!this.adapters.codex.hasSubscription(peer,endpoint)){
+        this.runtimeHealth.recordRuntimeProbeFailure(peer,endpoint);return;
+      }
       let probed=false;
-      await this.pumpStage('handoff_native_health:'+id,async()=>{await this.runtimeHealth.probeTurnHealth(peer,endpoint);probed=true;});
+      await this.pumpStage('handoff_native_health:'+id,async()=>{
+        try{await this.runtimeHealth.probeTurnHealth(peer,endpoint);probed=true;}
+        catch(error){this.runtimeHealth.recordRuntimeProbeFailure(peer,endpoint);throw error;}
+      });
       if(this.producersPaused)return;
       const reconciled=await this.reconcile(id);if(this.producersPaused||!probed||!reconciled)return;
       const current=this.memberLifecycle.ownedCodexRoute(id),health=peer.sessionId?this.health.get(endpoint.address,peer.sessionId):undefined;
@@ -1227,7 +1353,10 @@ export class Broker {
       this.turnEnds.sent(sender);const endpoint=this.store.endpoint(sender.id);if(endpoint)this.turnEndEvidence.sent(sender,endpoint);
       this.references.snapshot(accepted,expanded);this.communicationTips.partnerSent(sender,accepted);return accepted;
     });
-    if(schedule)queueMicrotask(()=>void this.pump());
+    if(schedule){
+      if(this.scheduling){this.wakeScheduledDelivery(m.to);this.wakeQueuedRecovery(m.to);}
+      else queueMicrotask(()=>void this.pump());
+    }
     return{message_id:m.id};
   }
   private runtimeEndpoint(peerId:string):Endpoint|undefined{return this.store.endpoint(peerId)??this.store.endpoints(peerId).at(-1);}
@@ -1366,6 +1495,7 @@ export class Broker {
     this.pairAnomalies.integration(peer,input.host==='claude'&&input.endpoint.questionSupport?{mod:true,modVersion:input.endpoint.modVersion,modRevision:input.endpoint.modRevision}:{});
     const result=()=>({...this.store.peer(peer.id),...(binding?{binding:{key:binding.key,epoch:binding.epoch}}:{})});
     if(process.platform==='linux'&&input.host==='claude'&&input.kind!=='subagent'&&input.endpoint.pid&&input.endpoint.procStart)recordClaudeForeground(this.home,peer.id,input.endpoint.pid,input.endpoint.procStart);
+    this.wakeScheduledDelivery(peer.id);
     return result();
   }
   private modReadPeer(actor:Actor,receipt:ModReadReceipt,endpointEpoch?:string):{peer:Peer;endpoint:Endpoint}{
@@ -1560,10 +1690,10 @@ export class Broker {
       throw error;
     }finally{releaseRestart();}
   }
-  private schedulePairedRecoveries():Map<string,Promise<boolean>>{
+  private schedulePairedRecoveries(targets?:ReadonlySet<string>):Map<string,Promise<boolean>>{
     if(this.producersPaused)return new Map();
     this.store.faults.sync('configuration_reload',()=>{const result=this.configurationReload.poll(()=>this.applyConfiguration());if(result==='failed'||result==='applied')this.store.event('configuration.reload.'+result,this.configurationReload.status);});
-    return this.memberLifecycle.schedulePairedRecoveries();
+    return this.memberLifecycle.schedulePairedRecoveries(targets);
   }
   pump():Promise<void>{
     if(this.producersPaused)return Promise.resolve();
@@ -1628,8 +1758,7 @@ export class Broker {
                                              
       if(!foregroundReady||!windowsReady||!pendingReady||!identitiesReady)return;
       const byTarget=new Map<string,PendingMessageFacts[]>();for(const m of this.store.pendingFacts()){const list=byTarget.get(m.to)??[];list.push(m);byTarget.set(m.to,list);}
-      for(const pair of this.store.pairs())if(!pair.paused&&this.codexDirect.pending(pair.codex)&&!byTarget.has(pair.codex))byTarget.set(pair.codex,[]);
-      for(const pair of this.store.pairs())if(!pair.paused&&this.subagentCompletions.pending(this.store.peer(pair.codex))&&!byTarget.has(pair.codex))byTarget.set(pair.codex,[]);
+      for(const id of this.deliveryCandidates(byTarget.keys()))if(!byTarget.has(id))byTarget.set(id,[]);
                                    
       for(const id of byTarget.keys())if(!recoveries.has(id))recoveries.set(id,this.memberLifecycle.schedulePairedRecovery(id,true));
       const deliveries=[...byTarget].map(([id,messages])=>this.pumpStage('delivery:'+id,async()=>{
@@ -1637,20 +1766,9 @@ export class Broker {
                                                
         const recovering=this.memberLifecycle.recoveryWork(id);if(recovering&&this.memberLifecycle.isRestoring(id))return this.memberLifecycle.deferRecoveryDelivery(id,recovering);
         if(!await recoveries.get(id))return SKIPPED;
-        if(this.memberLifecycle.isRetiring(id)||this.memberLifecycle.isRestarting(id)||this.store.setting('managedSessionConflict:'+id))return SKIPPED;
-        if(this.memberLifecycle.retryPending(id)||!this.incidents.canAttempt(this.store.peer(id),this.runtimeEndpoint(id)))return SKIPPED;
-        let target=this.store.peer(id);
-        if(this.profiles.blocks(target))return SKIPPED;
-        if(claudeAutoHolds(this.store,target))return SKIPPED;
-        if(hostingGate(this.store,target))return SKIPPED;
-        if(!this.enabled(id))return SKIPPED;
-        const targetPair=this.store.pairFor(id);if(!targetPair||targetPair.paused||!this.enabled(targetPair.claude)||!this.enabled(targetPair.codex))return SKIPPED;
-        const child=process.platform==='linux'&&target.host==='claude'?claudeChild(this.home,id):undefined;if(child&&['handoff','user'].includes(child.phase)&&target.owner==='nxbridge')return SKIPPED;
-        if(target.state==='paused'||target.state==='needsHuman'||target.launchFailure&&!target.sessionId)return SKIPPED;
+        const route=this.deliveryTarget(id);if(!route)return SKIPPED;
+        const {peer:target,endpoint}=route;
         try{
-          const endpoint=this.store.endpoint(id);
-          if(!target.sessionId||!endpoint||target.state==='offline'||endpoint.pendingContext)return SKIPPED;
-          if(!this.enabled(id))return SKIPPED;
           if(target.host==='claude'&&target.owner==='nxbridge')await this.memberLifecycle.verifyOwnedClaudeLaunch(id,false);
           if(endpoint.daemon)return this.signalCodexWake(target,endpoint);
           if(endpoint.pid&&!liveProcess(endpoint.pid)){this.store.deactivate(id,endpoint.epoch);this.store.updatePeer(id,{state:'offline'});return SKIPPED;}
@@ -1879,7 +1997,7 @@ export class Broker {
   private async signalSubagentWake(peer:Peer,endpoint:Endpoint,pair:Pair):Promise<void>{
     const batch=this.subagentCompletions.batch(peer);if(!batch||this.subagentCompletions.blocked(peer))return;
     const guard=()=>this.codexWakeAllowed(peer,endpoint,pair.id)&&this.subagentCompletions.pending(peer)&&!this.subagentCompletions.blocked(peer);
-    const scope=JSON.stringify([pair.id,peer.sessionId,endpoint.epoch,endpoint.bindingEpoch]);
+    const scope=this.wakeScope(peer,endpoint,pair);
     await this.codexWake.signal(peer.id,scope,batch,async accepted=>{
       if(!guard())return false;
       try{
@@ -1913,7 +2031,7 @@ export class Broker {
     if(!this.store.pendingCount(peer.id)&&!this.subagentCompletions.pending(peer)&&this.wakeNotices(pair,peer).some(n=>n.source==='background_completed')){
       await this.signalCompletionNotice(peer,endpoint,pair,true);return;
     }
-    const scope=JSON.stringify([pair.id,peer.sessionId,endpoint.epoch,endpoint.bindingEpoch]);
+    const scope=this.wakeScope(peer,endpoint,pair);
     const error=await this.wakeSignals.signal(peer.id,scope,home,peer.sessionId,async()=>{
       if(!this.codexWakeAllowed(peer,endpoint,pair.id)||this.subagentCompletions.blocked(peer)||!needed())return;
       const message=this.store.pendingCount(peer.id)?WAKE_NOTICE:HEALTH_WAKE_NOTICE;
@@ -1934,7 +2052,7 @@ export class Broker {
     const pair=this.store.pairFor(peer.id),current=this.store.peer(peer.id);
     if(!pair||!peer.sessionId||!this.codexWakeAllowed(peer,endpoint,pair.id)||this.subagentCompletions.blocked(peer))return SKIPPED;
     if(endpoint.daemon&&!await this.daemons.wakeReady(peer,endpoint))return SKIPPED;
-    if(this.subagentCompletions.pending(peer)&&!this.codexDirect.status(peer.id)?.continuation?.uncertain)return this.signalSubagentWake(peer,endpoint,pair);
+    if(this.subagentWakeAnchor(peer,endpoint,pair))return this.signalSubagentWake(peer,endpoint,pair);
     if(localCodexEndpoint(this.home,endpoint.address)){
       const actor:Actor={host:'codex',memberId:peer.id,sessionId:peer.sessionId,callId:randomUUID()};
       const notices=this.wakeNotices(pair,peer).map(notice=>({id:notice.id,pairId:pair.id,from:pair.claude,to:peer.id,body:notice.message,callId:notice.id,state:'accepted' as const,createdAt:Date.now(),updatedAt:Date.now(),attempts:0,inReplyTo:null,via:null,evidence:null,error:null,notice:true}));
@@ -1943,7 +2061,7 @@ export class Broker {
         if(message.notice){const notice=(await this.runtimeHealth.prepareNotices(actor,[message.id],true,true,true))[0];return notice?JSON.stringify({messages:[],notices:[{notice_id:notice.id,source:notice.source??'runtime_monitor',message:notice.message}]}):undefined;}
         const body=this.deliveryBody(message);return body===undefined?undefined:JSON.stringify({messages:[{message_id:message.id,from:modelPeerName(this.store.peer(message.from)),message:body,...(message.replyExpected?{reply_expected:true}:{}),...(message.inReplyTo?{in_reply_to:message.inReplyTo}:{}),...(message.via?{via:message.via}:{}),...fileHintFields(body,peer.cwd)}],status:'received'});
       },guard,receipt=>{this.observeCodexContext(peer,receipt,'原生持久历史');for(const notice of this.deliveryHealth.outcome(pair.id,peer.id,receipt.messageId,'submitted'))this.turnEnds.entered(peer,notice.id);},id=>this.deliveryHealth.recordedCanWake(pair.id,peer.id,id),turnId=>this.turnEnds.started(peer,turnId),id=>this.store.transaction(()=>this.turnEnds.notSubmitted(peer,this.deliveryHealth.outcome(pair.id,peer.id,id,'pending'))));
-      if(this.subagentCompletions.pending(peer)&&!this.subagentCompletions.blocked(peer)&&!this.codexDirect.status(peer.id)?.continuation?.uncertain)await this.signalSubagentWake(peer,endpoint,pair);
+      if(this.subagentWakeAnchor(peer,endpoint,pair)&&!this.subagentCompletions.blocked(peer))await this.signalSubagentWake(peer,endpoint,pair);
       return;
     }
     if(!this.store.pendingCount(peer.id)&&this.wakeNotices(pair,peer).some(n=>n.source==='background_completed')){
@@ -1951,7 +2069,7 @@ export class Broker {
     }
     const anchor=this.store.firstPendingId(peer.id)??this.wakeNotices(pair,peer)[0]?.id;
     if(!anchor){this.codexWake.clear(peer.id);return;}
-    const scope=JSON.stringify([pair.id,peer.sessionId,endpoint.epoch,endpoint.bindingEpoch]);
+    const scope=this.wakeScope(peer,endpoint,pair);
     await this.codexWake.signal(peer.id,scope,anchor,async accepted=>{
       if(!await this.submitCodexSignal(peer,'native_existing',()=>this.codexWakeAllowed(peer,endpoint,pair.id)&&(this.store.pendingCount(peer.id)>0||this.wakeNotices(pair,peer).length>0),authorize=>this.adapters.codex.wake(peer,endpoint,this.runtimeHealth.abortSignal,authorize,WAKE_NOTICE,accepted)))return false;
     });
@@ -1995,6 +2113,20 @@ export class Broker {
     const fence=this.store.setting<{sessionId:string;endpointEpoch:string;pairId:string;turnId:string}>('codexRecoveryFence:'+peer.id);
     return typeof turnId==='string'&&fence?.turnId===turnId&&fence.sessionId===peer.sessionId&&fence.endpointEpoch===this.store.endpoint(peer.id)?.epoch&&fence.pairId===this.store.pairFor(peer.id)?.id;
   }
+  private turnRecoveryReceipt(request:TurnRecoveryNotice,observed:RuntimeNotice['state']|undefined,error?:string,uncertain=false){
+    const {providerIssue,...facts}=request,failed=facts.action==='continue_failed';
+    const state=observed==='submitted'?'submitted':observed==='unknown'||uncertain||!observed?'uncertain':observed==='denied'?'stopped':'pending';
+    const prefix=failed?'没有中断或重放失败的那一轮；':'已中断卡住的这一轮；';
+    const text=state==='submitted'
+      ?(failed?'已在原会话中提交一次用户要求的“检查已有进度后继续”指令，没有中断或重放失败轮次；模型服务故障仍需按实际结果处理。':'已中断卡住的这一轮，并在原会话中发出一次“检查已有进度后继续”的指令。')+'文件、后台命令和消息记录都已保留；Codex 是否已经继续工作，请稍后用 nxbridge status 确认。'
+      :prefix+(state==='pending'
+        ?'“检查已有进度后继续”的指令已保留，但还没确认送进原会话，会按正常投递接着送。'+(failed?'不要重发指令；':'不要重发指令，也不要再中断；')+'Codex 是否已经继续工作，请稍后用 nxbridge status 确认。'
+        :state==='uncertain'
+          ?'“检查已有进度后继续”的指令有没有送进原会话暂时确认不了，不会自动重发。'+(failed?'不要重发指令；':'不要重发指令，也不要再中断；')+'请稍后用 nxbridge status 确认。'
+          :'“检查已有进度后继续”的指令没有送出，也不会再发；请用 nxbridge status 查看原会话，再决定要不要重新恢复。')+'文件、后台命令和消息记录都已保留。';
+    return {...facts,state,recovered:state==='submitted',text:text+(providerIssue?' 本次明确恢复只缩短原生重试等待，不会修复模型服务。':''),
+      ...(state!=='submitted'&&error?{error}:{})};
+  }
   private async recoverTurn(turnId?:string,preview=false,requestId?:string,selector:TargetSelector={},terminalOrigin?:TerminalOrigin):Promise<unknown>{
     const selected=this.targetPair(selector);this.requireEnabled(this.store.peer(selected.codex));
     const {pair,peer}=this.restartTarget(selector),endpoint=this.store.endpoint(peer.id);
@@ -2028,6 +2160,7 @@ export class Broker {
     if(this.memberLifecycle.isRestarting(peer.id))throw new BridgeError('restart_in_progress','目标正在恢复，请勿重复提交。');
     const releaseRestart=this.memberLifecycle.beginRestart(peer.id);
     const response={request_id:requestId,pair_id:pair.id,peer_id:peer.id,session_id:peer.sessionId,turn_id:turnId},resultKey='codexRecovery:'+requestId;
+    let queued:TurnRecoveryNotice|undefined;
     try{
       this.store.setSetting(resultKey,{...response,state:failed?'preparing':'interrupting'});
       const rpc=await this.adapters.codex.connect(endpoint.address);
@@ -2053,20 +2186,32 @@ export class Broker {
           if(Date.now()>=deadline)throw new DeliveryError('recovery_uncertain','没能确认这一轮已中断；不会重复中断，也不会重发任务，请用 nxbridge status 查看。',true);await delay(100);
         }
       }
-      noTakeover();
-      if(this.store.pairFor(peer.id)?.id!==pair.id||this.store.pairFor(peer.id)?.paused)throw new BridgeError('session_changed','中断后配对改变或暂停，未继续目标。');
+      guard();
       const noticeId=randomUUID();
+      const request:TurnRecoveryNotice={...response,notice_id:noticeId,action:failed?'continue_failed':'interrupt_stalled',providerIssue:!!providerBlocked(health)};
       this.store.transaction(()=>{
         if(failed)this.store.setSetting(failedKey,{sessionId:peer.sessionId,turnId,noticeId,requestId,requestedAt:Date.now()});
         this.deliveryHealth.enqueue(pair.id,peer.id,{id:noticeId,source:'turn_health',state:'pending',kind:'explicit_recovery',scope:this.runtimeHealth.noticeScope(pair,peer),...(failed?{factKey:'explicit_failed:'+peer.sessionId+':'+turnId}:{}),message:(failed?`The user explicitly requested recovery after failed native turn ${turnId}${health.modelRequest?' ('+modelRequestText(health.modelRequest)+')':''}. This does not repair the model provider. `:'Explicit recovery after a stalled turn. ')+'Continue the existing authorized task in this same session. First inspect partial file changes and existing command sessions; a command may still be running or may have completed. Do not rerun completed mutations/tests or resend prior messages. Report any uncertainty and continue from durable state.'});
+        this.store.setSetting(resultKey,this.turnRecoveryReceipt(request,'pending'));
       });
-      this.store.updatePeer(peer.id,{state:'ready'});
-                                       
+      queued=request;
+      const current=this.store.updatePeer(peer.id,{state:'ready'});
+                                               
+      this.codexDirect.nativeReady(current,endpoint,pair.id);
       releaseRestart();
-      await this.signalCodexWake(peer,endpoint);
-      const result={...response,recovered:true,notice_id:noticeId,action:failed?'continue_failed':'interrupt_stalled',text:(failed?'已在原会话中提交一次用户要求的“检查已有进度后继续”指令，没有中断或重放失败轮次；模型服务故障仍需按实际结果处理。':'已中断卡住的这一轮，并在原会话中发出一次“检查已有进度后继续”的指令。')+'文件、后台命令和消息记录都已保留；Codex 是否已经继续工作，请稍后用 nxbridge status 确认。'+(providerBlocked(health)?' 本次明确恢复只缩短原生重试等待，不会修复模型服务。':'')};
-      this.store.setSetting(resultKey,{...result,state:'submitted'});return result;
-    }catch(error){this.store.setSetting(resultKey,{...response,state:error instanceof DeliveryError&&error.uncertain?'uncertain':'stopped',error:describeError(error)});throw error;}
+      await this.signalCodexWake(current,endpoint);
+      const result=this.turnRecoveryReceipt(request,this.deliveryHealth.noticeState(pair.id,peer.id,noticeId));
+      this.store.setSetting(resultKey,result);
+      return result;
+    }catch(error){
+      const uncertain=error instanceof DeliveryError&&error.uncertain,detail=describeError(error);
+      if(queued){
+        const result=this.turnRecoveryReceipt(queued,this.deliveryHealth.noticeState(pair.id,peer.id,queued.notice_id),detail,uncertain);
+        this.store.setSetting(resultKey,result);
+        if(!uncertain)return result;
+      }else this.store.setSetting(resultKey,{...response,state:uncertain?'uncertain':'stopped',error:detail});
+      throw error;
+    }
     finally{releaseRestart();queueMicrotask(()=>void this.pump());}
   }
   private restartTarget(selector:RestartSelector|string={}):{pair:Pair|undefined;peer:Peer}{
@@ -2638,7 +2783,12 @@ export class Broker {
         }
         return{incident:this.managedRecovery.get(peer.id),recovery:this.memberLifecycle.recoveryStatus(this.store.peer(peer.id)),...(message?{message}:{})};
       }
-      case'codex.recover.result':{const p=z.object({request_id:text}).strict().parse(raw),saved=this.store.setting<any>('codexRecovery:'+p.request_id);if(saved?.request_id!==p.request_id)throw new BridgeError('recovery_result_missing','找不到这次恢复请求的记录；没有重复中断，请用 nxbridge status 核对 Codex 状态。');return saved;}
+      case'codex.recover.result':{
+                                        
+        const p=z.object({request_id:text}).strict().parse(raw),saved=this.store.setting<{request_id:string}>('codexRecovery:'+p.request_id);
+        if(saved?.request_id!==p.request_id)throw new BridgeError('recovery_result_missing','找不到这次恢复请求的记录；没有重复中断，请用 nxbridge status 核对 Codex 状态。');
+        return saved;
+      }
       case'open.candidates':{
         const p=z.object({cwd:text}).strict().parse(raw),candidates=this.store.pairs().flatMap(pair=>{
           const peer=this.store.peer(pair.codex),partner=this.store.peer(pair.claude),endpoint=this.store.endpoint(peer.id);
@@ -2913,7 +3063,7 @@ export class Broker {
       this.store.setSetting('communicationTurn:'+peer.id,randomUUID());
       this.foregroundHealth.observe(peer,'start',typeof p.turn_id==='string'?p.turn_id:undefined);
       if(typeof p.turn_id==='string')this.turnEnds.begin(peer,p.turn_id);
-      this.store.updatePeer(peer.id,{state:'busy',...(!isEmbeddedWake(p.prompt)&&typeof p.prompt==='string'&&p.prompt.trim()?{activityAt:Date.now()}:{})});queueMicrotask(()=>void this.pump());
+      this.store.updatePeer(peer.id,{state:'busy',...(!isEmbeddedWake(p.prompt)&&typeof p.prompt==='string'&&p.prompt.trim()?{activityAt:Date.now()}:{})});
     }
     const nativeTurnId=typeof p.turn_id==='string'?p.turn_id:undefined,toolId=typeof p.tool_use_id==='string'?p.tool_use_id:undefined;
     if(typeof p.transcript_path==='string'){

@@ -114,9 +114,12 @@ export class SessionTransfers {
   }
   private async settleOwned(peer:Peer):Promise<boolean>{
     const eligible=()=>{
-      const current=this.store.peer(peer.id),record=hostingRecord(this.store,current),endpoint=this.store.endpoint(peer.id),runtime=runtimeFor(this.home,{peerId:peer.id})?.value;
+      const current=this.store.peer(peer.id),record=hostingRecord(this.store,current);
       if(current.host!=='codex'||current.owner!=='nxbridge'||!current.sessionId||current.sessionId!==peer.sessionId||current.state==='offline'||!record?.background||record.phase!=='adopting'||record.released||record.verifying||record.verificationError||record.reason==='bootstrap_policy_unsupported'||this.store.bindings.current(peer.id)||this.store.setting('takeover:'+peer.id)||this.store.setting('managedSessionConflict:'+peer.id)||this.store.setting('managedRuntimeConflict:'+peer.id))return;
-      if(!endpoint||endpoint.mode!=='app-server'||endpoint.daemon||!runtime||runtime.kind!=='owned'||runtime.state!=='ready'||runtime.sessionVerification||runtime.sessionId&&runtime.sessionId!==current.sessionId||!runtime.pid||!runtime.procStart||endpoint.address!==runtime.endpoint||endpoint.runtimeId&&endpoint.runtimeId!==runtime.id||endpoint.pid!==runtime.pid||endpoint.procStart!==runtime.procStart||!endpoint.configHome||!runtime.configHome||!sameDirectory(endpoint.configHome,runtime.configHome)||!sameDirectory(record.configHome,runtime.configHome))return;
+      const endpoint=this.store.endpoint(peer.id);
+      if(!endpoint||endpoint.mode!=='app-server'||endpoint.daemon||!endpoint.configHome)return;
+      const runtime=runtimeFor(this.home,{peerId:peer.id})?.value;
+      if(!runtime||runtime.kind!=='owned'||runtime.state!=='ready'||runtime.sessionVerification||runtime.sessionId&&runtime.sessionId!==current.sessionId||!runtime.pid||!runtime.procStart||endpoint.address!==runtime.endpoint||endpoint.runtimeId&&endpoint.runtimeId!==runtime.id||endpoint.pid!==runtime.pid||endpoint.procStart!==runtime.procStart||!runtime.configHome||!sameDirectory(endpoint.configHome,runtime.configHome)||!sameDirectory(record.configHome,runtime.configHome))return;
       return{current,runtime,record};
     };
     if(peer.host!=='codex'||!this.ops.inspect)return false;

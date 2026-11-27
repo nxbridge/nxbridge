@@ -3,14 +3,33 @@ import assert from 'node:assert/strict';
 import {once} from 'node:events';
 import {WebSocketServer} from 'ws';
 import {acquireCodexGroups,parkCodexGroups} from '../hosts/codex/codex-handoff.js';
-import {connectAppServer} from '../hosts/codex/adapter.js';
+import {CodexAdapter,connectAppServer} from '../hosts/codex/adapter.js';
 import {CodexNativeRpc} from '../hosts/codex/codex-native-rpc.js';
 import {RpcClient} from '../ipc/rpc.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
 import type {CustodyOffer} from '../broker/broker-custody.js';
 import {delay} from '../shared/time.js';
+import {temporary} from './support/temporary.js';
 
 const offer=(id:string,groupId:string):CustodyOffer=>({id,groupId,memberId:id,sessionId:id,address:groupId,epoch:'route',runtimeId:'runtime',pid:1,procStart:'start',profile:{sessionId:id,offset:1,complete:true,verified:true,meta:{},settings:{}}});
+
+test('交接撤销后逐路恢复未确认的线程观察，已替换的连接不污染新代次',t=>{
+  const adapter=new CodexAdapter(DEFAULT_CONFIG,temporary(t));t.after(()=>adapter.close());
+  const {installPool}=adapter as unknown as {installPool(address:string,rpc:CodexNativeRpc):void};
+  const install=(address:string)=>{
+    const rpc=new CodexNativeRpc(()=>{},()=>{},address);t.after(()=>rpc.close());
+    installPool.call(adapter,address,rpc);return rpc;
+  };
+  const first=install('ws://first'),second=install('ws://second'),observed:string[][]=[];
+  adapter.on('threadUnconfirmed',(id,address)=>observed.push([id,address]));
+  const handoff=adapter.pauseHandoff(()=>assert.fail('不应超出暂存容量'));
+  first.emit('threadUnconfirmed','one');first.emit('threadUnconfirmed','two');
+  second.emit('threadUnconfirmed','stale');const replacement=install('ws://second');
+  replacement.emit('threadUnconfirmed','replacement');
+  assert.deepEqual(observed,[]);
+  handoff.resume();
+  assert.deepEqual(observed,[['one','ws://first'],['two','ws://first'],['replacement','ws://second']]);
+});
 
 test('同一物理旧连接等全部订阅结算后才关闭，失效只改变该行证据',()=>{
   let closed=0,wire=0;

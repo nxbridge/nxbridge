@@ -329,7 +329,7 @@ export class CodexAdapter extends EventEmitter {
     this.deferredNative=undefined;this.handoffPrepared=[];this.coldResumeSealed=true;this.turnOrigin=undefined;
     for(const rpc of this.clients.values()){
       if(rpc instanceof CodexNativeRpc){rpc.threadGuard=undefined;rpc.seal();}
-      for(const event of ['notification','request','threadAbsent','disconnected'])rpc.removeAllListeners(event);
+      for(const event of ['notification','request','threadAbsent','threadUnconfirmed','disconnected'])rpc.removeAllListeners(event);
       if(!retained.has(rpc))rpc.close();
     }
     this.clients.clear();this.attached.clear();this.nativeStates.clear();this.subscriptionOwners.clear();this.ownedRoutes.clear();
@@ -394,17 +394,26 @@ export class CodexAdapter extends EventEmitter {
   }
   async probe(peer:Peer,endpoint?:Endpoint):Promise<RuntimeAvailability>{
     this.requireMember(peer.id);
-    return probePeerRuntime(peer,endpoint,this.home,async()=>{
+    let threadConfirmed=false;
+    const availability=await probePeerRuntime(peer,endpoint,this.home,async()=>{
       if(!endpoint)return false;
       const rpc=this.clients.get(endpoint.address);
       if(rpc&&!rpc.closed){
-        if(peer.owner==='nxbridge'&&!this.ownedRoutes.permits({peer,endpoint},rpc))return true;
-        try{const result=await rpc.request('thread/read',{threadId:peer.sessionId,includeTurns:false},{timeout:750});return typeof result.thread?.id==='string'?result.thread.id===peer.sessionId:undefined;}
+        const lease=peer.owner==='nxbridge'?this.ownedRoutes.leaseIdentity({peer,endpoint},rpc):undefined;
+        if(peer.owner==='nxbridge'&&!lease)return true;
+        try{
+          const result=await rpc.request('thread/read',{threadId:peer.sessionId,includeTurns:false},{timeout:750});
+          const matches=typeof result.thread?.id==='string'?result.thread.id===peer.sessionId:undefined;
+          threadConfirmed=!!lease&&matches===true&&typeof result.thread.status?.type==='string'&&result.thread.status.type!=='notLoaded'
+            &&this.ownedRoutes.leaseIdentity({peer,endpoint},rpc)===lease;
+          return matches;
+        }
         catch(error){return rpc.closed?false:undefined;}
       }
       const token=this.tokens.get(endpoint.address)??managedRuntimeToken(this.home,endpoint.address)??(this.config.codexAuthTokenEnv?process.env[this.config.codexAuthTokenEnv]:undefined);
       return probeAppServer(endpoint.address,token);
     });
+    return threadConfirmed?{...availability,threadConfirmed:true}:availability;
   }
   async connect(endpoint:string,bearerToken?:string):Promise<RpcClient>{
     if(/[\\/]app-server-(?:control|daemon)[\\/]/i.test(endpoint))throw new BridgeError('shared_daemon_read_only','共享 daemon 只能通过只读发现连接访问，不能交给专用投递适配器。');
@@ -450,6 +459,11 @@ export class CodexAdapter extends EventEmitter {
         this.ownedRoutes.revoke(endpoint,id,rpc);this.attached.delete(key);this.subscriptionOwners.delete(key);this.invalidated.set(key,++this.nativeStateRevision);
         this.nativeStates.set(key,{state:'offline',revision:++this.nativeStateRevision});
         this.observeAfterHandoff(undefined,()=>{if(samePhysical()){forgetChild(id);this.emit('state',id,'offline',endpoint);}});
+      });
+      rpc.on('threadUnconfirmed',(id:string)=>{
+        if(this.clients.get(endpoint)===rpc)this.observeAfterHandoff(undefined,()=>{
+          if(this.clients.get(endpoint)===rpc)this.emit('threadUnconfirmed',id,endpoint);
+        },JSON.stringify(['threadUnconfirmed',endpoint,id]));
       });
       rpc.on('notification',(message:RpcMessage)=>{if(this.clients.get(endpoint)===rpc){
         if(!this.handoffPaused){observeNotification(message);return;}
@@ -532,7 +546,7 @@ export class CodexAdapter extends EventEmitter {
     const serialized:string[]=[],scoped=new Set<string>();
     for(const id of loaded)if(this.canObserveThread(endpoint,id,rpc,scope))serialized.push(id);else if(scope?.isChild(id))scoped.add(id);
     const revision=this.nativeStateRevision;
-    const [catalog]=await Promise.all([catalogCodexThreads(rpc,scoped,{independent:true}),Promise.all(serialized.map(id=>this.discoverThread(endpoint,id,rpc)))]);
+    const [catalog]=await Promise.all([catalogCodexThreads(rpc,scoped,{independent:true,ancestorThreadId:scope?.root}),Promise.all(serialized.map(id=>this.discoverThread(endpoint,id,rpc)))]);
     if(this.clients.get(endpoint)===rpc)for(const thread of catalog.values())if(thread.status?.type!=='notLoaded')this.record(thread,endpoint,undefined,undefined,revision);
   }
   private discoverThread(endpoint:string,id:string,rpc=this.clients.get(endpoint)):Promise<void>{
@@ -541,7 +555,7 @@ export class CodexAdapter extends EventEmitter {
     const scope=this.ownedNativeScope(runtimeFor(this.home,{endpoint})?.value),serialized=this.canObserveThread(endpoint,id,rpc,scope);
     if(!serialized&&!scope?.isChild(id))return Promise.resolve();
     const revision=this.nativeStateRevision;
-    const work=(serialized?rpc.request('thread/read',{threadId:id,includeTurns:false},{timeout:3000}).then(r=>r.thread):catalogCodexThreads(rpc,new Set([id]),{independent:true}).then(catalog=>catalog.get(id)))
+    const work=(serialized?rpc.request('thread/read',{threadId:id,includeTurns:false},{timeout:3000}).then(r=>r.thread):catalogCodexThreads(rpc,new Set([id]),{independent:true,ancestorThreadId:scope?.root}).then(catalog=>catalog.get(id)))
       .then(thread=>{if(!this.handoffPaused&&this.clients.get(endpoint)===rpc&&thread?.id===id&&thread.status?.type!=='notLoaded'){this.record(thread,endpoint,undefined,undefined,revision);this.discovered.set(key,Date.now()+1000);}})
       .catch(()=>{this.discovered.set(key,Date.now()+1000);}).finally(()=>{if(this.discovering.get(key)===work)this.discovering.delete(key);});
     this.discovering.set(key,work);if(this.discovered.size>256)this.discovered.delete(this.discovered.keys().next().value!);return work;
@@ -634,7 +648,8 @@ export class CodexAdapter extends EventEmitter {
     const rpc=await this.connect(endpoint.address),revision=this.nativeStateRevision;
     if(peer.kind==='subagent'&&peer.sessionId&&!this.canObserveThread(endpoint.address,peer.sessionId,rpc)){
       const id=peer.sessionId,loaded=await loadedCodexThreads(rpc);
-      const thread=loaded.has(id)?(await catalogCodexThreads(rpc,new Set([id]),{independent:true})).get(id):undefined;
+      const scope=this.ownedNativeScope(runtimeFor(this.home,{endpoint:endpoint.address})?.value);
+      const thread=loaded.has(id)?(await catalogCodexThreads(rpc,new Set([id]),{independent:true,ancestorThreadId:scope?.root})).get(id):undefined;
       if(this.clients.get(endpoint.address)!==rpc||rpc.closed)return;
       if(thread&&codexSubagent(thread))this.record(thread,endpoint.address,undefined,peer.id,revision);
       else if(!loaded.has(id)&&(this.nativeStates.get(endpoint.address+'|'+id)?.revision??0)<=revision)this.emit('state',id,'offline',endpoint.address);
@@ -1761,7 +1776,7 @@ export class CodexAdapter extends EventEmitter {
     if(runtime.endpoint.startsWith('unix://')&&await ownedProcessState({pid:runtime.pid,startedAt:runtime.procStart})!=='alive')throw new BridgeError('managed_proof_unverified','自有运行时的原生代次尚未确认存活。');
     const rpc=await connectAppServer(runtime.endpoint,this.config,undefined,this.home,{readOnly:true});
     try{
-      const thread=scope?(await catalogCodexThreads(rpc,new Set([sessionId]),{independent:true})).get(sessionId)
+      const thread=scope?(await catalogCodexThreads(rpc,new Set([sessionId]),{independent:true,ancestorThreadId:scope.root})).get(sessionId)
         :(await rpc.request('thread/read',{threadId:sessionId,includeTurns:false},{timeout:2000})).thread;
       if(thread?.id!==sessionId)return;
                                        

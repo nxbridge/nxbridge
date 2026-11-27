@@ -28,7 +28,7 @@ export interface TurnEndView {
   turn_id?:string;completed_at?:number;reason?:CompletionReason;hold?:CompletionHold;budget?:CompletionWakeStatus;user_text?:string;
 }
 interface Options {
-  owned(peer:Peer):boolean;
+  owned(peer:Peer,endpoint:Endpoint):boolean;
   gate(background:Peer,foreground:Peer,boundaryPeerId?:string):CompletionHold|undefined;
   source(peer:Peer):string|undefined;
   stats(peer:Peer,turnId?:string,completed?:boolean):TurnEndStats|undefined;
@@ -62,9 +62,9 @@ export class TurnEndCoordinator {
   private role(peer:Peer):Role|undefined {
     const members=this.members(peer);if(!members)return;
     const {background,foreground}=members;
-    if(!background.sessionId||!foreground.sessionId||!this.options.owned(background))return;
+    if(!background.sessionId||!foreground.sessionId)return;
     const source=this.store.endpoint(background.id),target=this.store.endpoint(foreground.id);
-    if(!source?.active||!target?.active)return;
+    if(!source?.active||!target?.active||!this.options.owned(background,source))return;
     return{...members,source,target};
   }
   private foregroundState(peer:Peer,turnId:string,busy:boolean,at=Date.now()):void {

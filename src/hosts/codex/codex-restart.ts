@@ -92,12 +92,12 @@ export async function codexThreadLoaded(rpc:RpcClient,id:string):Promise<boolean
 export async function assertCodexRuntimeScope(rpc:RpcClient,id:string,options:{inspectOnly?:boolean;probe?:(id:string)=>Promise<void>;observed?:(ids:ReadonlySet<string>)=>void}={}):Promise<void>{
   const loaded=await loadedCodexThreads(rpc);if(!loaded.delete(id))confirmCodexThreadAbsent(rpc,id);
   options.observed?.(loaded);
-  const threads=await timeCodexRestart('native_thread_catalog',()=>catalogCodexThreads(rpc,loaded));
+  const threads=await timeCodexRestart('native_thread_catalog',()=>catalogCodexThreads(rpc,loaded,{ancestorThreadId:id}));
   const unverified=()=>new BridgeError('restart_verification_failed','没能确认 Codex 子任务的身份或状态，未执行重启。');
   const read=async(threadId:string)=>{
     let thread=threads.get(threadId);
     if(!thread){
-      thread=(await catalogCodexThreads(rpc,new Set([threadId]))).get(threadId);
+      thread=(await catalogCodexThreads(rpc,new Set([threadId]),{ancestorThreadId:id})).get(threadId);
       if(!thread||thread.id!==threadId)throw unverified();
       threads.set(threadId,thread);
     }

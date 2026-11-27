@@ -9,10 +9,12 @@ import { codexThreadIdle } from './codex-thread-state.js';
 
 interface Attempt {id:string;callId:string;waitingTurn?:string;notice?:boolean;at?:number;checks?:number;historyCursor?:HistoryCursor}
 interface Continuation {anchor:string;notice?:boolean;baseline?:string;attempts:number;at:number;uncertain?:boolean;error?:string}
-interface Reservation {scope:string;attempts:Attempt[];continuation?:Continuation;parked?:string[];checkedAt?:number;wait?:{native_status:string;active_flags:string[];turn_id?:string;since:number;message:string}}
+interface Reservation {scope:string;attempts:Attempt[];continuation?:Continuation;parked?:string[];checkedAt?:number;wait?:{route?:string;native_status:string;active_flags:string[];turn_id?:string;since:number;message:string}}
 const RECEIPT_GRACE_MS=3000,RECHECK_MS=10000,RETRY_MS=30000;
 const key=(peerId:string)=>'codexDirect:'+peerId;
 const scope=(peer:Peer,endpoint:Endpoint)=>JSON.stringify([peer.sessionId,endpoint.epoch]);
+const identity=(peer:Peer,endpoint:Endpoint,pairId:string|undefined)=>JSON.stringify([pairId,scope(peer,endpoint)]);
+const nativeRoute=(endpoint:Endpoint)=>JSON.stringify([endpoint.address,endpoint.bindingEpoch,endpoint.runtimeId,endpoint.native?.pid??endpoint.pid,endpoint.native?.procStart??endpoint.procStart]);
 
                                           
 export class CodexDirectDelivery {
@@ -20,23 +22,45 @@ export class CodexDirectDelivery {
   constructor(private store:Store,private adapter:Pick<CodexAdapter,'injectionState'|'inject'|'continueInjected'>){}
   pending(peerId:string):boolean{const value=this.store.setting<Reservation>(key(peerId));return !!value&&(value.attempts.length>0||!!value.continuation&&(value.continuation.attempts<3||!!value.continuation.uncertain));}
   status(peerId:string):Reservation|undefined{return this.store.setting(key(peerId));}
+  private canCheck(value:Reservation|undefined,route:string,endpoint:Endpoint,hasMessages:boolean):boolean{
+    if(!value||value.scope!==route)return true;
+    const now=Date.now(),continuation=value.continuation;
+    if(value.wait?.route===nativeRoute(endpoint))return value.checkedAt===undefined||now-value.checkedAt>=RECHECK_MS;
+    if(hasMessages)return true;
+    if(value.attempts.length)return value.checkedAt===undefined||now-value.checkedAt>=RECHECK_MS;
+    return !!continuation&&(continuation.attempts===0||(continuation.attempts<3||continuation.uncertain===true)&&now-continuation.at>=RETRY_MS);
+  }
+  ready(peer:Peer,endpoint:Endpoint,pairId:string,hasMessages:boolean):boolean{
+    return !this.active.has(peer.id)&&this.canCheck(this.status(peer.id),identity(peer,endpoint,pairId),endpoint,hasMessages);
+  }
+  continuationUncertain(peer:Peer,endpoint:Endpoint,pairId:string):boolean{
+    const value=this.status(peer.id);
+    return value?.scope===identity(peer,endpoint,pairId)&&value.continuation?.uncertain===true;
+  }
+  nativeReady(peer:Peer,endpoint:Endpoint,pairId:string):void{
+    const value=this.status(peer.id);
+    if(value?.scope===identity(peer,endpoint,pairId)&&value.wait?.route===nativeRoute(endpoint)&&value.checkedAt!==undefined){
+      delete value.checkedAt;this.store.setSetting(key(peer.id),value);
+    }
+  }
   continued(peerId:string,turnId:string):void{const value=this.status(peerId);if(value?.continuation&&turnId!==value.continuation.baseline){delete value.continuation;this.store.setSetting(key(peerId),value);}}
   async deliver(peer:Peer,endpoint:Endpoint,messages:(Message&{notice?:boolean})[],output:(message:Message&{notice?:boolean})=>Promise<string|undefined>,guard:()=>boolean,observed:(receipt:CodexContextReceipt)=>void,noticeCanContinue:(id:string)=>boolean=()=>true,continued?:(turnId:string)=>void,notSubmitted?:(id:string)=>void):Promise<void>{
     if(hostingGate(this.store,peer))return;
     const enabled=()=>memberEnabled(this.store,this.store.peer(peer.id));if(!enabled())return;
     if(this.active.has(peer.id))return;this.active.add(peer.id);
     try{
-      const identity=JSON.stringify([this.store.pairFor(peer.id)?.id,scope(peer,endpoint)]),previous=this.status(peer.id);
-      if(previous&&previous.scope!==identity){this.store.setSetting(key(peer.id),null);return;}
-      const reservation:Reservation=previous??{scope:identity,attempts:[]},save=()=>this.store.setSetting(key(peer.id),reservation);
+      const route=identity(peer,endpoint,this.store.pairFor(peer.id)?.id),previous=this.status(peer.id);
+      if(previous&&previous.scope!==route){this.store.setSetting(key(peer.id),null);return;}
+      const reservation:Reservation=previous??{scope:route,attempts:[]},save=()=>this.store.setSetting(key(peer.id),reservation);
                                                  
       if(reservation.continuation&&reservation.continuation.notice!==false){
         const continuation=reservation.continuation,id=continuation.anchor.slice('nxbridge-'.length);let message=false;
         if(continuation.notice===undefined)try{message=this.store.message(id).to===peer.id;}catch(error){if(!(error instanceof BridgeError)||error.code!=='message_missing')throw error;}
         if(!message&&!noticeCanContinue(id)){delete reservation.continuation;save();}
       }
-      if(!messages.length&&Date.now()-(reservation.checkedAt??0)<RECHECK_MS)return;
+      if(!this.canCheck(reservation,route,endpoint,messages.length>0))return;
       reservation.checkedAt=Date.now();
+      if(previous)save();
       const historyOptions=()=>{
                                                       
         if(reservation.attempts.some(value=>!value.historyCursor))return{since:Math.min(...reservation.attempts.map(value=>value.at??0))};
@@ -47,9 +71,10 @@ export class CodexDirectDelivery {
       const latest=()=>state.thread.turns?.at(-1),idle=()=>codexThreadIdle(state.thread);
       const recordWait=()=>{
         if(idle()){if(reservation.wait){delete reservation.wait;save();this.store.event('codex.delivery.resumed',{peerId:peer.id});}return;}
-        const turn=state.thread.turns?.find(turn=>turn.status==='inProgress'),facts={native_status:state.thread.status?.type??'unknown',active_flags:state.thread.status?.activeFlags??[],...(turn?{turn_id:turn.id}:{})};
-        if(reservation.wait&&reservation.wait.native_status===facts.native_status&&JSON.stringify(reservation.wait.active_flags)===JSON.stringify(facts.active_flags)&&reservation.wait.turn_id===facts.turn_id)return;
-        reservation.wait={...facts,since:Date.now(),message:'原生 Codex 尚未空闲（'+facts.native_status+(facts.active_flags.length?'；'+facts.active_flags.join(', '):'')+(turn?'；轮次 '+turn.id+' 仍在运行':'')+'）；消息保留，等待原生任务或输入处理完成后继续投递。'};save();this.store.event('codex.delivery.wait',{peerId:peer.id,...reservation.wait});
+        const turn=state.thread.turns?.find(turn=>turn.status==='inProgress'),facts={native_status:state.thread.status?.type??'unknown',active_flags:state.thread.status?.activeFlags??[],...(turn?{turn_id:turn.id}:{})},physical=nativeRoute(endpoint);
+        if(reservation.wait?.route===physical&&reservation.wait.native_status===facts.native_status&&JSON.stringify(reservation.wait.active_flags)===JSON.stringify(facts.active_flags)&&reservation.wait.turn_id===facts.turn_id)return;
+        const wait={...facts,since:Date.now(),message:'原生 Codex 尚未空闲（'+facts.native_status+(facts.active_flags.length?'；'+facts.active_flags.join(', '):'')+(turn?'；轮次 '+turn.id+' 仍在运行':'')+'）；消息保留，等待原生任务或输入处理完成后继续投递。'};
+        reservation.wait={...wait,route:physical};save();this.store.event('codex.delivery.wait',{peerId:peer.id,...wait});
       };
       recordWait();
       const reconcile=()=>{

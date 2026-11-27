@@ -67,7 +67,7 @@ export async function readCodexRecycleScope(rpc:RpcClient,rootId:string,options:
 }={}):Promise<{loaded:Set<string>;threads:Map<string,CodexThread>;originalRootOmitted:boolean}> {
   const loaded=options.registry??await loadedCodexThreads(rpc);
   let complete=false;
-  const threads=await catalogCodexThreads(rpc,new Set([...loaded,rootId]),{independent:true,onComplete:()=>{complete=true;}});
+  const threads=await catalogCodexThreads(rpc,new Set([...loaded,rootId]),{independent:true,ancestorThreadId:rootId,onComplete:()=>{complete=true;}});
   let root=threads.get(rootId),originalRootOmitted=false;
   const rollout=options.ownedRootRollout,meta=rollout?.meta;
                                                                  
@@ -89,7 +89,7 @@ export async function readCodexRecycleScope(rpc:RpcClient,rootId:string,options:
       if(!parent)throw lineageError();
       let row=threads.get(parent);
       if(!row){
-        row=(await catalogCodexThreads(rpc,new Set([parent]),{independent:true})).get(parent);
+        row=(await catalogCodexThreads(rpc,new Set([parent]),{independent:true,ancestorThreadId:rootId})).get(parent);
         if(!row)throw lineageError();
         threads.set(parent,row);
       }

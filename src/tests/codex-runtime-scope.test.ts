@@ -5,6 +5,7 @@ import {writeFileSync} from 'node:fs';
 import {randomUUID} from 'node:crypto';
 import {assertCodexRuntimeScope, forgetAbsentChildControls, probeCodexChildWork} from '../hosts/codex/codex-restart.js';
 import {CodexAdapter, type CodexThread} from '../hosts/codex/adapter.js';
+import {observeCodexThreadIdentity} from '../hosts/codex/codex-evidence.js';
 import {removeManagedRuntime, runtimeFor, saveManagedRuntime, type ManagedRuntime} from '../hosts/managed-runtimes.js';
 import {managedMarker} from '../install/installation.js';
 import {RpcClient, type RpcMessage} from '../ipc/rpc.js';
@@ -47,6 +48,44 @@ function native(t:TestContext,values:CodexThread[],loaded=values.map(thread=>thr
   return{rpc,home,runtime,threads,queue,terminals,calls,scope,silence:(method?:string)=>{silent=method;},replyTerminals:(reply:typeof terminalReply)=>{terminalReply=reply;}};
 }
 const child=(id:string,parent='root',status='idle'):CodexThread=>({id,cwd:'/project',parentThreadId:parent,status:{type:status}});
+
+test('重启范围及缺失父辈的补查都只读状态库，分页仍覆盖完整父链',async t=>{
+  let catalogs=0;
+  const rpc=new RpcClient(message=>{
+    let result:unknown;
+    if(message.method==='thread/loaded/list')result={data:['root','grandchild']};
+    else{
+      assert.equal(message.method,'thread/list');
+      assert.equal(message.params.useStateDbOnly,true,'范围核验不能触发原生 JSONL 修补');
+      assert.equal(message.params.ancestorThreadId,'root','缺失父辈也要覆盖原根的所有层级后代');
+      catalogs++;
+      result=message.params.cursor?{data:[child('parent')]}:{data:[child('grandchild','parent')],nextCursor:'parent-page'};
+    }
+    queueMicrotask(()=>rpc.receive({id:message.id,result}));
+  },()=>{});t.after(()=>rpc.close());
+  await assertCodexRuntimeScope(rpc,'root',{inspectOnly:true});
+  assert.equal(catalogs,3,'已加载子线程先命中，缺失父辈再按原生分页补查');
+});
+
+test('普通目录隐藏的纯工具子代理按祖先查询，外来根仍从全局目录识别',async t=>{
+  const descendants=[child('parent'),child('grandchild','parent')],loaded=['root','grandchild','foreign'];
+  const rpc=new RpcClient(message=>{
+    const data=message.method==='thread/loaded/list'?loaded
+      :message.params.ancestorThreadId?descendants:[{id:'foreign',cwd:'/project',status:{type:'idle'}}];
+    if(message.method==='thread/list')assert.equal(message.params.useStateDbOnly,true);
+    queueMicrotask(()=>rpc.receive({id:message.id,result:{data}}));
+  },()=>{});t.after(()=>rpc.close());
+  await assert.rejects(assertCodexRuntimeScope(rpc,'root',{inspectOnly:true}),{code:'shared_runtime'});
+  loaded.pop();
+  await assertCodexRuntimeScope(rpc,'root',{inspectOnly:true});
+});
+
+test('已加载子线程不在状态库时保持未知，连接上的旧空闲身份也不能放行',async t=>{
+  const f=native(t,[],['root','missing']);
+  await assert.rejects(assertCodexRuntimeScope(f.rpc,'root',{inspectOnly:true}),{code:'restart_verification_failed'});
+  observeCodexThreadIdentity(f.rpc,child('missing'));
+  await assert.rejects(assertCodexRuntimeScope(f.rpc,'root',{inspectOnly:true}),{code:'subagent_active'});
+});
 
 test('原生父链覆盖嵌套子代理及未加载的中间父线程，全部核验只读',async t=>{
   const f=native(t,[child('parent'),child('grandchild','parent'),child('old','root','notLoaded')],['root','grandchild','old']);

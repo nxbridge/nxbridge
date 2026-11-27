@@ -2,11 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import path from 'node:path';
-import {mkdirSync,writeFileSync} from 'node:fs';
+import {randomUUID} from 'node:crypto';
+import {mkdirSync,readFileSync,readdirSync,writeFileSync} from 'node:fs';
+import {DatabaseSync} from 'node:sqlite';
 import {stringify} from 'smol-toml';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
+import type {CodexThread} from '../hosts/codex/adapter.js';
 import {catalogCodexThreads} from '../hosts/codex/codex-evidence.js';
 import {readCodexRecycleScope} from '../hosts/codex/codex-recycle.js';
+import {assertCodexRuntimeScope} from '../hosts/codex/codex-restart.js';
 import {configClient} from '../hosts/codex/stdio-codex.js';
 import {sameDirectory} from '../shared/files.js';
 import {delay} from '../shared/time.js';
@@ -60,6 +64,41 @@ test('官方 Codex 独立状态目录完整核验加载范围，旧版兼容且�
   assert.equal(scope.threads.get(thread.id)?.id,thread.id);
   const ordinary=await catalogCodexThreads(rpc,new Set([thread.id]));
   assert.equal(ordinary.get(thread.id)?.id,thread.id);
+                                                          
+  const records=readFileSync(thread.path,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+  const childIds=[randomUUID(),randomUUID()];
+  for(const [index,id] of childIds.entries()){
+    const childPath=path.join(path.dirname(thread.path),path.basename(thread.path).replace(thread.id,id));
+    const copied=records.filter(record=>!(record.type==='event_msg'&&record.payload?.type==='user_message')
+      &&!(record.type==='response_item'&&record.payload?.role==='user')).map(record=>{
+      const value=JSON.parse(JSON.stringify(record).replaceAll(thread.id,id));
+      if(value.type==='session_meta'){
+        const parent=index?childIds[0]:thread.id;
+        Object.assign(value.payload,{session_id:thread.id,parent_thread_id:parent,thread_source:'subagent',
+          source:{subagent:{thread_spawn:{parent_thread_id:parent,depth:index+1}}}});
+      }
+      return JSON.stringify(value);
+    });
+    writeFileSync(childPath,copied.join('\n')+'\n','utf8');
+    const resumed:CodexThread=(await rpc.request('thread/resume',{threadId:id,path:childPath,excludeTurns:true})).thread;
+    assert.equal(resumed.id,id);
+    assert.equal(resumed.parentThreadId??resumed.source?.subAgent?.thread_spawn?.parent_thread_id,index?childIds[0]:thread.id);
+  }
+                                      
+  const stateFile=readdirSync(codexHome).find(name=>/^state_\d+\.sqlite$/.test(name));assert.ok(stateFile);
+  const state=new DatabaseSync(path.join(codexHome,stateFile),{timeout:1000});
+  try{
+    for(const id of childIds){
+      state.prepare("UPDATE threads SET has_user_event=0,first_user_message='' WHERE id=?").run(id);
+      assert.equal(state.prepare('SELECT has_user_event FROM threads WHERE id=?').get(id)?.has_user_event,0);
+    }
+  }finally{state.close();}
+  const scoped=await rpc.request('thread/list',{limit:100,modelProviders:[],sourceKinds:['subAgentThreadSpawn'],useStateDbOnly:true,ancestorThreadId:thread.id});
+  assert.deepEqual(new Set(scoped.data.map((entry:CodexThread)=>entry.id)),new Set(childIds),'原生祖先过滤必须实际覆盖所有层级且排除根线程');
+  const descendants=await catalogCodexThreads(rpc,new Set(childIds),{independent:true,ancestorThreadId:thread.id});
+  for(const id of childIds){assert.equal(descendants.get(id)?.id,id);assert.equal(descendants.get(id)?.status?.type,'idle');}
+  await assertCodexRuntimeScope(rpc,thread.id,{inspectOnly:true});
+  assert.deepEqual((await readCodexRecycleScope(rpc,thread.id)).loaded,new Set([thread.id,...childIds]));
   assert.equal(requests,1,'目录和范围核验均不创建额外模型轮次');
   t.diagnostic(JSON.stringify({catalogComplete:true,scopeComplete:true,catalogMs:performance.now()-started,localRequests:requests,realModelCalls:0}));
 });

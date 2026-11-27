@@ -99,6 +99,57 @@ test('提交结果未知时保留持久请求，不因再次执行恢复命令�
   assert.equal(wake.mock.callCount(),1);
 });
 
+test('原生等待时立刻保存完整待送结果，后续送达及清理不改写这次请求的回执',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:1000000});
+  const f=failedFixture(t),read=f.codex.injectionState.bind(f.codex);let idle=false;
+  const poll=()=>f.broker.dispatch('codex.recover.result',{request_id:'recover-failed'}) as Promise<{state:string;recovered:boolean;notice_id:string;text:string}>;
+  let initial:Awaited<ReturnType<typeof poll>>|undefined;
+  f.codex.injectionState=async(...args)=>{
+    initial??=await poll();
+    const value=await read(...args);
+    return idle?value:{...value,thread:{...value.thread,status:{type:'active'}}};
+  };
+  const accepted=await f.recover() as Awaited<ReturnType<typeof poll>>;
+  assert.equal(accepted.state,'pending');assert.equal(accepted.recovered,false);assert.match(accepted.text,/指令已保留/);
+  assert.deepEqual(initial,accepted,'处理尚未返回时也可查询已经保存的完整待送回执');
+  assert.equal(f.codex.injectedNotices.length,0);assert.equal(f.codex.woken.length,0);
+  f.broker.deliveryHealth.enqueue(f.pair.id,f.x.id,{id:'unrelated',state:'pending',message:'独立通知'});
+  f.broker.deliveryHealth.outcome(f.pair.id,f.x.id,'unrelated','submitted');
+  assert.equal((await poll()).state,'pending');
+  await assert.rejects(f.recover('repeat-before-delivery'),{code:'recovery_already_requested'});
+  await f.broker.pump();
+  idle=true;t.mock.timers.tick(10000);
+  await f.broker.pump();
+  assert.equal(f.broker.deliveryHealth.noticeState(f.pair.id,f.x.id,accepted.notice_id),'submitted');
+  assert.deepEqual(f.codex.injectedNotices.map(notice=>notice.id),[accepted.notice_id]);
+  assert.equal(f.codex.woken.length,1);
+  f.broker.deliveryHealth.enqueue(f.pair.id,f.x.id,{id:'new-monitor-notice',state:'pending',message:'新观察'});
+  assert.equal(f.broker.deliveryHealth.noticeState(f.pair.id,f.x.id,accepted.notice_id),undefined);
+  const write=t.mock.method(f.store,'setSetting');
+  assert.deepEqual(await poll(),accepted);
+  assert.equal(write.mock.callCount(),0);
+});
+
+test('确认未提交的后续错误保留已入队的继续指令和本次待送回执',async t=>{
+  const f=failedFixture(t);
+  t.mock.method(f.codex,'inject',async()=>{throw new DeliveryError('isolated_before_submit','原生提交前的隔离故障',false);});
+  const receipt=await f.recover() as {state:string;recovered:boolean;notice_id:string;error:string};
+  assert.equal(receipt.state,'pending');assert.equal(receipt.recovered,false);assert.match(receipt.error,/原生提交前的隔离故障/);
+  assert.equal(f.broker.deliveryHealth.noticeState(f.pair.id,f.x.id,receipt.notice_id),'pending');
+  assert.deepEqual(await f.broker.dispatch('codex.recover.result',{request_id:'recover-failed'}),receipt);
+  assert.equal(f.codex.woken.length,0);
+  await assert.rejects(f.recover('repeat-after-error'),{code:'recovery_already_requested'});
+});
+
+test('明确恢复的原生注入结果未知时不报告继续指令已送达',async t=>{
+  const f=failedFixture(t),inject=t.mock.method(f.codex,'inject',async()=>{throw new DeliveryError('native_unknown','原生提交结果未知',true);});
+  const receipt=await f.recover() as {state:string;recovered:boolean;text:string};
+  assert.equal(receipt.state,'uncertain');assert.equal(receipt.recovered,false);assert.match(receipt.text,/暂时确认不了/);
+  assert.equal((await f.broker.dispatch('codex.recover.result',{request_id:'recover-failed'}) as typeof receipt).state,'uncertain');
+  await assert.rejects(f.recover('repeat-unknown'),{code:'recovery_already_requested'});
+  assert.equal(inject.mock.callCount(),1);assert.equal(f.codex.woken.length,0);
+});
+
 test('恢复预约与通知写入同一事务，未提交的存储错误不会留下永久重复闸门',async t=>{
   const f=failedFixture(t),enqueue=t.mock.method(f.broker.deliveryHealth,'enqueue',()=>{throw Error('隔离存储写入故障');});
   await assert.rejects(f.recover(),/隔离存储写入故障/);assert.equal(f.store.setting('codexFailedRecovery:'+f.x.id),undefined);

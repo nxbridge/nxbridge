@@ -55,8 +55,14 @@ interface HealthHooks {
  signalCodexWake(peer:Peer,endpoint:Endpoint):Promise<void|typeof SKIPPED>;
  signalEmbeddedWake(peer:Peer,endpoint:Endpoint):Promise<void>;
  refreshHookTrust(peer:Peer):void;
+ runtimeProbeFailed(id:string):void;
  pumpStage(stage:string,work:()=>unknown|Promise<unknown>):Promise<boolean>;
 }
+
+const codexProbeScope=(peer:Peer,endpoint:Endpoint|undefined):string|undefined=>
+  peer.host==='codex'&&peer.owner==='nxbridge'&&endpoint?.active&&endpoint.mode==='app-server'&&!endpoint.daemon
+    ?JSON.stringify([peer.sessionId,endpoint.address,endpoint.epoch,endpoint.bindingEpoch,endpoint.runtimeId,endpoint.native?.pid??endpoint.pid,endpoint.native?.procStart??endpoint.procStart]):undefined;
+interface RuntimeProbeFailure {scope:string;retryAt:number}
 
                                          
 export class BrokerHealthCoordinator {
@@ -65,6 +71,7 @@ export class BrokerHealthCoordinator {
   private deliveryHealthCheckedAt=0;
   private unqueuedHealthCheckedAt=0;
   private runtimeProbes=new Map<string,{key:string;at:number;work:Promise<RuntimeAvailability>}>();
+  private failedRuntimeProbes=new Map<string,RuntimeProbeFailure>();
   private healthRequests=new Set<Promise<unknown>>();
   private healthCheckedAt=0;
   private turnHealthProbes=new Map<string,{key:string;at:number}>();
@@ -109,12 +116,49 @@ export class BrokerHealthCoordinator {
       this.hooks.requireEnabled(peer);
       const endpoint=this.runtimeEndpoint(peer.id),key=JSON.stringify([peer.sessionId,peer.owner,endpoint]),cached=this.runtimeProbes.get(peer.id);
       if(cached&&cached.key===key&&Date.now()-cached.at<2000&&!fresh)return cached.work;
+      const priorFailure=this.failedRuntimeProbes.get(peer.id);
+      if(priorFailure&&priorFailure.scope===codexProbeScope(peer,endpoint))priorFailure.retryAt=Date.now()+5000;
       const work=this.environment.adapters[peer.host].probe(peer,endpoint).then(value=>{
                                                  
         if(value.deliveryIssue&&this.runtimeEndpoint(peer.id)?.epoch===endpoint?.epoch&&this.environment.store.peer(peer.id).sessionId===peer.sessionId)this.services.incidents.failed(peer,endpoint,new BridgeError(value.deliveryIssue,value.deliveryIssue==='claude_inbox_missing'?'Claude inbox socket pathname missing':'Codex protected socket target pathname missing'));
         return value;
-      }).catch(()=>({state:'unknown' as const,reasons:['runtime availability check failed'],checked_at:Date.now()}));this.runtimeProbes.set(peer.id,{key,at:Date.now(),work});return work;
+      }).catch(():RuntimeAvailability=>({state:'unknown',reasons:['runtime availability check failed'],checked_at:Date.now()})).then(value=>{
+        if(this.runtimeProbes.get(peer.id)?.work===work){
+          if(value.state==='blocked'||value.state==='unknown')this.recordRuntimeProbeFailure(peer,endpoint,Date.now()+5000);
+          else if(value.state==='reachable'&&value.threadConfirmed)this.confirmRuntimeProbe(peer,endpoint,priorFailure);
+        }
+        return value;
+      });this.runtimeProbes.set(peer.id,{key,at:Date.now(),work});return work;
     }
+
+  runtimeProbeFailed(peer:Peer,endpoint:Endpoint):boolean{
+    const failure=this.failedRuntimeProbes.get(peer.id);
+    if(!failure)return false;
+    if(failure.scope===codexProbeScope(peer,endpoint))return true;
+    this.failedRuntimeProbes.delete(peer.id);return false;
+  }
+  runtimeProbeDue(peer:Peer,endpoint:Endpoint):boolean{
+    return this.runtimeProbeFailed(peer,endpoint)&&this.failedRuntimeProbes.get(peer.id)!.retryAt<=Date.now();
+  }
+  private confirmRuntimeProbe(peer:Peer,endpoint:Endpoint|undefined,prior:RuntimeProbeFailure|undefined):void{
+    if(prior&&this.failedRuntimeProbes.get(peer.id)===prior&&prior.scope===codexProbeScope(peer,endpoint))this.failedRuntimeProbes.delete(peer.id);
+  }
+  recordRuntimeProbeFailure(peer:Peer,endpoint:Endpoint|undefined,retryAt=0):void{
+    const scope=codexProbeScope(peer,endpoint);
+    if(!scope||this.hooks.stopped())return;
+    const existing=this.failedRuntimeProbes.get(peer.id),failure={scope,retryAt};
+    if(existing?.scope===scope){
+                                            
+      this.failedRuntimeProbes.set(peer.id,{scope,retryAt:Math.max(existing.retryAt,retryAt)});return;
+    }
+    const {store}=this.environment;
+    store.faults.sync('runtime_probe_signal:'+peer.id,()=>{
+      const current=store.getPeer(peer.id);
+      if(!current||scope!==codexProbeScope(current,store.endpoint(peer.id)))return;
+      this.failedRuntimeProbes.set(peer.id,failure);
+      this.hooks.runtimeProbeFailed(peer.id);
+    });
+  }
 
   async deliveryAvailability(sender:Peer,partner:Peer):Promise<RuntimeAvailability>{
       const source=this.runtimeEndpoint(sender.id);
@@ -310,13 +354,15 @@ export class BrokerHealthCoordinator {
     const {store}=this.environment;
       this.hooks.requireEnabled(peer);
       const revision=this.services.health.revision(endpoint.address,peer.sessionId!);
+      const priorFailure=this.failedRuntimeProbes.get(peer.id);
       let result:{thread:Awaited<ReturnType<typeof readCodexThread>>};
       try{const rpc=await this.environment.adapters.codex.connect(endpoint.address);this.hooks.requireEnabled(peer);result={thread:await readCodexThread(rpc,peer.sessionId!,{timeout:5000,progress:true})};}
-      catch(error){this.services.health.unverified(endpoint.address,peer.sessionId!,revision);throw error;}
+      catch(error){this.services.health.unverified(endpoint.address,peer.sessionId!,revision);this.recordRuntimeProbeFailure(peer,endpoint);throw error;}
       if(this.hooks.stopped())return;
       if(result.thread?.id!==peer.sessionId)throw new BridgeError('session_changed','原生状态返回了不同的线程，未处理目标。');
       const current=store.peer(peer.id),status=result.thread.status;
       if(current.sessionId!==peer.sessionId||store.endpoint(peer.id)?.epoch!==endpoint.epoch)throw new BridgeError('session_changed','原生状态核对期间目标会话已经改变。');
+      if(status?.type&&status.type!=='notLoaded')this.confirmRuntimeProbe(current,store.endpoint(peer.id),priorFailure);
       await this.refreshCodexPermission(current,result.thread.path);
       if(this.hooks.stopped())return;
       if(store.peer(peer.id).sessionId!==peer.sessionId||store.endpoint(peer.id)?.epoch!==endpoint.epoch)

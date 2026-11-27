@@ -6,7 +6,6 @@ import type {PartnerProfileCoordination} from '../profiles/coordination.js';
 import type {BrokerHealthCoordinator} from '../health/coordinator.js';
 import type {DeliveryHealth} from '../health/delivery.js';
 import type {CodexDaemons} from '../../hosts/codex/codex-daemon.js';
-import type {CodexDirectDelivery} from '../../hosts/codex/codex-direct.js';
 import type {TakeoverReturn,Takeovers} from '../recovery/takeover.js';
 import type {TakeoverPermissions} from '../recovery/takeover-permission.js';
 import {hostingRecord,writeHosting,closeHostedWindow,type SessionTransfers} from '../recovery/session-hosting.js';
@@ -20,6 +19,7 @@ import {CLAUDE_UNRESOLVED_LAUNCH_NOTICE} from '../../hosts/claude/claude-capabil
 import {nativeOwnership,nativeOwnershipRecords} from '../../process/owned-native.js';
 import {ownedProcesses} from '../../process/owned-processes.js';
 import {probeProcesses,liveProcess} from '../../process/process.js';
+import {hasCodexSocketPath} from '../health/probe.js';
 import {runtimeFor} from '../../hosts/managed-runtimes.js';
 import {partnerConfigHome} from '../pairing/pair-restore.js';
 import {launchInputFingerprint,parkLaunchFailure} from '../../hosts/launch-park.js';
@@ -51,8 +51,6 @@ interface LifecycleServices {
   readonly runtimeHealth:BrokerHealthCoordinator;
   readonly deliveryHealth:DeliveryHealth;
   readonly daemons:CodexDaemons;
-  readonly codexDirect:CodexDirectDelivery;
-  readonly subagentCompletions:Pick<import('../subagent-completions.js').SubagentCompletions,'pending'>;
 }
 interface LifecycleHooks {
   stopped():boolean;
@@ -60,7 +58,8 @@ interface LifecycleHooks {
   startupBlocked?(id:string):boolean;
   startupRecoveryBlocked?(id:string):boolean;
   migrateCodexIdentity(peer:Peer,endpoint:Endpoint,error:BridgeError):Promise<void>;
-  pumpAfterCurrent():Promise<void>;
+  queuedDelivery(id:string,accepted?:boolean):boolean;
+  wakeDelivery(id:string):void;
   restartCodexTransport(peer:Peer,endpoint:Endpoint,options:CodexRestartOptions):Promise<unknown>;
   foldRecycleReceipt?(peer:Peer,receipt:CodexContextReceipt):void;
 }
@@ -687,7 +686,13 @@ export class BrokerLifecycleCoordinator {
     if(endpoint?.pendingContext)return;
     let restore:(()=>Promise<unknown>)|undefined;
     if(peer.owner==='nxbridge'){
-      const availability=endpoint?await this.services.runtimeHealth.probeRuntime(peer):undefined;
+      const health=this.services.runtimeHealth,recovery=this.services.managedRecovery;
+      const failedProbe=endpoint&&health.runtimeProbeDue(peer,endpoint);
+      const needsProbe=endpoint&&(peer.host!=='codex'||endpoint.mode!=='app-server'||endpoint.daemon
+        ||hasCodexSocketPath(endpoint.address)||!['ready','busy'].includes(peer.state)||failedProbe
+        ||(recovery.get(id)?.state??'closed')!=='closed');
+                                           
+      const availability=needsProbe?await health.probeRuntime(peer,!!failedProbe):undefined;
       if(availability?.deliveryIssue==='claude_inbox_missing'){
         this.services.managedRecovery.ready(id,false);
         await this.repairClaudeInbox(peer,endpoint!);return;
@@ -711,7 +716,7 @@ export class BrokerLifecycleCoordinator {
         try{await reconciliation;}finally{this.restoringMembers.delete(id);}
         return;
       }
-      this.services.managedRecovery.ready(id,!!endpoint&&peer.state!=='offline'&&(!availability||availability.state==='reachable'));
+      if(availability||!endpoint||peer.state==='offline')recovery.ready(id,!!availability&&peer.state!=='offline'&&availability.state==='reachable');
       if(!peer.sessionId){if(hasPending&&!peer.launchFailure)restore=()=>this.prepare(peer);}
       else if(!endpoint||peer.state==='offline')restore=()=>this.recover(peer);
     }else if(peer.host==='codex'&&peer.sessionId&&!endpoint)restore=()=>this.recover(peer);
@@ -867,30 +872,40 @@ export class BrokerLifecycleCoordinator {
     const work=this.pumpStage('member_recovery:'+id,()=>this.recoverPairedPeer(id,hasPending)).finally(()=>{if(this.memberRecoveries.get(id)===work)this.memberRecoveries.delete(id);});
     this.memberRecoveries.set(id,work);return work;
   }
+                                                 
+  queuedRecoveryDue(id:string):boolean{
+    const {store}=this.environment;
+    if(this.memberRecoveries.has(id)||!store.faults.ready('member_recovery:'+id)||this.hooks.startupRecoveryBlocked?.(id)
+      ||this.preparing.has(id)||this.isRetiring(id)||this.isRestarting(id)||(this.recoveryAt.get(id)??0)>Date.now())return false;
+    const peer=store.getPeer(id),pair=store.pairFor(id);
+    if(!peer||!pair||pair.paused||!this.enabled(pair.claude)||!this.enabled(pair.codex)||['paused','needsHuman'].includes(peer.state)
+      ||claudeAutoHolds(store,peer)||store.setting('managedSessionConflict:'+id))return false;
+    const hosting=hostingRecord(store,peer),endpoint=store.endpoint(id),incident=this.services.managedRecovery.get(id);
+    if(hosting?.released||hosting?.launchPark||(hosting?.nextAt??0)>Date.now()||endpoint?.pendingContext||this.services.takeovers.get(id))return false;
+    if(endpoint&&this.services.runtimeHealth.runtimeProbeDue(peer,endpoint))return true;
+    if(incident&&incident.state!=='closed'&&incident.state!=='ready')return this.services.managedRecovery.due(incident);
+    if(!peer.sessionId)return peer.owner==='nxbridge'&&!peer.launchFailure;
+    if(peer.owner==='nxbridge')return !endpoint||peer.state==='offline'
+      ||peer.host==='codex'&&endpoint.mode==='app-server'&&!endpoint.daemon&&!this.environment.adapters.codex.hasSubscription(peer,endpoint);
+    return peer.host==='codex'&&!endpoint&&!store.setting('legacyTakeoverNeedsUser:'+id);
+  }
   deferRecoveryDelivery(id:string,recovery:Promise<boolean>):typeof SKIPPED{
     if(!this.recoveryDeliveryWaits.has(recovery)){
       this.recoveryDeliveryWaits.add(recovery);
       void recovery.then(ready=>{
         this.recoveryDeliveryWaits.delete(recovery);
-        if(ready)this.background('recovery_delivery:'+id,()=>{
-          const {store,adapters}=this.environment,peer=store.getPeer(id),endpoint=peer?store.endpoint(id):undefined;
-          const owned=this.ownedCodexRoute(id);
-          if(peer&&endpoint&&['ready','busy'].includes(peer.state)&&(!owned||adapters.codex.hasSubscription(peer,endpoint))
-            &&(store.pendingCount(id)||this.services.codexDirect.pending(id)||this.services.subagentCompletions.pending(peer))){
-            return this.hooks.pumpAfterCurrent();
-          }
-          return SKIPPED;
-        });
+        if(ready&&!this.hooks.producersPaused())this.hooks.wakeDelivery(id);
       });
     }
     return SKIPPED;
   }
-  schedulePairedRecoveries():Map<string,Promise<boolean>>{
+  schedulePairedRecoveries(targets?:ReadonlySet<string>):Map<string,Promise<boolean>>{
     const recoveries=new Map<string,Promise<boolean>>();
                                                  
     this.environment.store.faults.sync('member_recovery_schedule',()=>{
-      const queued=new Set(this.environment.store.pendingFacts().map(message=>message.to));
-      for(const pair of this.environment.store.pairs())for(const id of [pair.claude,pair.codex])recoveries.set(id,this.schedulePairedRecovery(id,queued.has(id)||id===pair.codex&&this.services.codexDirect.pending(id)));
+      const accepted=targets?undefined:new Set(this.environment.store.pendingRecipients());
+      for(const pair of this.environment.store.pairs())for(const id of [pair.claude,pair.codex])
+        recoveries.set(id,this.schedulePairedRecovery(id,targets?.has(id)??this.hooks.queuedDelivery(id,accepted?.has(id))));
       for(const id of this.environment.store.ongoingCodexRecycles())if(!recoveries.has(id))recoveries.set(id,this.schedulePairedRecovery(id,false));
     });
     return recoveries;

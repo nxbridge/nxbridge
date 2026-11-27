@@ -31,6 +31,8 @@ export async function probeAppServer(address:string,token?:string,timeout=750):P
     socket.once('open',()=>finish(true));socket.once('error',()=>finish(false));socket.once('close',()=>finish(false));
   });
 }
+export const hasCodexSocketPath=(address:string):boolean=>process.platform!=='win32'&&address.startsWith('unix://');
+
 export async function probePeerRuntime(peer:Peer,endpoint:Endpoint|undefined,home?:string,appServerProbe?:()=>Promise<boolean|undefined>,deadline?:number):Promise<RuntimeAvailability>{
   const now=Date.now(),reasons:string[]=[],unknown:string[]=[];
   if(endpoint?.pendingContext&&endpoint.pid&&endpoint.procStart){
@@ -62,7 +64,7 @@ export async function probePeerRuntime(peer:Peer,endpoint:Endpoint|undefined,hom
   const results=await probeProcesses(identities,remainingTime(deadline,1500));
   for(let i=0;i<results.length;i++)if(results[i]==='dead')reasons.push(identities[i]!.label+' exited or PID generation changed');else if(results[i]==='unknown')unknown.push(identities[i]!.label+' PID generation unverifiable');
   let deliveryIssue:RuntimeAvailability['deliveryIssue'];
-  if(process.platform!=='win32'&&peer.host==='codex'&&native&&results[0]==='alive'&&endpoint.address.startsWith('unix://')&&codexSocketPathMissing(endpoint.address.slice(7))){
+  if(peer.host==='codex'&&native&&results[0]==='alive'&&hasCodexSocketPath(endpoint.address)&&codexSocketPathMissing(endpoint.address.slice(7))){
     deliveryIssue='codex_socket_target_missing';reasons.push('Codex native process alive; protected socket pathname missing');
   }
   if(endpoint.mode==='claude-inbox'){

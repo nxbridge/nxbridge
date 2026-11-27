@@ -26,6 +26,7 @@ import { registration } from '../tests/support/registration.js';
 import { temporaryDirectory } from '../tests/support/temporary.js';
 import { releaseNativeTestLaunches } from '../tests/support/native-launch.js';
 import { randomUUID } from 'node:crypto';
+import {DatabaseSync} from 'node:sqlite';
 import { managedRuntimes, runtimeFor, saveManagedRuntime } from '../hosts/managed-runtimes.js';
 
 const execute=promisify(execFile);
@@ -100,7 +101,19 @@ test('显式独立引导后重启托管会话，旧 MCP 竞争不改变协调器
   const bootstrap=await execute(process.execPath,['--no-warnings',entry,'bootstrap'],{env:process.env,windowsHide:true,timeout:90000});assert.match(bootstrap.stdout,/独立运行/);
   const independent=await brokerCall('ping',{}, {home,start:false});assert.notEqual(independent.pid,before.pid);if(process.platform==='win32')assert.equal(independent.runtime.windowsIndependent,true);
   await wait(async()=>{const status=await brokerCall('status',{}, {home,start:false});return status.peers.find((value:any)=>value.id===peer.id)?.state==='ready';});
-  const result=await execute(process.execPath,['--no-warnings',entry,'restart','codex','--member',peer.id],{env:process.env,windowsHide:true,timeout:90000});
+  let result;
+  try{result=await execute(process.execPath,['--no-warnings',entry,'restart','codex','--member',peer.id],{env:process.env,windowsHide:true,timeout:90000});}
+  catch(error){
+                                            
+    const evidence=new DatabaseSync(path.join(home,'nxbridge.db'),{readOnly:true,timeout:1000});
+    try{
+      const events=evidence.prepare("SELECT seq,type,data FROM events WHERE type LIKE '%restart%' OR type LIKE '%recover%' OR type LIKE '%subscription%' ORDER BY seq DESC LIMIT 24").all().map(row=>({...row,data:JSON.parse(row.data as string)}));
+      const endpoints=evidence.prepare('SELECT data FROM endpoints WHERE peer_id=?').all(peer.id).map(row=>JSON.parse(row.data as string));
+      const active=endpoints.find(endpoint=>endpoint.active);
+      t.diagnostic(JSON.stringify({serviceRestartFailure:{events,endpoints,externalSubscription:!!active&&adapter.hasSubscription(peer,active)}}));
+    }finally{evidence.close();}
+    throw error;
+  }
   assert.match(result.stdout,/Codex 已用新运行时恢复原会话/);assert.equal(result.stderr,'');
   const after=runtimeFor(home,{peerId:peer.id})!.value;assert.ok(after.pid);pids.add(after.pid);assert.notEqual(after.pid,child.pid);
   const service=await brokerCall('ping',{}, {home,start:false});assert.equal(service.pid,independent.pid);assert.equal(service.origin.some((value:any)=>value.pid===child.pid),false);

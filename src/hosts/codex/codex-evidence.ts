@@ -16,21 +16,28 @@ function rememberUnsupported(rpc:RpcClient,method:string,threadId:string,error:u
 }
 
                                      
-export async function catalogCodexThreads(rpc:RpcClient,ids:ReadonlySet<string>,options:{independent?:boolean;onComplete?:()=>void}={}):Promise<Map<string,CodexThread>>{
+export async function catalogCodexThreads(rpc:RpcClient,ids:ReadonlySet<string>,options:{independent?:boolean;ancestorThreadId?:string;onComplete?:()=>void}={}):Promise<Map<string,CodexThread>>{
   const threads=new Map<string,CodexThread>(),deadline=performance.now()+5000;
   if(!ids.size)return threads;
-  let cursor:string|undefined;
-  const cursors=new Set<string>();
-  for(let pageIndex=0;pageIndex<10;pageIndex++){
-    const timeout=Math.ceil(deadline-performance.now());if(timeout<=0)break;
-                                                     
-    const page=await rpc.request('thread/list',{limit:100,modelProviders:[],sourceKinds:['cli','vscode','exec','appServer','subAgent','subAgentReview','subAgentCompact','subAgentThreadSpawn','subAgentOther','unknown'],...(options.independent?{useStateDbOnly:true}:{}),...(cursor?{cursor}:{})},{timeout});
-    if(!Array.isArray(page.data))break;
-    for(const thread of page.data)if(typeof thread?.id==='string'&&ids.has(thread.id)&&typeof thread.cwd==='string')threads.set(thread.id,thread);
-    if(page.nextCursor==null){options.onComplete?.();break;}
+  let pages=0;
+                                          
+                                           
+  const scopes=options.ancestorThreadId&&!(ids.size===1&&ids.has(options.ancestorThreadId))?[options.ancestorThreadId,undefined]:[undefined];
+  for(const ancestorThreadId of scopes){
     if(threads.size===ids.size)break;
-    if(typeof page.nextCursor!=='string'||!page.nextCursor||cursors.has(page.nextCursor))break;
-    cursor=page.nextCursor;cursors.add(cursor!);
+    let cursor:string|undefined;
+    const cursors=new Set<string>();
+    while(pages++<10){
+      const timeout=Math.ceil(deadline-performance.now());if(timeout<=0)break;
+                                             
+      const page=await rpc.request('thread/list',{limit:100,modelProviders:[],sourceKinds:['cli','vscode','exec','appServer','subAgent','subAgentReview','subAgentCompact','subAgentThreadSpawn','subAgentOther','unknown'],useStateDbOnly:true,...(ancestorThreadId?{ancestorThreadId}:{}),...(cursor?{cursor}:{})},{timeout});
+      if(!Array.isArray(page.data))break;
+      for(const thread of page.data)if(typeof thread?.id==='string'&&ids.has(thread.id)&&typeof thread.cwd==='string')threads.set(thread.id,thread);
+      if(page.nextCursor==null){if(!ancestorThreadId)options.onComplete?.();break;}
+      if(threads.size===ids.size)break;
+      if(typeof page.nextCursor!=='string'||!page.nextCursor||cursors.has(page.nextCursor))break;
+      cursor=page.nextCursor;cursors.add(cursor!);
+    }
   }
                                                         
   for(const id of ids)if(!options.independent&&!threads.has(id)){

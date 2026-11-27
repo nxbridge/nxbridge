@@ -29,7 +29,10 @@ test('同一窗口只预约一次：跨重启、并发及一分钟通知租约�
   await Promise.all(Array.from({length:20},()=>signals.signal('peer','scope','home','session',submit)));
   for(let i=0;i<10;i++){t.mock.timers.tick(61000);signals=new EmbeddedWakeSignals(store,()=>queue);await signals.signal('peer','scope','home','session',submit);}
   assert.equal(submitted,1);assert.equal(store.setting<any>('embeddedWake:peer').nativeId,'native');
-  queue={items:[]};await signals.signal('peer','scope','home','session',submit);assert.equal(submitted,2,'核验用户清空队列后可重新唤醒');
+  assert.equal(signals.ready('peer','scope'),false);
+  queue={items:[]};t.mock.timers.tick(5000);
+  assert.equal(signals.ready('peer','scope'),true);
+  await signals.signal('peer','scope','home','session',submit);assert.equal(submitted,2,'核验用户清空队列后可重新唤醒');
 });
 
 test('原生消费交接保留短暂预约，队列协议未知最多十分钟回退一次并返回诊断',async t=>{

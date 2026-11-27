@@ -1,6 +1,7 @@
 import test,{type TestContext} from 'node:test';
 import assert from 'node:assert/strict';
 import { TurnHealthTracker, SILENCE_MS, providerRetryInfo } from '../broker/health/turn-health.js';
+import type {CodexDirectDelivery} from '../hosts/codex/codex-direct.js';
 import { fixture } from './support/broker-fixture.js';
 import {writeFileSync} from 'node:fs';
 import path from 'node:path';
@@ -270,7 +271,7 @@ test('真实依赖停滞十五分钟后被动提醒，恢复只在主动状态�
   t.mock.timers.tick(30000);await f.broker.pump();assert.equal(f.claude.delivered.length,0);assert.equal(f.store.messages().length,1);
 });
 
-test('明确恢复只中断指定 turn 并提交一次继续指令，不重放旧任务或改写送达证据',async t=>{
+for(const waiting of [false,true])test('明确恢复只中断指定 turn 并提交一次继续指令，不重放旧任务或改写送达证据：'+waiting,async t=>{
   t.mock.timers.enable({apis:['Date'],now:1000000});
   const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id);f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'busy'});
   const message=f.store.accept(pair,f.c,'已经完成的原任务','original');f.store.transition(message.id,'contextObserved','原生历史证据');
@@ -280,11 +281,18 @@ test('明确恢复只中断指定 turn 并提交一次继续指令，不重放�
     if(method==='thread/read')return{thread};
     if(method==='thread/turns/list'||method==='thread/items/list')return boundedResult(method,thread);
     if(method==='turn/interrupt'){assert.equal(params.turnId,'t');turn.status='interrupted';return{};}
-    assert.equal(method,'turn/start');return{turn:{id:'new'}};
+    assert.equal(method,'turn/start');thread.turns.push({id:'new',status:'inProgress',items:[]});return{turn:{id:'new'}};
   }}) as any;
   f.codex.continueInjected=async(peer,endpoint)=>{await((await f.codex.connect(endpoint.address)) as any).request('turn/start',{threadId:peer.sessionId,input:[]});return'new';};
   f.broker.health.read(address,thread);t.mock.timers.tick(31000);
+  if(waiting){
+    const direct=(f.broker as unknown as {codexDirect:CodexDirectDelivery}).codexDirect,current=f.store.peer(f.x.id),endpoint=f.store.endpoint(f.x.id)!;
+    await direct.deliver(current,endpoint,[message],async()=>assert.fail('忙碌时不应准备输入'),()=>true,()=>assert.fail('忙碌时不应生成回执'));
+    assert.equal(direct.ready(current,endpoint,pair.id,true),false,'原生等待尚在退避');
+  }
   const result:any=await f.broker.dispatch('codex.recover',{turn_id:'t',request_id:'recover'});assert.equal(result.recovered,true);
+  assert.equal(calls.filter(call=>call.method==='turn/start').length,1,'明确恢复应立即复核原生状态');
+  await assert.rejects(f.broker.dispatch('codex.recover',{turn_id:'t',request_id:'repeat'}),{code:'turn_changed'});
   await f.broker.dispatch('hook',{hook_event_name:'Interrupt',session_id:'x',turn_id:'t'});
   f.codex.emit('interrupted','x',address,'t');
   assert.notEqual(f.store.peer(f.x.id).state,'paused','明确恢复导致的旧轮中断迟到后不得重新暂停');
