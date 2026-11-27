@@ -39,6 +39,28 @@ export async function windowsHookIdentityHelper(home=identityHome(),timeout=1000
   }finally{await rm(staging,{recursive:true});}
 }
 
+const readComplete='\nNXBRIDGE_READ_COMPLETE\n';
+export function parseWindowsProcessSnapshot<T>(contents:string):T{
+  if(contents.endsWith(readComplete)){
+    try{return JSON.parse(contents.slice(0,-readComplete.length)) as T;}catch{                       }
+  }
+  throw new BridgeError('process_census_incomplete','Windows 原生进程查询没有返回完整快照，未采用部分结果。');
+}
+
+async function readProcessSnapshot<T>(helper:string,args:string[],deadline:number):Promise<T>{
+  try{
+    const {stdout}=await execute(helper,['read-result',...args],{
+      windowsHide:true,encoding:'utf8',timeout:remainingTime(deadline,Number.MAX_SAFE_INTEGER),maxBuffer:16*1024*1024,
+    });
+    return parseWindowsProcessSnapshot<T>(stdout);
+  }catch(error){
+    const detail=error as {code?:string;signal?:string;killed?:boolean};
+    if(detail.code==='ERR_CHILD_PROCESS_STDIO_MAXBUFFER'||detail.code==='ETIMEDOUT'||detail.code==='timeout'||detail.killed||detail.signal)
+      throw new BridgeError('process_census_incomplete','Windows 原生进程查询在完整输出前结束，未采用部分结果。');
+    throw error;
+  }
+}
+
 export async function readWindowsAncestors(pid:number,depth:number,timeout=10000,home=identityHome()):Promise<ProcessAncestry>{
   if(!Number.isSafeInteger(pid)||pid<=0||!Number.isSafeInteger(depth)||depth<=0)throw new BridgeError('process_identity_invalid','Windows 祖先查询参数无效。');
   const deadline=performance.now()+timeout;let helper:string;
@@ -47,13 +69,12 @@ export async function readWindowsAncestors(pid:number,depth:number,timeout=10000
     if((error as BridgeError).code==='uninstalled'||(error as BridgeError).code==='timeout')throw error;
     throw new BridgeError('native_identity_unavailable','Windows 原生祖先助手准备未完成。');
   }
-  let stdout:string;
-  try{({stdout}=await execute(helper,['ancestors',String(pid),String(depth)],{windowsHide:true,timeout:remainingTime(deadline,timeout),maxBuffer:16*1024*1024}));}
+  let value:ProcessAncestry;
+  try{value=await readProcessSnapshot(helper,['ancestors',String(pid),String(depth)],deadline);}
   catch(error){
+    if((error as BridgeError).code==='process_census_incomplete')throw error;
     throw windowsAncestryFailure(error);
   }
-  let value:ProcessAncestry;
-  try{value=JSON.parse(stdout) as ProcessAncestry;}catch{throw new BridgeError('process_identity_unknown','Windows 原生祖先助手返回格式不符。');}
   return{...value,source:'native'};
 }
 
@@ -77,19 +98,20 @@ export async function readWindowsProcessArguments(identity:Pick<ProcessIdentity,
 }
 
 async function readWindowsIdentity(pid:number,home:string,host:'codex'|'claude'|'codex-hook'|'claude-hook'|'process',timeout:number):Promise<{pid:number;parentPid:number;image:string;launchImage:string;procStart:string;procStartTicks:string;commandLine:string}>{
-  const deadline=performance.now()+timeout,helper=await windowsHookIdentityHelper(home,remainingTime(deadline,10000)),began=performance.now();let stdout:string;
-  try{({stdout}=await execute(helper,[host,String(pid)],{windowsHide:true,timeout:remainingTime(deadline,2000)}));}
+  const deadline=performance.now()+timeout,helper=await windowsHookIdentityHelper(home,remainingTime(deadline,10000)),began=performance.now();
+  try{
+    return await readProcessSnapshot(helper,[host,String(pid)],Math.min(deadline,began+2000));
+  }
   catch(error){
+    if((error as BridgeError).code==='process_census_incomplete')throw error;
     const detail=error as Error&{code?:string|number;signal?:string;killed?:boolean;stderr?:string};
     throw new BridgeError('process_identity_unknown',`Windows 原生身份查询未完成（耗时 ${Math.round(performance.now()-began)}ms，退出码 ${detail.code??'未知'}，信号 ${detail.signal??'无'}，终止 ${detail.killed===true}）：${detail.stderr?.trim()||detail.message}`);
   }
-  return JSON.parse(stdout);
 }
 
 export async function readWindowsProcessGenerations(pids:number[],timeout:number):Promise<{pid:number;generation?:string;ticks?:string;missing?:boolean}[]>{
-  const began=performance.now(),helper=await windowsHookIdentityHelper(identityHome(),timeout),remaining=timeout-(performance.now()-began);
-  if(remaining<=0)throw Object.assign(new Error('原生代次查询预算已用完'),{code:'ETIMEDOUT'});
-  const {stdout}=await execute(helper,['probe',...pids.map(String)],{windowsHide:true,timeout:Math.max(1,Math.floor(remaining))});return JSON.parse(stdout);
+  const deadline=performance.now()+timeout,helper=await windowsHookIdentityHelper(identityHome(),timeout);
+  return readProcessSnapshot(helper,['probe',...pids.map(String)],deadline);
 }
 
                                      
@@ -104,9 +126,8 @@ export async function stopWindowsProcess(identity:Pick<ProcessIdentity,'pid'|'st
 }
 
 export async function readWindowsJobMembers(job:string,root:{pid:number;startedAt:string},timeout=10000):Promise<ProcessIdentity[]>{
-  const began=performance.now(),helper=await windowsHookIdentityHelper(identityHome(),timeout),remaining=timeout-(performance.now()-began);
-  if(remaining<=0)throw Object.assign(new Error('原生后代查询预算已用完'),{code:'ETIMEDOUT'});
-  const {stdout}=await execute(helper,['job-members',job,String(root.pid),root.startedAt],{windowsHide:true,timeout:Math.max(1,Math.floor(remaining)),maxBuffer:16*1024*1024});return JSON.parse(stdout);
+  const deadline=performance.now()+timeout,helper=await windowsHookIdentityHelper(identityHome(),timeout);
+  return readProcessSnapshot(helper,['job-members',job,String(root.pid),root.startedAt],deadline);
 }
 
 export async function stopWindowsJob(job:string,root:{pid:number;startedAt:string},timeout=5000,beforeSignal?:()=>void):Promise<void>{

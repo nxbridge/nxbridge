@@ -28,7 +28,7 @@ import { knownNativeProcesses } from '../process/native-processes.js';
 import { processRegistryRoot } from '../process/owned-processes.js';
 import { reserveBrokerStartup } from '../broker/broker-startup.js';
 import { updateBroker } from './setup-broker.js';
-import { activeRuntime, fileHashes, ownsRuntime, pointerDetails, pruneRuntimes, publishSource, runtimeEntriesChanged, runtimeManifest, stageRuntime, verifyPublish, type InstallReceipt } from './runtime-install.js';
+import { activeRuntime, fileHashes, pluginFileHashes, ownsRuntime, pointerDetails, pruneRuntimes, publishSource, runtimeEntriesChanged, runtimeManifest, stageRuntime, verifyPublish, type InstallReceipt } from './runtime-install.js';
 import { managedMarker } from './installation.js';
 import { probeClaudeBackground, saveClaudeBackground } from '../hosts/claude/claude-capability.js';
 import { platformCompatibility, versionCompatibility, requireCodexVersion } from './compatibility.js';
@@ -311,9 +311,9 @@ async function setupInner(options:NonNullable<Parameters<typeof setup>[0]>,input
     const {host}=inventory,marketKey=host==='claude'?'claudeMarketplace':'codexMarketplace',installedKey=host==='claude'?'claudeInstalled':'codexInstalled';
     const beforeHomes=[host==='codex'?services.codexDirectory:services.claudeDirectory,...inventory.plugins.filter(value=>typeof value.installPath==='string').map(value=>path.resolve(value.installPath,'../../../../..'))];
     const beforeDirectories=[...new Set(beforeHomes.flatMap(directory=>installedCacheDirectories(directory,host)))].filter(directory=>inventory.plugins.some(value=>value.installed!==false&&(typeof value.installPath==='string'?sameDirectory(value.installPath,directory):path.basename(directory)===value.version)));
-    const preparedFiles=fileHashes(path.join(root,'plugins',host));
+    const preparedFiles=pluginFileHashes(path.join(root,'plugins',host),host);
                                            
-    reloadRequired[host]=entryChanged(host==='codex'?['mcp-entry.mjs']:['mod-entry.mjs','mcp-entry.mjs'])||!beforeDirectories.length||beforeDirectories.some(directory=>!isDeepStrictEqual(fileHashes(directory),preparedFiles));
+    reloadRequired[host]=entryChanged(host==='codex'?['mcp-entry.mjs']:['mod-entry.mjs','mcp-entry.mjs'])||!beforeDirectories.length||beforeDirectories.some(directory=>!isDeepStrictEqual(pluginFileHashes(directory,host),preparedFiles));
     const targetVersion=readJson<{version:string}>(path.join(root,'plugins',host,host==='codex'?'.codex-plugin':'.claude-plugin','plugin.json')).version;
     const retainedCaches=[...recoveredCaches],installCodex=async()=>{
       const homes=[services.codexDirectory,...inventory.plugins.filter(value=>typeof value.installPath==='string').map(value=>path.resolve(value.installPath,'../../../../..'))];
@@ -377,7 +377,8 @@ async function setupInner(options:NonNullable<Parameters<typeof setup>[0]>,input
     if(edits.length){const client=await services.control(loadConfig(home));try{await client.request('config/batchWrite',{edits,filePath:configFile},{mutation:true});}finally{await client.close();}}
   }
   const newFiles=[...shim.launcher,...shim.files],obsolete=(state.managedFiles??[]).filter(file=>!newFiles.some(value=>sameDirectory(value.file,file.file)));
-  const receipt:InstallReceipt={owner:managedMarker(home),buildId:candidate.buildId,roots:[root,...(state.cacheDirectories??[]).map(cache=>cache.directory)].map(directory=>({directory,files:fileHashes(directory)}))};
+  const receipt:InstallReceipt={owner:managedMarker(home),buildId:candidate.buildId,roots:[{directory:root,files:fileHashes(root)},
+    ...(state.cacheDirectories??[]).map(cache=>({directory:cache.directory,files:pluginFileHashes(cache.directory,cache.host)}))]};
   await commitActivation(home,state,newFiles,receipt,services.checkpoint);
   const cleaned=removeManagedFiles(obsolete,home);notes.push(...cleaned.notes);state.managedFiles=[...newFiles,...cleaned.remaining];delete state.pendingSetup;atomicJson(statePath,state);
   services.checkpoint?.('obsolete-state');

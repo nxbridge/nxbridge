@@ -178,7 +178,7 @@ export function matchesProcess(record: { procStart?: string; procStartFt?: strin
 type ProbeState='alive'|'dead'|'unknown';
 interface ProbeRequest {records:{pid:number;procStart:string}[];resolve:(states:ProbeState[])=>void;reject:(error:unknown)=>void}
 const probeBatches=new Map<number,ProbeRequest[]>();
-const probeDiagnostics:{batches:number;requests:number;last?:{at:number;durationMs:number;pidCount:number;outcome:'ok'|'timeout'|'failed';code?:string}}={batches:0,requests:0};
+const probeDiagnostics:{batches:number;requests:number;nativeQueries:number;nativeDurationMs:number;last?:{at:number;durationMs:number;pidCount:number;outcome:'ok'|'timeout'|'failed';code?:string}}={batches:0,requests:0,nativeQueries:0,nativeDurationMs:0};
 export const processProbeStatus=()=>({...probeDiagnostics,...(probeDiagnostics.last?{last:{...probeDiagnostics.last}}:{})});
                                   
 export function probeProcesses(records:{pid:number;procStart:string}[],timeout=1500):Promise<ProbeState[]>{
@@ -204,8 +204,11 @@ async function probeProcessesNow(records:{pid:number;procStart:string}[],timeout
       for(const row of await readWindowsProcessGenerations(pids,timeout))if(row.missing)missing.add(row.pid);else if(row.generation)identities.set(row.pid,{generation:row.generation,...(row.ticks?{ticks:row.ticks}:{})});
       probeDiagnostics.last={at:Date.now(),durationMs:performance.now()-began,pidCount:pids.length,outcome:'ok'};
     }catch(error){
-      const detail=error as {killed?:boolean;code?:string};probeDiagnostics.last={at:Date.now(),durationMs:performance.now()-began,pidCount:pids.length,outcome:detail.killed||detail.code==='ETIMEDOUT'?'timeout':'failed',...(typeof detail.code==='string'?{code:detail.code}:{})};
+      const detail=error as {killed?:boolean;code?:string};probeDiagnostics.last={at:Date.now(),durationMs:performance.now()-began,pidCount:pids.length,outcome:detail.killed||detail.code==='ETIMEDOUT'||detail.code==='timeout'?'timeout':'failed',...(typeof detail.code==='string'?{code:detail.code}:{})};
                                     
+    }finally{
+      probeDiagnostics.nativeQueries++;
+      probeDiagnostics.nativeDurationMs+=performance.now()-began;
     }
   }else{
     await Promise.all(pids.map(async pid=>{

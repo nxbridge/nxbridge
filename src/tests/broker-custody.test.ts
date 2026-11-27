@@ -16,6 +16,17 @@ import {waitForPartnerQuestion} from '../integration/mcp/question-wait.js';
 import {once} from 'node:events';
 import {WebSocketServer,type WebSocket} from 'ws';
 import {CodexAdapter} from '../hosts/codex/adapter.js';
+import {StartupRoutes} from '../broker/startup-routes.js';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import {existsSync,writeFileSync} from 'node:fs';
+import {readCodexHistory} from '../hosts/codex/codex-history.js';
+import type {BrokerHealthCoordinator} from '../broker/health/coordinator.js';
+import type {BrokerLifecycleCoordinator} from '../broker/lifecycle/coordinator.js';
+import {turnNativeScope} from '../broker/turn-end-evidence.js';
+import {saveManagedRuntime} from '../hosts/managed-runtimes.js';
+import {managedMarker} from '../install/installation.js';
+import {randomUUID} from 'node:crypto';
 
 class HandoffAdapter extends FakeAdapter{
   pending=false;
@@ -29,16 +40,22 @@ class HandoffAdapter extends FakeAdapter{
     return{offers:[],live:()=>false,release:()=>{},close:()=>{}};
   }
   async acquireHandoff(){return{promoted:this.promoted,transferred:this.promoted.length,held:0};}
+  async connect(address:string){
+    this.connected.push(address);
+    return{request:async(...args:any[])=>({thread:{id:args[1]?.threadId,status:{type:'idle'},turns:[]}})};
+  }
 }
 
 function fixture(t:TestContext){
   const temp=temporaryDirectory(),home=temp.directory,file=path.join(home,'nxbridge.db'),store=new Store(file),codex=new HandoffAdapter(),claude=new FakeAdapter();
   const broker=new Broker(store,{...DEFAULT_CONFIG,implicit:'never'},{codex,claude} as unknown as Adapters,home);
   const c=store.register(registration('claude','c')),x=store.register(registration('codex','x')),pair=store.pair(c.id,x.id);
+                                
+  store.saveEndpoint({...store.endpoint(x.id)!,runtimeId:'custody-fixture'});
   t.after(async()=>{await broker.stop();store.close();await temp.cleanup();});
   const cx={host:'codex' as const,sessionId:'x',callId:'ask'};
   const question=()=>broker.dispatch('question.create',{actor:cx,questions:[{id:'one',header:'方向',question:'如何继续？',options:[{label:'甲',description:'说明甲'},{label:'乙',description:'说明乙'}]}]}) as Promise<{request_id:string;expires_at:string}>;
-  return{file,broker,store,codex,claude,c,x,pair,cx,question};
+  return{home,file,broker,store,codex,claude,c,x,pair,cx,question};
 }
 
 const barrier=()=>{
@@ -46,6 +63,16 @@ const barrier=()=>{
   const wait=new Promise<void>(resolve=>{open=resolve;});
   return {wait,open};
 };
+
+function holdNativeProbe(f:ReturnType<typeof fixture>,entered:ReturnType<typeof barrier>,resume:ReturnType<typeof barrier>){
+  const health=(f.broker as unknown as {runtimeHealth:BrokerHealthCoordinator}).runtimeHealth,probe=health.probeTurnHealth.bind(health);
+  let first=true;
+  health.probeTurnHealth=async(peer,endpoint)=>{
+    const value=await probe(peer,endpoint);
+    if(first){first=false;entered.open();await resume.wait;}
+    return value;
+  };
+}
 
 test('封存等待公开请求和 Mod 的实际内层工作，丢弃迟到生产者写入',async t=>{
   const f=fixture(t),actual=barrier(),outer=barrier(),entered=barrier();
@@ -284,23 +311,253 @@ test('不可逆封存期间出错也关闭旧写入句柄，问题连续性只�
   }finally{restarted.close();}
 });
 
-test('接班补证期间的新原生轮次使并行扫描证据过时，业务仍被拒绝',async t=>{
+test('接班补证期间仍响应 IPC，新原生轮次胜过先前探针，控制请求立即重试',async t=>{
   const f=fixture(t);
   f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'ready'});
   const endpoint=f.store.endpoint(f.x.id)!;
   f.store.saveEndpoint({...endpoint,mode:'app-server',address:'隔离原生连接'});
   f.codex.promoted=[f.x.id];
-  const raced=barrier(),resume=barrier(),scan=f.broker.turnEnds.scan.bind(f.broker.turnEnds);
-  f.broker.turnEnds.scan=async(peer,current)=>{
-    if(!current)return scan(peer);
-    assert.equal(current(),true);raced.open();await resume.wait;assert.equal(current(),false);
-  };
+  const raced=barrier(),resume=barrier();holdNativeProbe(f,raced,resume);
   const start=f.broker.start({offers:[],signal:new AbortController().signal,verify:async()=>false,resolve:async()=>{}});
   await raced.wait;
   try{
-    await assert.rejects(f.broker.dispatch('ping',{}),{code:'handoff_retry'});
+    assert.equal((await f.broker.dispatch('ping',{}) as any).pid,process.pid);
+    await assert.rejects(f.question(),{code:'starting'});
     f.codex.emit('native',{address:'隔离原生连接',message:{method:'turn/started',params:{threadId:'x',turn:{id:'newer'}}}});
     assert.equal(f.store.peer(f.x.id).state,'ready');
   }finally{resume.open();}
-  await start;assert.equal((await f.broker.dispatch('ping',{}) as any).pid,process.pid);
+  await start;assert.equal((await f.broker.dispatch('ping',{}) as any).pid,process.pid);assert.equal(f.store.peer(f.x.id).state,'busy');
+});
+
+test('慢路由认领不挡住查询和既有配对排队，控制与 hook 不等待认领，也不隐式创建搭档',async t=>{
+  const f=fixture(t),entered=barrier(),resume=barrier(),serving=barrier();
+  f.codex.acquireHandoff=async()=>{entered.open();await resume.wait;return{promoted:[],transferred:0,held:0};};
+  const original=f.store.accept(f.pair,f.c,'原投递','original');f.store.claim(original.id);
+  const start=f.broker.start({offers:[],signal:new AbortController().signal,verify:async()=>false,resolve:async()=>{}},undefined,serving.open);
+  await serving.wait;await entered.wait;
+  try{
+    assert.equal((await f.broker.dispatch('ping',{}) as any).pid,process.pid);
+    assert.equal(f.store.message(original.id).state,'unknown');
+    const actor={host:'claude',sessionId:'c',callId:'startup-send'},input={actor,message:'认领期间保存的新消息'};
+    const first:any=await f.broker.dispatch('send',input),again:any=await f.broker.dispatch('send',input);
+    assert.equal(first.persisted,true);assert.equal(first.route_recovery_pending,true);assert.equal(first.message_id,again.message_id);
+    assert.equal(f.store.message(first.message_id).attempts,0);
+    assert.equal((await f.broker.dispatch('status',{actor}) as any).paired,true);
+    await f.broker.dispatch('receive',{...actor,callId:'startup-receive'});
+    for(const method of ['hook.client','broker.handoff.prepare','shutdown','codex.restart','codex.restart.target'])
+      await assert.rejects(f.broker.dispatch(method,{}),{code:'starting'});
+    f.store.register(registration('claude','unpaired'));
+    await assert.rejects(f.broker.dispatch('send',{actor:{host:'claude',sessionId:'unpaired',callId:'new'},message:'不能创建新搭档'}),{code:'starting'});
+    assert.equal(f.store.pairs().length,1);assert.equal(f.codex.created.length,0);assert.equal(f.claude.created.length,0);
+    assert.deepEqual(f.codex.injected,[]);assert.deepEqual(f.codex.woken,[]);
+  }finally{resume.open();await start;}
+});
+
+test('补证期间 hook 立即回退，稍后的原生历史结算回执；早到消息在补证结束前不提交',async t=>{
+  const f=fixture(t),entered=barrier(),resume=barrier();
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'ready'});
+  f.store.saveEndpoint({...f.store.endpoint(f.x.id)!,mode:'app-server',address:'unix://隔离接班连接'});f.codex.promoted=[f.x.id];
+  const original=f.store.accept(f.pair,f.c,'hook 之前已提交','native-output');f.store.claim(original.id);
+  const transcript=path.join(f.home,'native-hook-history.jsonl');
+                                                       
+  f.codex.reconcile=async peer=>(await readCodexHistory(transcript,peer.sessionId!)).receipts;
+  holdNativeProbe(f,entered,resume);
+  await ensureHome(f.home);
+  const server=await listenBroker(f.home,(method,params)=>f.broker.dispatch(method,params));
+  const start=f.broker.start({offers:[],signal:new AbortController().signal,verify:async()=>false,resolve:async()=>{}});
+  await entered.wait;
+  let queued:string|undefined;
+  try{
+    const at=new Date().toISOString(),history=[
+      {type:'session_meta',payload:{id:f.x.sessionId}},
+      {type:'event_msg',timestamp:at,payload:{type:'task_started',turn_id:'native-turn'}},
+      {type:'response_item',timestamp:at,payload:{type:'function_call',namespace:'claude',name:'receive_messages',call_id:'native-receive'}},
+      {type:'response_item',timestamp:at,payload:{type:'function_call_output',id:'native-tool-output',call_id:'native-receive',output:JSON.stringify({messages:[{message_id:original.id}]})}},
+    ].map(row=>JSON.stringify(row)).join('\n')+'\n';
+                                                             
+    const program="import {hookClient} from "+JSON.stringify(new URL('../integration/hooks/hook-client.js',import.meta.url).href)+";\n"+
+      "import {writeFileSync} from 'node:fs';\n"+
+      "const output=await hookClient('codex',{hook_event_name:'Stop',session_id:'x'},()=>{throw Error('未提供回执');},async()=>{writeFileSync("+
+      JSON.stringify(transcript)+","+JSON.stringify(history)+",'utf8');return{};});\nprocess.stdout.write(JSON.stringify(output));";
+    const result=await promisify(execFile)(process.execPath,['--input-type=module','-e',program],{
+      encoding:'utf8',windowsHide:true,timeout:5000,env:{...process.env,NXBRIDGE_HOME:f.home,NXBRIDGE_HOOK_STARTED_AT:String(Date.now())},
+    });
+    assert.deepEqual(JSON.parse(result.stdout),{});assert.equal(existsSync(transcript),true);assert.equal(f.store.message(original.id).state,'unknown');
+    const saved:any=await f.broker.dispatch('send',{actor:{host:'claude',sessionId:'c',callId:'catchup-queue'},message:'补证期间新消息'});
+    queued=saved.message_id;await f.broker.pump();
+    assert.equal(f.store.message(queued!).attempts,0);assert.equal(f.codex.injected.length,0);assert.equal(f.codex.woken.length,0);
+  }finally{
+    resume.open();await start;await server.close();
+  }
+  assert.equal(f.store.message(original.id).state,'contextObserved');assert.equal(f.store.message(original.id).attempts,1);
+  await f.broker.pump();assert.equal(f.store.message(queued!).attempts,1);
+  assert.ok(f.codex.injected.some(call=>call.output.includes(queued!)));
+});
+
+test('原生历史超过启动等待预算后显式降级，新投递继续而未知消息不重放',async t=>{
+  const f=fixture(t),entered=barrier(),resume=barrier();
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'ready'});f.store.saveEndpoint({...f.store.endpoint(f.x.id)!,mode:'app-server',address:'unix://慢历史连接'});
+  f.codex.promoted=[f.x.id];
+  const old=f.store.accept(f.pair,f.c,'旧未知投递','unknown-before');f.store.claim(old.id);
+  holdNativeProbe(f,entered,resume);
+  const start=f.broker.start({offers:[],signal:new AbortController().signal,verify:async()=>false,resolve:async()=>{}});
+  await entered.wait;
+  try{
+    await start;
+    const startup=(f.broker as unknown as {startupRoutes:StartupRoutes}).startupRoutes;startup.fail(f.x.id);
+    const status:any=await f.broker.dispatch('status',{actor:{host:'claude',sessionId:'c',callId:'degraded'}});
+    assert.ok(status.startupRoutes.some((route:any)=>route.phase==='degraded'));
+    const sent:any=await f.broker.dispatch('send',{actor:{host:'claude',sessionId:'c',callId:'after-ceiling'},message:'降级后新消息'});
+    await f.broker.pump();
+    assert.equal(f.store.message(sent.message_id).attempts,1);assert.equal(f.store.message(old.id).state,'unknown');assert.equal(f.store.message(old.id).attempts,1);
+    assert.equal(f.codex.injected.some(call=>call.output.includes(old.id)),false);
+  }finally{resume.open();await start;}
+  for(let i=0;i<20&&(f.broker as unknown as {startupCatchups:Map<string,unknown>}).startupCatchups.size;i++)await delay(10);
+  assert.equal(f.store.message(old.id).state,'unknown');
+});
+
+test('首次回执核对只读到一片时，后续协调器对账沿同一游标继续核验且不重放未知消息',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:1000000});
+  const f=fixture(t),found=f.store.accept(f.pair,f.c,'稍后能证明已接收','progress-found'),unknown=f.store.accept(f.pair,f.c,'仍无回执','progress-unknown');
+  f.store.claim(found.id);f.store.claim(unknown.id);f.store.recover();
+  const file=path.join(f.home,'progressive-receipts.jsonl'),call='progressive-call';
+  writeFileSync(file,[
+    {type:'session_meta',payload:{id:f.x.sessionId}},
+    {type:'event_msg',payload:{type:'agent_message',message:'x'.repeat(10*1024*1024)}},
+    {type:'event_msg',payload:{type:'task_started',turn_id:'progressive-turn'}},
+    {type:'response_item',payload:{type:'function_call',namespace:'claude',name:'receive_messages',call_id:call}},
+    {type:'response_item',payload:{type:'function_call_output',call_id:call,output:JSON.stringify({messages:[{message_id:found.id}]})}},
+  ].map(row=>JSON.stringify(row)).join('\n')+'\n','utf8');
+  f.codex.reconcile=async(peer,_endpoint,options:{since?:number}={})=>(await readCodexHistory(file,peer.sessionId!,{since:options.since})).receipts;
+  assert.equal(await f.broker.reconcile(f.x.id),true);assert.equal(f.store.message(found.id).state,'unknown');
+  for(let pass=0;pass<20&&f.store.message(found.id).state==='unknown';pass++)await f.broker.reconcile(f.x.id);
+  assert.equal(f.store.message(found.id).state,'contextObserved');assert.equal(f.store.message(found.id).attempts,1);
+  assert.equal(f.store.message(unknown.id).state,'unknown');assert.equal(f.store.message(unknown.id).attempts,1);
+  assert.equal(f.codex.woken.length,0);assert.equal(f.codex.injected.length,0);assert.equal(f.codex.created.length,0);
+});
+
+test('普通重启的完成核对不阻止投递、全局回执对账和下一次交接，悬挂读取在封存后不写旧库',async t=>{
+  const f=fixture(t),entered=barrier(),resume=barrier();
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'ready'});
+  const runtimeId=randomUUID(),previous=f.store.endpoint(f.x.id)!;
+  f.store.saveEndpoint({...previous,address:'unix://held-completion-source',configHome:f.home,runtimeId});
+  const peer=f.store.peer(f.x.id),endpoint=f.store.endpoint(f.x.id)!;
+                                          
+  saveManagedRuntime(f.home,{id:runtimeId,owner:managedMarker(f.home),kind:'owned',state:'ready',dedicated:true,endpoint:endpoint.address,
+    peerId:peer.id,sessionId:peer.sessionId!,pid:endpoint.pid!,procStart:endpoint.procStart!,configHome:f.home,createdAt:Date.now()});
+  f.store.setSetting('turnEndFact:'+peer.id,{version:1,pairId:f.pair.id,sessionId:peer.sessionId,scope:turnNativeScope(peer,endpoint),state:'completed',turnId:'before-restart',at:Date.now(),reason:'unverified'});
+  const reader=f.broker.turnEnds as unknown as {read(peer:typeof f.x,current?:()=>boolean):Promise<boolean>};
+  t.mock.method(reader,'read',async()=>{entered.open();await resume.wait;return true;});
+  const old=f.store.accept(f.pair,f.c,'旧回执','receipt-before-check');f.store.claim(old.id);
+  f.codex.reconcile=async()=>[{messageId:old.id,turnId:'before-restart',itemId:'persisted-receipt'}];
+  const start=f.broker.start();await Promise.all([start,entered.wait]);
+  try{
+    const status:any=await f.broker.dispatch('status',{actor:{host:'claude',sessionId:'c',callId:'normal-restart'}});
+    assert.ok(status.startupRoutes.some((route:any)=>route.memberId===f.x.id&&route.phase==='completion_pending'));
+    assert.equal(status.startupRoutes.some((route:any)=>route.phase==='pending'),false);
+    const saved:any=await f.broker.dispatch('send',{actor:{host:'claude',sessionId:'c',callId:'normal-start-send'},message:'正常重启期间排队'});
+    await f.broker.pump();await f.broker.reconcile();
+    assert.equal(f.store.message(saved.message_id).attempts,1);assert.equal(f.store.message(old.id).state,'contextObserved');
+    assert.equal(f.broker.turnEnds.startupStatus().length,1);
+    const parked=await f.broker.sealForHandoff({updateId:'completion-still-checking',signal:new AbortController().signal,commit:()=>{}});parked.close();
+  }finally{resume.open();await start;}
+});
+
+test('补证连续失败在硬期限前保持排队，降级后仍取通知、检查静默并处理原生完成，稍后成功才解除完成门禁',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:1000000});
+  const f=fixture(t),b=f.broker as unknown as {startupRoutes:StartupRoutes;runtimeHealth:BrokerHealthCoordinator;catchUpOwnedRoutes(ids:Iterable<string>):Promise<void>};
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'busy'});f.store.updatePeer(f.c.id,{state:'ready'});
+  b.startupRoutes.close();b.startupRoutes=new StartupRoutes(()=>{},250);b.startupRoutes.begin([f.x.id]);
+  let reconciles=0;
+  const probe=t.mock.method(b.runtimeHealth,'probeTurnHealth',async()=>{throw Error('原生读取暂时失败');});
+  const old=f.store.accept(f.pair,f.c,'尚待核对的旧回执','failed-probe-receipt');f.store.claim(old.id);f.store.recover();
+  f.codex.reconcile=async()=>{reconciles++;return[];};
+  const availability=t.mock.method(b.runtimeHealth,'deliveryAvailability',async()=>({state:'reachable' as const,reasons:[],checked_at:Date.now()}));
+  f.broker.deliveryHealth.enqueue(f.pair.id,f.c.id,{id:'stored-notice',message:'已保存的独立提醒',state:'pending',wake:false});
+  const actor={host:'claude' as const,sessionId:'c',callId:'degraded-notices'};
+  await b.catchUpOwnedRoutes([f.x.id]);t.mock.timers.tick(5001);await b.catchUpOwnedRoutes([f.x.id]);
+  assert.equal(reconciles,2,'健康探针失败不应跳过消息回执补证');assert.equal(b.startupRoutes.blocked(f.x.id),true);
+  assert.deepEqual(await b.runtimeHealth.prepareNotices(actor,undefined,false),[]);
+  await b.runtimeHealth.checkTurnHealth();await b.runtimeHealth.checkDeliveryHealth();
+  assert.equal(probe.mock.callCount(),2);assert.equal(availability.mock.callCount(),0);
+  await delay(300);assert.equal(b.startupRoutes.status()[0]?.phase,'degraded');
+  assert.ok((await b.runtimeHealth.prepareNotices(actor,undefined,false)).some(notice=>notice.id==='stored-notice'));
+  t.mock.timers.tick(30001);await b.runtimeHealth.checkTurnHealth();await b.runtimeHealth.checkDeliveryHealth();
+  assert.equal(probe.mock.callCount(),3,'降级仍检查原生任务是否静默');assert.ok(availability.mock.callCount()>=3);
+  assert.equal(b.startupRoutes.incomplete(f.x.id),true);
+  f.store.updatePeer(f.x.id,{state:'needsHuman'});
+  f.codex.emit('native',{address:f.store.endpoint(f.x.id)!.address,message:{method:'turn/completed',params:{threadId:f.x.sessionId,turn:{id:'after-ceiling',status:'completed'}}}});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(f.store.peer(f.x.id).state,'ready','降级期间的原生业务回调仍应执行');
+  probe.mock.restore();t.mock.timers.tick(5001);await b.catchUpOwnedRoutes([f.x.id]);
+  assert.deepEqual(b.startupRoutes.status(),[]);
+});
+
+for(const died of [false,true])test(died?'交接后运行时已退出的路由仍允许普通恢复，新订阅出现后补证解除栅栏':'交接路由的订阅暂缺时允许普通恢复，订阅稍后出现时由周期消息泵重试补证',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:1000000});
+  const f=fixture(t),b=f.broker as unknown as {startupRoutes:StartupRoutes;startupCatchups:Map<string,unknown>;memberLifecycle:BrokerLifecycleCoordinator};
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'ready'});
+  if(died)f.store.saveEndpoint({...f.store.endpoint(f.x.id)!,native:{pid:2147483647,procStart:'died-during-downtime'}});
+  f.codex.promoted=[f.x.id];
+  let subscribed=false;
+  t.mock.method(f.codex,'hasSubscription',()=>subscribed);
+  await f.broker.start({offers:[],signal:new AbortController().signal,verify:async()=>false,resolve:async()=>{}});assert.equal(b.startupRoutes.blocked(f.x.id),true);
+  const recover=t.mock.method(b.memberLifecycle as unknown as {recoverPairedPeer(id:string,pending:boolean):Promise<boolean>},'recoverPairedPeer',async()=>true);
+  await b.memberLifecycle.schedulePairedRecovery(f.x.id,false);assert.ok(recover.mock.callCount()>0);
+                                         
+  await f.broker.pump();
+  if(died)f.store.saveEndpoint({...f.store.endpoint(f.x.id)!,native:{pid:process.pid,procStart:'recovered-native-generation'}});
+  subscribed=true;t.mock.timers.tick(5001);await f.broker.pump();
+  for(let i=0;i<20&&b.startupCatchups.size;i++)await delay(10);
+  assert.deepEqual(b.startupRoutes.status(),[]);
+  assert.equal(f.codex.created.length,0);
+});
+
+test('未接上的旧路由沿用普通健康和原生回调，完成检查单独等待且不取得新的写入权限',async t=>{
+  t.mock.timers.enable({apis:['Date'],now:1000000});
+  const f=fixture(t),b=f.broker as unknown as {startupRoutes:StartupRoutes;runtimeHealth:BrokerHealthCoordinator};
+  f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'busy'});f.store.updatePeer(f.c.id,{state:'ready'});
+  f.store.saveEndpoint({...f.store.endpoint(f.x.id)!,runtimeId:undefined});
+  t.mock.method(f.codex,'hasSubscription',()=>false);
+  const endpoint=f.store.endpoint(f.x.id)!;
+  f.store.setSetting('turnEndFact:'+f.x.id,{version:1,pairId:f.pair.id,sessionId:f.x.sessionId,scope:turnNativeScope(f.x,endpoint),state:'completed',turnId:'old-legacy',at:Date.now(),reason:'unverified'});
+  const probe=t.mock.method(b.runtimeHealth,'probeTurnHealth',async()=>undefined);
+  t.mock.method(b.runtimeHealth,'deliveryAvailability',async()=>({state:'reachable' as const,reasons:[],checked_at:Date.now()}));
+  await f.broker.start();await f.broker.pump();
+  assert.equal(b.startupRoutes.blocked(f.x.id),false);assert.equal(b.startupRoutes.incomplete(f.x.id),false);
+  assert.equal(f.broker.turnEnds.startupStatus()[0]?.phase,'completion_pending');
+  b.runtimeHealth.resetTurnCheck();await b.runtimeHealth.checkTurnHealth();assert.ok(probe.mock.callCount()>0);
+  f.broker.deliveryHealth.enqueue(f.pair.id,f.c.id,{id:'legacy-independent',message:'独立健康提醒',state:'pending',wake:false});
+  const notices=await b.runtimeHealth.prepareNotices({host:'claude',sessionId:'c',callId:'legacy-notices'},undefined,false);
+  assert.ok(notices.some(notice=>notice.id==='legacy-independent'));
+  f.store.updatePeer(f.x.id,{state:'needsHuman'});
+  f.codex.emit('native',{address:f.store.endpoint(f.x.id)!.address,message:{method:'turn/completed',params:{threadId:f.x.sessionId,turn:{id:'legacy-end',status:'completed'}}}});
+  await new Promise(resolve=>setImmediate(resolve));assert.equal(f.store.peer(f.x.id).state,'ready');
+  assert.equal(f.codex.created.length,0);assert.equal(f.codex.released.length,0);assert.equal(f.codex.woken.length,0);assert.equal(f.codex.injected.length,0);
+  assert.deepEqual(b.startupRoutes.status(),[]);
+});
+
+test('公开管道创建时屏蔽不兼容参数，创建后恢复且子进程仍看到用户原环境',{skip:process.platform!=='win32'},async t=>{
+  const f=fixture(t),previous=process.env.NODE_PENDING_PIPE_INSTANCES;
+  await ensureHome(f.home);
+  let server:Awaited<ReturnType<typeof listenBroker>>|undefined;
+  try{
+    for(const value of [undefined,'32']){
+      if(value===undefined)delete process.env.NODE_PENDING_PIPE_INSTANCES;else process.env.NODE_PENDING_PIPE_INSTANCES=value;
+      server=await listenBroker(f.home,async()=>({ok:true}));
+      assert.equal(process.env.NODE_PENDING_PIPE_INSTANCES,value);
+      const result=await promisify(execFile)(process.execPath,['-p','JSON.stringify(process.env.NODE_PENDING_PIPE_INSTANCES??null)'],{encoding:'utf8',windowsHide:true});
+      assert.equal(JSON.parse(result.stdout),value??null);
+      await server.close();server=undefined;
+    }
+  }finally{await server?.close();if(previous===undefined)delete process.env.NODE_PENDING_PIPE_INSTANCES;else process.env.NODE_PENDING_PIPE_INSTANCES=previous;}
+});
+
+test('历史补证栅栏到达硬期限后只降级一次，迟到成功会撤下可见恢复状态',async()=>{
+  const degraded:string[]=[],routes=new StartupRoutes(id=>{degraded.push(id);},20);
+  try{
+    routes.begin(['slow']);assert.equal(routes.blocked('slow'),true);
+    await delay(35);assert.equal(routes.blocked('slow'),false);assert.equal(routes.status()[0]?.phase,'degraded');assert.deepEqual(degraded,['slow']);
+    routes.fail('slow');assert.deepEqual(degraded,['slow']);routes.finish('slow');assert.deepEqual(routes.status(),[]);
+  }finally{routes.close();}
 });

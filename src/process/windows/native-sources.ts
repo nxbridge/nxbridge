@@ -221,7 +221,9 @@ public static class NxHookIdentity {
     long created,exited,kernel,user;
     if(WaitForSingleObject(handle,0)==0){rows.Add("{\\"pid\\":"+pid+",\\"missing\\":true}");continue;}
     if(!GetProcessTimes(handle,out created,out exited,out kernel,out user))continue;
-    if(WaitForSingleObject(handle,0)!=258){rows.Add("{\\"pid\\":"+pid+",\\"missing\\":true}");continue;}
+    uint state=WaitForSingleObject(handle,0);
+    if(state==0){rows.Add("{\\"pid\\":"+pid+",\\"missing\\":true}");continue;}
+    if(state!=258)continue;
     rows.Add("{\\"pid\\":"+pid+",\\"generation\\":"+Json(created.ToString())+",\\"ticks\\":"+Json(DateTime.FromFileTimeUtc(created).Ticks.ToString())+"}");
    }finally{CloseHandle(handle);}
   }
@@ -305,9 +307,36 @@ public static class NxHookIdentity {
    Console.Write("["+String.Join(",",result.ToArray())+"]");return 0;
   }finally{if(rows!=null)foreach(HeldProcess row in rows)CloseHandle(row.handle);CloseHandle(job);}
  }
+ [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(int id);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern bool WriteFile(IntPtr handle,IntPtr bytes,uint count,out uint written,IntPtr overlapped);
  public static int Main(string[] args) {
   if(args.Length>0&&args[0]=="run")return NxOwnedCommand.Run(args);
   Console.InputEncoding=new UTF8Encoding(false);Console.OutputEncoding=new UTF8Encoding(false);
+  if(args.Length>=2&&args[0]=="read-result"){
+   if(args[1]!="probe"&&args[1]!="ancestors"&&args[1]!="process"&&args[1]!="job-members"
+    &&args[1]!="codex"&&args[1]!="claude"&&args[1]!="codex-hook"&&args[1]!="claude-hook")return 1;
+   TextWriter originalOutput=Console.Out;
+   using(StringWriter result=new StringWriter()){
+    int code;Console.SetOut(result);
+    try{code=Execute(new List<string>(args).GetRange(1,args.Length-1).ToArray());}finally{Console.SetOut(originalOutput);}
+    if(code!=0)return code;
+                                           
+    try{
+     byte[] bytes=new UTF8Encoding(false).GetBytes(result.ToString()+"\\nNXBRIDGE_READ_COMPLETE\\n");
+     if(bytes.Length>16*1024*1024)throw new IOException("native process snapshot too large");
+     IntPtr stdout=GetStdHandle(-11);GCHandle pinned=GCHandle.Alloc(bytes,GCHandleType.Pinned);
+     try{
+      for(int offset=0;offset<bytes.Length;){
+       uint written,count=(uint)Math.Min(bytes.Length-offset,32768);
+       if(!WriteFile(stdout,IntPtr.Add(pinned.AddrOfPinnedObject(),offset),count,out written,IntPtr.Zero)||written==0||written>count)
+        throw new IOException("native process snapshot write incomplete");
+       offset+=(int)written;
+      }
+     }finally{pinned.Free();}
+    }catch(Exception error){Console.Error.WriteLine(error.Message);return 1;}
+    return 0;
+   }
+  }
   if(args.Length!=1||args[0]!="serve")return Execute(args);
                                             
   TextWriter output=Console.Out,errors=Console.Error;string line;

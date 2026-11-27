@@ -1,5 +1,6 @@
 import { statSync, type BigIntStats } from 'node:fs';
 import { open, type FileHandle } from 'node:fs/promises';
+import {setImmediate as yieldToIo} from 'node:timers/promises';
 import { codexChildResult, codexQueuedAgentMetadata } from './codex-subagent-read.js';
 
 interface Final {itemId:string;text:string;at:number}
@@ -15,6 +16,7 @@ export interface CodexCompletedTurn {
 export interface CodexTurnEvidence {
   status:'supported'|'unsupported'|'unavailable';caughtUp:boolean;turns:CodexCompletedTurn[];
   latestTurnId?:string;openTurnId?:string;bytesRead:number;
+  latestTurnEnd?:{turnId:string;state:'completed'|'failed';completedAt:number};
 }
 
 interface ActiveTurn extends Omit<CodexCompletedTurn,'completedAt'> {
@@ -27,6 +29,7 @@ interface Cursor {
   stat:BigIntStats;offset:number;tail:Buffer;skipping:boolean;
   idleBoundary:boolean;queuedAgentMetadata:boolean;lastCompletedAt?:number;latestTurnId?:string;
   active?:ActiveTurn;turns:CodexCompletedTurn[];
+  latestTurnEnd?:CodexTurnEvidence['latestTurnEnd'];
   offeredCall?:{id:string;sequence:number};offeredInjection?:Injection;
 }
 
@@ -50,6 +53,7 @@ function resetEvidence(cursor:Cursor):void{
   cursor.queuedAgentMetadata=false;
   cursor.active=cursor.offeredCall=cursor.offeredInjection=undefined;
   cursor.latestTurnId=cursor.lastCompletedAt=undefined;
+  cursor.latestTurnEnd=undefined;
   cursor.turns=[];
 }
 
@@ -62,6 +66,7 @@ function start(cursor:Cursor,p:any,at:number):void{
   }
   const attribution=p.turn_attribution?.turn_id===p.turn_id?p.turn_attribution:undefined;
   cursor.latestTurnId=p.turn_id;
+  cursor.latestTurnEnd=undefined;
   cursor.active={turnId:p.turn_id,startedAt:at,userInputs:[],pendingUserInputs:0,calls:new Map(),sawModel:false,
     ...(id(attribution?.turn_trigger)?{trigger:attribution.turn_trigger}:{}),
     ...(id(attribution?.parent_turn_id)?{parentTurnId:attribution.parent_turn_id}:{}),
@@ -75,11 +80,13 @@ function complete(cursor:Cursor,p:any,at:number):void{
   if(!id(p.turn_id))return resetEvidence(cursor);
   if(turn&&turn.turnId!==p.turn_id)return resetEvidence(cursor);
   cursor.latestTurnId=p.turn_id;
+  const failed=p.error!=null||p.status!=null&&p.status!=='completed';
+  cursor.latestTurnEnd=!turn||at>=turn.startedAt?{turnId:p.turn_id,state:failed?'failed':'completed',completedAt:at}:undefined;
   cursor.active=undefined;
   cursor.idleBoundary=true;
   cursor.lastCompletedAt=at;
   cursor.offeredCall=cursor.offeredInjection=undefined;
-  if(!turn||p.error!=null||p.status!=null&&p.status!=='completed'||at<turn.startedAt)return;
+  if(!turn||failed||at<turn.startedAt)return;
   const {turnId,startedAt,userInputs,trigger,parentTurnId,lastWorkAt,sampledInjection,childTurnIds,pendingUserInputs}=turn;
   const answer=turn.answer;
   const final=answer?.text&&answer.at<=at?{itemId:answer.itemId,text:answer.text,at:answer.at}:undefined;
@@ -219,7 +226,7 @@ function accept(cursor:Cursor,line:Buffer,sessionId:string):void{
 const empty=(status:CodexTurnEvidence['status']):CodexTurnEvidence=>({status,caughtUp:false,turns:[],bytesRead:0});
 
                                            
-export async function readCodexTurnEvidence(file:unknown,sessionId:string):Promise<CodexTurnEvidence>{
+export async function readCodexTurnEvidence(file:unknown,sessionId:string,maxBytes=SCAN_BYTES):Promise<CodexTurnEvidence>{
   if(!id(file)||!id(sessionId))return empty('unavailable');
   const fd=await open(file,'r').catch(()=>undefined);if(!fd)return empty('unavailable');
   const stat=await fd.stat({bigint:true}).catch(()=>undefined);
@@ -229,12 +236,22 @@ export async function readCodexTurnEvidence(file:unknown,sessionId:string):Promi
     await fd.close();
     if(sameVersion(running.stat,stat))return running.work;
     await running.work;
-    return readCodexTurnEvidence(file,sessionId);
+    return readCodexTurnEvidence(file,sessionId,maxBytes);
   }
-  const work=read(file,sessionId,key,fd,stat).finally(()=>pending.delete(key));pending.set(key,{stat,work});return work;
+  const work=read(file,sessionId,key,fd,stat,maxBytes).finally(()=>pending.delete(key));pending.set(key,{stat,work});return work;
 }
 
-async function read(file:string,sessionId:string,key:string,fd:FileHandle,stat:BigIntStats):Promise<CodexTurnEvidence>{
+                                                  
+export async function catchUpCodexTurnEvidence(file:unknown,sessionId:string,current?:()=>boolean):Promise<CodexTurnEvidence>{
+  let result=await readCodexTurnEvidence(file,sessionId),bytes=result.bytesRead;
+  while(result.status==='supported'&&!result.caughtUp&&result.bytesRead&&bytes<SCAN_BYTES&&current?.()!==false){
+    await yieldToIo();if(current?.()===false)break;
+    result=await readCodexTurnEvidence(file,sessionId,SCAN_BYTES-bytes);bytes+=result.bytesRead;
+  }
+  return{...result,bytesRead:bytes};
+}
+
+async function read(file:string,sessionId:string,key:string,fd:FileHandle,stat:BigIntStats,maxBytes:number):Promise<CodexTurnEvidence>{
   try{
     const size=Number(stat.size);let cursor=cursors.get(key);
     if(!Number.isSafeInteger(size))return empty('unavailable');
@@ -248,7 +265,7 @@ async function read(file:string,sessionId:string,key:string,fd:FileHandle,stat:B
     }
     cursors.delete(key);cursors.set(key,cursor);
     if(cursors.size>16)cursors.delete(cursors.keys().next().value!);
-    const from=cursor.offset,limit=Math.min(size,from+SCAN_BYTES),started=performance.now();
+    const from=cursor.offset,limit=Math.min(size,from+maxBytes),started=performance.now();
     while(cursor.offset<limit){
       const buffer=Buffer.allocUnsafe(Math.min(CHUNK,limit-cursor.offset)),{bytesRead}=await fd.read(buffer,0,buffer.length,cursor.offset);
       if(!bytesRead)break;
@@ -274,7 +291,7 @@ async function read(file:string,sessionId:string,key:string,fd:FileHandle,stat:B
     }
     cursor.stat=stat;
     const caughtUp=cursor.offset===size&&!cursor.tail.length&&!cursor.skipping&&current.size===stat.size;
-    return{status:'supported',caughtUp,latestTurnId:cursor.latestTurnId,openTurnId:cursor.active?.turnId,turns:[...cursor.turns],bytesRead:cursor.offset-from};
+    return{status:'supported',caughtUp,latestTurnId:cursor.latestTurnId,latestTurnEnd:cursor.latestTurnEnd,openTurnId:cursor.active?.turnId,turns:[...cursor.turns],bytesRead:cursor.offset-from};
   }catch{cursors.delete(key);return empty('unavailable');}
   finally{if(fd.fd!==-1)await fd.close();}
 }

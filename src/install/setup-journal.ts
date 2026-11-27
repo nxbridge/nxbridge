@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { atomicWriteFile, atomicWriteText, retryWindowsFileOperation } from '../storage/atomic-file.js';
 import {stateDirectory} from '../storage/state-directory.js';
 import { managedMarker, inside, ownsFile, cacheBelongsTo, type ManagedFile } from './installation.js';
-import { fileHashes, type InstallReceipt } from './runtime-install.js';
+import { pluginFileHashes, type InstallReceipt } from './runtime-install.js';
 import { processIdentity, liveProcess } from '../process/process.js';
 import {BridgeError} from '../shared/errors.js';
 import type { DatabaseSync } from 'node:sqlite';
@@ -40,8 +40,8 @@ function safeTree(scope:string,file:string):void{
   if(!same(base,actual)&&!inside(base,actual))conflict([file],'恢复路径实际指向记录目录之外');
 }
 
-function snapshot(directory:string,contents?:Map<string,Buffer>):Record<string,string>{
-  try{return fileHashes(directory,[],contents);}catch(error){conflict([directory],`无法核验插件目录，请先恢复该目录：${error instanceof Error?error.message:String(error)}`);}
+function snapshot(directory:string,host:'codex'|'claude',contents?:Map<string,Buffer>):Record<string,string>{
+  try{return pluginFileHashes(directory,host,contents);}catch(error){conflict([directory],`无法核验插件目录，请先恢复该目录：${error instanceof Error?error.message:String(error)}`);}
 }
 
 function cacheChanges(intent:CacheIntent,current:Record<string,string>):string[]{
@@ -67,11 +67,13 @@ function apply(home:string,intent:Intent,checkpoint:Checkpoint=()=>{},cached?:Ca
       checkpoint(intent.label+':write:'+index);
     }
   }else{
+                                               
+    if(intent.host==='claude'){delete intent.before['.orphaned_at'];delete intent.after['.orphaned_at'];}
     if(!cached){
       safeTree(home,intent.source);safeTree(intent.hostHome,intent.target);
       const contents=new Map<string,Buffer>();
-      if(!existsSync(intent.source)||!isDeepStrictEqual(snapshot(intent.source,contents),intent.after))conflict([intent.source],'插件恢复来源缺失或已改变，请恢复该目录后重试');
-      cached={current:existsSync(intent.target)?snapshot(intent.target):{},contents};
+      if(!existsSync(intent.source)||!isDeepStrictEqual(snapshot(intent.source,intent.host,contents),intent.after))conflict([intent.source],'插件恢复来源缺失或已改变，请恢复该目录后重试');
+      cached={current:existsSync(intent.target)?snapshot(intent.target,intent.host):{},contents};
     }
     const changed=cacheChanges(intent,cached.current);if(changed.length)conflict(changed.map(file=>path.join(intent.target,file)));
                                                
@@ -143,6 +145,6 @@ export async function commitCache(home:string,host:'codex'|'claude',hostHome:str
   if(!cacheBelongsTo(target,host,home))throw new BridgeError('cache_conflict',`${target} 无法核验为 ${home} 这套 nxbridge 安装的自有缓存，未覆盖。请确认当前 NXBRIDGE_HOME 与 ${host} 配置目录是否配套；若缓存属于另一套安装，请使用那套安装维护，或让不同安装使用独立的 ${host} 配置目录后重新执行 setup。`);
   safeTree(home,source);safeTree(hostHome,target);
                                               
-  const contents=new Map<string,Buffer>(),before=snapshot(target),after=snapshot(source,contents);
+  const contents=new Map<string,Buffer>(),before=snapshot(target,host),after=snapshot(source,host,contents);
   commit(home,{kind:'cache',label:'cache:'+host,host,hostHome,source,target,before,after},{pid:writer.pid,startedAt:writer.startedAt},checkpoint,{current:before,contents});
 }

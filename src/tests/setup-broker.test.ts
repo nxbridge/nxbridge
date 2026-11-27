@@ -11,6 +11,42 @@ import {temporary} from './support/temporary.js';
 const candidate={owner:'nxbridge-publish-v1' as const,buildId:'0.1.1-123456789abc',version:'0.1.1',files:{[CUSTODY_MANIFEST_ENTRY]:'fixture'},dependencies:{}};
 const old={pid:2147483646,runtime:{generation:'old',buildId:'0.1.1-2441d4ab28d8'}};
 const {DatabaseSync}=createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+
+for(const changed of [false,true])test(changed?'接班待结算期间换代不能采用另一协调器的结果':'IPC 已服务时只轮询同代接班结果，未结算的计数不能提前报告',async t=>{
+  const home=temporary(t);let reads=0,launches=0;
+  const next={pid:process.pid,runtime:{generation:'successor',buildId:candidate.buildId}};
+  const broker=(async(method,_params,options)=>{
+    assert.equal(method,'ping');
+    if(options?.reserved){
+      launches++;return{...next,handoff:{protocol:CUSTODY_PROTOCOL,used:true,transferred:0,held:2,pending:true}};
+    }
+    assert.equal(options?.start,false);
+    if(reads++===0)throw Object.assign(Error('尚未运行'),{code:'ENOENT'});
+    return{...next,runtime:{...next.runtime,generation:changed?'other-generation':'successor'},
+      handoff:{protocol:CUSTODY_PROTOCOL,used:true,transferred:2,held:0}};
+  }) as typeof brokerCall;
+  const result=await updateBroker(home,candidate,broker);
+  assert.equal(launches,1);assert.equal(result.restarted,!changed);
+  if(changed)assert.equal((result.error as BridgeError).code,'broker_changed');
+  else assert.deepEqual(result.handoff,{supported:true,used:true,transferred:2,held:0});
+});
+
+test('已开始服务但接班结果一直未结算时沿用固定预算，不再次启动或无限等待',async t=>{
+  const home=temporary(t),clock=performance.now.bind(performance);let calls=0,offset=0,launches=0;
+  t.mock.method(performance,'now',()=>clock()+offset);
+  const broker=(async(_method,_params,options)=>{
+    if(options?.reserved)launches++;
+    else if(calls++===0)throw Object.assign(Error('尚未运行'),{code:'ENOENT'});
+                                
+    offset+=60000;
+    return{pid:process.pid,runtime:{generation:'successor',buildId:candidate.buildId},
+      handoff:{protocol:CUSTODY_PROTOCOL,used:true,transferred:0,held:2,pending:true}};
+  }) as typeof brokerCall;
+  const result=await updateBroker(home,candidate,broker);
+  assert.equal(launches,1);assert.equal(result.restarted,false);assert.equal((result.error as BridgeError).code,'timeout');
+  assert.equal(result.handoff.transferred,0);
+});
+
 function oldQuestions(home:string,expiry:number){
   const db=new DatabaseSync(path.join(home,'nxbridge.db'));
   db.exec("CREATE TABLE questions(status TEXT, expires_at INTEGER); WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<101) INSERT INTO questions SELECT 'expired',0 FROM rows");

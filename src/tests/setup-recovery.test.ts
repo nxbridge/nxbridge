@@ -8,7 +8,7 @@ import { preparePlugins, setup, uninstall } from '../install/setup.js';
 import {atomicJson,readJson} from '../shared/files.js';
 import {PACKAGE_ROOT} from '../shared/package-location.js';
 import {loadConfig} from '../config/load.js';
-import { activeRuntime, fileHashes } from '../install/runtime-install.js';
+import { activeRuntime, fileHashes, inspectRuntime } from '../install/runtime-install.js';
 import { registration } from './support/registration.js';
 import { Store } from '../storage/store.js';
 
@@ -21,6 +21,35 @@ async function recoveryRelease(directory:string,filename='nxbridge-collaboration
   manifest.buildId=manifest.version+'-'+createHash('sha256').update(JSON.stringify({files:manifest.files,dependencies:manifest.dependencies})).digest('hex').slice(0,12);atomicJson(path.join(source,'publish.json'),manifest);
   return{source,buildId:manifest.buildId};
 }
+
+test('Claude 原生 GC 标记不属于插件载荷，重复更新保留标记且仍报告实际载荷漂移',async t=>{
+  const f=fixture(t);await setup({home:f.home},f.services);
+  const state=readJson<any>(path.join(f.home,'setup-state.json'));
+  const cache=state.cacheDirectories.find((value:any)=>value.host==='claude').directory;
+  const marker=path.join(cache,'.orphaned_at');writeFileSync(marker,'原生 GC 时间戳','utf8');
+  assert.deepEqual(inspectRuntime(f.home).drift,[]);
+  const updated:any=await setup({home:f.home},f.services);
+  assert.equal(updated.reloadRequired.claude,false);assert.equal(readFileSync(marker,'utf8'),'原生 GC 时间戳');
+  assert.deepEqual(inspectRuntime(f.home).drift,[]);
+  const payload=path.join(cache,'bridge.cjs');writeFileSync(payload,readFileSync(payload,'utf8')+'\n// 手工改动\n','utf8');
+  assert.ok((inspectRuntime(f.home).drift as string[]).includes(payload));
+});
+
+test('旧版缓存恢复意图不再覆盖或删除 Claude 在中断后更新的 GC 标记',async t=>{
+  const f=fixture(t);await setup({home:f.home},f.services);
+  const state=readJson<any>(path.join(f.home,'setup-state.json'));
+  const cache=state.cacheDirectories.find((value:any)=>value.host==='claude').directory,marker=path.join(cache,'.orphaned_at');
+  writeFileSync(marker,'中断前的标记','utf8');
+  const release=await recoveryRelease(f.directory,'mod-entry.mjs');
+  await assert.rejects(setup({home:f.home,from:release.source},{...f.services,checkpoint:step=>{
+    if(step!=='cache:claude:intent')return;
+    const pending=path.join(f.home,'setup-pending.json'),intent=readJson<any>(pending);
+    intent.before['.orphaned_at']=fileHashes(cache)['.orphaned_at'];atomicJson(pending,intent);
+    writeFileSync(marker,'中断后原生 GC 更新的标记','utf8');throw Error('隔离 GC 标记恢复');
+  }}),/隔离 GC 标记恢复/);
+  await setup({home:f.home,from:release.source},f.services);
+  assert.equal(readFileSync(marker,'utf8'),'中断后原生 GC 更新的标记');assert.deepEqual(inspectRuntime(f.home).drift,[]);
+});
 
                                          
 for(const [entry,required] of [['mcp-entry.mjs',{claude:true,codex:true}],['mod-entry.mjs',{claude:true,codex:false}],['vendor-core.mjs',{claude:true,codex:true}],['runtime-native-source.mjs',{claude:true,codex:true}]] as const){

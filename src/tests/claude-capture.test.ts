@@ -40,7 +40,8 @@ async function fixture(t:TestContext){
 function identityQueries(t:TestContext,pid:number){
   const prototype=ChildProcess.prototype as unknown as {spawn:(options:any)=>unknown},original=prototype.spawn,count={value:0};
   t.mock.method(prototype,'spawn',function(this:ChildProcess,options:any){
-    if(options.args?.[1]==='ancestors'&&options.args[2]===String(pid)&&options.args[3]==='1')count.value++;
+                                                 
+    if(options.args?.[1]==='read-result'&&options.args[2]==='ancestors'&&options.args[3]===String(pid)&&options.args[4]==='1')count.value++;
     return Reflect.apply(original,this,[options]);
   });
   return count;

@@ -820,7 +820,11 @@ export function register(on) {
   on('agent.spawn', async ($, e, next) => {
     const context=await captureContext($);
     const expanded=e.prompt.includes('nxref:')?await call($,'ref-expand',{text:e.prompt,context}):undefined;
-    const result=await next(expanded?{...e,prompt:expanded.text}:e);
+    const changed=expanded&&expanded.text!==e.prompt;
+                                                    
+                                               
+    if(changed&&e.resume!==undefined)return{deny:'nxref is not expanded when continuing an existing subagent; resend with the needed text inline'};
+    const result=await next(changed?{...e,prompt:expanded.text}:e);
                                               
     if(result?.agentId){
       agentContexts.delete(result.agentId);agentContexts.set(result.agentId,context);

@@ -5,7 +5,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpat
 import path from 'node:path';
 import {atomicJson,readJson,sameDirectory} from '../shared/files.js';
 import {CLI_PATH,PACKAGE_ROOT} from '../shared/package-location.js';
-import { inside, managedMarker } from './installation.js';
+import { cacheBelongsTo, inside, managedMarker } from './installation.js';
 import { liveProcess, processIdentity } from '../process/process.js';
 import {BridgeError} from '../shared/errors.js';
 import { resolveNodeRuntime } from './node-runtime.js';
@@ -47,6 +47,10 @@ export function fileHashes(root:string,ignore:string[]=[],contents?:Map<string,B
     }
   };
   walk(root,'');return files;
+}
+                                                    
+export function pluginFileHashes(root:string,host:'codex'|'claude',contents?:Map<string,Buffer>):Record<string,string>{
+  return fileHashes(root,host==='claude'?['.orphaned_at']:[],contents);
 }
 export function runtimeManifest(root=PACKAGE_ROOT):RuntimeManifest|undefined{
   try{const value=readJson<RuntimeManifest>(path.join(root,'publish.json'));return value.owner===OWNER&&typeof value.buildId==='string'&&typeof value.version==='string'&&!!value.files?value:undefined;}catch{return;}
@@ -148,8 +152,13 @@ export function inspectRuntime(home:string):Record<string,unknown>{
   if(existsSync(receiptFile))try{
     const receipt=readJson<InstallReceipt>(receiptFile);
     if(receipt.owner===managedMarker(home))for(const root of receipt.roots){
-      const actual=existsSync(root.directory)?fileHashes(root.directory):{};
-      for(const file of new Set([...Object.keys(root.files),...Object.keys(actual)]))if(actual[file]!==root.files[file])drift.push(path.join(root.directory,file));
+                                                      
+      const claudeCache=cacheBelongsTo(root.directory,'claude',home);
+      const actual=existsSync(root.directory)?claudeCache?pluginFileHashes(root.directory,'claude'):fileHashes(root.directory):{};
+      for(const file of new Set([...Object.keys(root.files),...Object.keys(actual)])){
+        if(claudeCache&&file==='.orphaned_at')continue;
+        if(actual[file]!==root.files[file])drift.push(path.join(root.directory,file));
+      }
     }
   }catch(error){drift.push(String(error));}
   return{independent:true,buildId:pointer.buildId,entry:pointer.entry,source:pointer.source,previous:pointer.previous??null,drift,liveLoading:'磁盘上的文件和正在运行的 broker 分别核对版本；已打开的 MCP 连接和 Codex 会话是否已加载新版，需要各自确认。'};

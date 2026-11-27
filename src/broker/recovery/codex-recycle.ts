@@ -28,7 +28,11 @@ export interface CodexRecycleDecision {
   revision:string; facts:string; work:CodexRecycleWork; since:number; noticeId:string; autoEligible:boolean; noticePosted?:true;
 }
 export interface CodexRecycleAcceptance { incidentId:string; evidenceRevision:string; reason:string; by?:'partner'|'user' }
-interface ObservationGap { since:number; attempts:number; reason:string; exhausted?:true; lapsedRevision?:string }
+interface ObservationGap {
+  since:number; attempts:number; reason:string; exhausted?:true; lapsedRevision?:string;
+                                         
+  publication?:Omit<CodexRecycleBasis,'acceptance'>;
+}
 interface Stage { step:string; trigger:CodexRecycleTrigger; observationGap?:ObservationGap }
 export interface CodexRecycleBasis { old:CodexRecycleGeneration; profile:CodexRecycleProfileRef; decision:CodexRecycleDecision; acceptance?:CodexRecycleAcceptance }
 type Basis=CodexRecycleBasis;
@@ -125,7 +129,7 @@ function decisionFacts(evidence:Available,progressGate:boolean):string {
   const {work,old,profile}=evidence;
   return JSON.stringify([
     old.runtimeId,old.endpoint,old.pid,old.procStart,old.bootId,profile.sourceId,profile.sessionId,profile.file,profile.settingsKey,
-    uniqueSorted(work.activeTurnIds),work.progress==='stalled',uniqueSorted(work.roles),uniqueSorted(work.unresolved),progressGate,
+    uniqueSorted(work.activeTurnIds),work.progress,uniqueSorted(work.roles),uniqueSorted(work.unresolved),progressGate,
   ]);
 }
 function heldError(error:unknown):{code:string;reason:string} {
@@ -135,7 +139,7 @@ export function recycleEvidenceReadFailure(source:string,error:unknown):Extract<
   return {kind:'held',code:error instanceof BridgeError?error.code:recycleEvidenceHeldCode,
     reason:(error instanceof BridgeError?describeError(error):evidenceUnverifiedReason(source,describeError(error))).slice(0,1200)};
 }
-export const isCodexRecycleTransientObservation=(code:string)=>['timeout','rpc_backpressure','disconnected','restart_profile_pending_tail'].includes(code);
+export const isCodexRecycleTransientObservation=(code:string)=>['timeout','rpc_backpressure','disconnected','restart_profile_pending_tail','process_census_incomplete'].includes(code);
 
 export class CodexRecycle {
   private operations=new Map<string,{id:string; work:Promise<CodexRecycleResult>}>();
@@ -208,8 +212,10 @@ export class CodexRecycle {
     };
     const observeAgain=(basis?:Basis,retrySample?:string,observationGap=basis?.acceptance?gap:undefined)=>commit(stopFailed?
       {...stopFailed,basis:basis??(stopFailed.basis&&{...stopFailed.basis,acceptance:undefined}),retrySample}:{phase:'observing',basis,retrySample},undefined,observationGap);
-    const lapseObservation=({since,attempts,reason,lapsedRevision}:ObservationGap,basis?:Basis)=>{
-      const exhausted:ObservationGap={since,attempts,reason,exhausted:true,lapsedRevision:lapsedRevision??basis?.acceptance?.evidenceRevision};
+    const lapseObservation=({since,attempts,reason,lapsedRevision,publication}:ObservationGap,basis?:Basis)=>{
+      const expired=lapsedRevision??basis?.acceptance?.evidenceRevision;
+      const published=!expired&&(basis?.decision.noticePosted?{old:basis.old,profile:basis.profile,decision:basis.decision}:publication);
+      const exhausted:ObservationGap={since,attempts,reason,exhausted:true,lapsedRevision:expired,...(published?{publication:published}:{})};
       const revision=exhausted.lapsedRevision;
       const notify=revision&&!lapsedRevision?(current:ManagedIncident)=>ports.acceptanceLapsed?.(current,revision):undefined;
       if(stopFailed){
@@ -259,8 +265,8 @@ export class CodexRecycle {
       if(stage){
         trigger=operation!.trigger;
       }else{
-        const awaiting=operation?.phase==='awaiting_partner'||operation?.phase==='preflight'||operation?.phase==='observing'?operation.basis:
-          operation?.phase==='held'?operation.basis:undefined;
+        const awaiting:Basis|undefined=operation?.phase==='awaiting_partner'||operation?.phase==='preflight'||operation?.phase==='observing'?operation.basis:
+          operation?.phase==='held'?operation.basis??operation.observationGap?.publication:undefined;
         const acceptedHere=acceptance&&awaiting&&(operation?.phase==='awaiting_partner'||operation?.phase==='held'&&operation.code==='codex_recycle_stop_deadline'&&!operation.retryPending||
           operation?.phase==='held'&&operation.code==='codex_recycle_partner_unreachable'&&acceptance.by==='user')&&
           acceptance.incidentId===incident.id&&acceptance.evidenceRevision===awaiting.decision.revision;

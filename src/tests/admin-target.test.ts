@@ -19,4 +19,7 @@ test('多组管理拒绝默认及未知目标，原生窗口和显式选择只�
   assert.equal((await broker.dispatch('codex.restart.target',{pair_id:p1.id}) as any).peer_id,x.id);
   await broker.dispatch('unpair',{session_id:'other-x'});assert.equal(store.pairFor(c2.id),undefined);assert.equal(store.pairFor(c.id)?.id,p1.id);
   assert.ok(formatGlobalStatus(broker.status()).includes('配对 1'));assert.equal(store.pairById(p2.id)?.archived,true);
+  const status:any=broker.status();
+  status.capabilities.startupRoutes=[{memberId:x.id,reason:'核对会话记录超时，仍在后台继续。'}];
+  assert.ok(formatGlobalStatus(status).includes('会话核对：「'+x.name+'」核对会话记录超时，仍在后台继续。'));
 });

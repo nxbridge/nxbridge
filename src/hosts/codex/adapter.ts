@@ -326,8 +326,8 @@ export class CodexAdapter extends EventEmitter {
     this.clients.clear();this.attached.clear();this.nativeStates.clear();this.subscriptionOwners.clear();this.ownedRoutes.clear();
     return parkCodexGroups(parked,rpc=>{rpc.close();codexTransports.get(rpc)?.terminate();});
   }
-  async acquireHandoff(custody:CustodyAcquisition){
-    return acquireCodexGroups(custody,offers=>this.openHandoffGroup(offers,custody.signal));
+  async acquireHandoff(custody:CustodyAcquisition,measure?:<T>(stage:string,work:()=>Promise<T>,memberId?:string)=>Promise<T>){
+    return acquireCodexGroups(custody,(offers,signal)=>this.openHandoffGroup(offers,signal),measure);
   }
   private async openHandoffGroup(offers:readonly CustodyOffer[],signal:AbortSignal):Promise<ProvisionalCodexGroup>{
     const first=offers[0]!,address=first.address;

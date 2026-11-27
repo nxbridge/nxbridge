@@ -1,4 +1,5 @@
 import { createReadStream, fstatSync, statSync, openSync, read as readAt, readSync, closeSync, type BigIntStats } from 'node:fs';
+import {setImmediate as yieldToIo} from 'node:timers/promises';
 
 export interface HistoryReceipt {messageId:string;turnId:string;itemId:string;callId:string}
 export interface HistoryCursor {dev:number;ino:number;offset:number;exactDev?:string;exactIno?:string}
@@ -192,7 +193,9 @@ async function read(filename:string,sessionId:string,key:string,options:ReadOpti
     let current=stat;
     if(!cache.seek&&size>cache.readOffset&&seekBytes<READ_BYTES&&(seekBytes===0||performance.now()-started<READ_MS)){
       stream=createReadStream(filename,{fd,start:cache.readOffset,end:Math.min(size,cache.readOffset+READ_BYTES-seekBytes)-1,highWaterMark:65536});
+      let fairnessBytes=0;
       for await(const chunk of stream){
+        fairnessBytes+=chunk.length;if(fairnessBytes>=1024*1024){await yieldToIo();fairnessBytes=0;}
         const bytes=chunk as Buffer;cache.readOffset+=bytes.length;let tail=Buffer.concat([cache.tail,bytes]),newline:number;
         if(options.since!==undefined||options.receiptSuffix){const seam=Buffer.from(bytes.subarray(-SEAM_BYTES));cache.seam={offset:cache.readOffset-seam.length,bytes:seam};}
         if(cache.skipping){

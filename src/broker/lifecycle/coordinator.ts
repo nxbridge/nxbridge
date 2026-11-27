@@ -52,6 +52,8 @@ interface LifecycleServices {
 interface LifecycleHooks {
   stopped():boolean;
   producersPaused():boolean;
+  startupBlocked?(id:string):boolean;
+  startupRecoveryBlocked?(id:string):boolean;
   migrateCodexIdentity(peer:Peer,endpoint:Endpoint,error:BridgeError):Promise<void>;
   pumpAfterCurrent():Promise<void>;
   restartCodexTransport(peer:Peer,endpoint:Endpoint,options:CodexRestartOptions):Promise<unknown>;
@@ -96,7 +98,7 @@ export class BrokerLifecycleCoordinator {
   isPreparing(id:string):boolean{return this.preparing.has(id);}
   isRestarting(id:string):boolean{return this.restarting.has(id)||this.codexRecycle.fenced(id);}
   isRetiring(id:string):boolean{return this.retiring.has(id);}
-  blocksDeliveryActivation(id:string):boolean{return this.isRestarting(id)||this.isRetiring(id)||!!this.environment.store.setting('managedSessionConflict:'+id);}
+  blocksDeliveryActivation(id:string):boolean{return !!this.hooks.startupBlocked?.(id)||this.isRestarting(id)||this.isRetiring(id)||!!this.environment.store.setting('managedSessionConflict:'+id);}
   isRestoring(id:string):boolean{return this.restoringMembers.has(id);}
   preparation(id:string):Promise<void>|undefined{return this.preparing.get(id);}
   recoveryWork(id:string):Promise<boolean>|undefined{return this.memberRecoveries.get(id);}
@@ -146,6 +148,7 @@ export class BrokerLifecycleCoordinator {
   }
 
   async prepare(peer:Peer,extraReason?:string,provisional?:{peerId:string;sessionId:string;authorize?:()=>void;beforeCreate?:()=>void},claimedAttempt?:string,migration?:TransportMigration):Promise<void>{
+    if(this.hooks.startupBlocked?.(peer.id))throw new RuntimeRecoveryHold('startup_route_pending','原生历史正在补证，尚未启动或唤醒会话。');
     const {store,adapters}=this.environment;
     this.requireEnabled(peer);
     this.codexRecycle.requireUnfenced(peer.id);
@@ -302,6 +305,7 @@ export class BrokerLifecycleCoordinator {
   }
   async recover(peer:Peer,extraReason?:string):Promise<boolean>{
     const {store}=this.environment;
+    if(this.hooks.startupBlocked?.(peer.id))return false;
     if(!this.enabled(peer.id))return false;
     if(this.codexRecycle.fenced(peer.id))return false;
     if(peer.owner==='user'&&store.setting('legacyTakeoverNeedsUser:'+peer.id))return false;
@@ -407,6 +411,7 @@ export class BrokerLifecycleCoordinator {
           await reconcileManagedCodexConflict(store,this.environment.home,store.peer(id),(runtime,session)=>this.environment.adapters.codex.inspectThread(runtime,session));
           if(store.setting('managedRuntimeConflict:'+id)&&endpoint?.mode==='app-server'&&await this.environment.adapters.codex.sessionState({...peer,sessionId:conflict.sessionId},endpoint)==='dead')clearManagedConflict(store,id,conflict.runtimeId,conflict.sessionId,conflict);
         }
+        if(this.hooks.startupBlocked?.(id))return;
         await this.services.transfers.reconcileOwned(store.peer(id));
         const hosting=hostingRecord(store,store.peer(id));
         if(peer.host==='codex'&&hosting?.phase==='releasing'&&(hosting.nextAt??0)<=Date.now()&&!this.services.takeovers.get(id)){this.background('hosting_release:'+id,()=>this.services.transfers.release(store.peer(id)));return;}
@@ -428,6 +433,7 @@ export class BrokerLifecycleCoordinator {
       ...(value.recycle?{recycle:this.codexRecycle.summary(peer,value)}:{})};
   }
   async acceptCodexRecycle(peer:Peer,acceptance:CodexRecycleAcceptance):Promise<string|undefined>{
+    if(this.hooks.startupBlocked?.(peer.id))throw new RuntimeRecoveryHold('startup_route_pending','会话正在核对交接记录，暂不回收。');
     if(this.preparing.has(peer.id)||this.restarting.has(peer.id)||this.retiring.has(peer.id))throw new BridgeError('restart_in_progress','原会话还有一次生命周期操作，暂不回收。');
     const previous=this.services.managedRecovery.get(peer.id);
     await this.codexRecycle.advance(peer,acceptance);
@@ -464,6 +470,7 @@ export class BrokerLifecycleCoordinator {
     childHandoff(this.environment.home,peer.id,'stopped',handoffId,current);
   }
   async returnTakeover(peerId:string,leaseId:string,foregroundEnded=false):Promise<boolean>{
+    if(this.hooks.startupBlocked?.(peerId))return false;
     const {store}=this.environment;
     const lease=this.services.takeovers.get(peerId);if(!lease)return true;
     if(lease.adopted&&!lease.adopted.retirementChecked&&store.peer(peerId).host==='codex'&&lease.adopted.endpoint){
@@ -516,7 +523,7 @@ export class BrokerLifecycleCoordinator {
         value={...value,mode_checked:true,...(endpoint.nativePermission.mode!=='default'?{phase:'unknown' as const,error:'副本首次上报的实际权限不是手动模式，未再次创建副本。'}:{})};store.setSetting(claudeAutoKey(peer.id),value);
       }
       if(['ready','resolved','unknown','blocked'].includes(value.phase)){this.notifyClaudeAuto(peer,value);continue;}
-      if(pair.paused||!this.enabled(pair.claude)||!this.enabled(pair.codex)||peer.owner!=='nxbridge'||this.retiring.has(peer.id)||this.restarting.has(peer.id)||this.preparing.has(peer.id)||this.services.takeovers.get(peer.id))continue;
+      if(pair.paused||this.hooks.startupBlocked?.(peer.id)||!this.enabled(pair.claude)||!this.enabled(pair.codex)||peer.owner!=='nxbridge'||this.retiring.has(peer.id)||this.restarting.has(peer.id)||this.preparing.has(peer.id)||this.services.takeovers.get(peer.id))continue;
       const save=(patch:Partial<ClaudeAutoFallback>)=>{
         if(JSON.stringify(store.setting(claudeAutoKey(peer.id)))!==JSON.stringify(value))throw new BridgeError('fallback_changed','权限恢复状态已经改变，未覆盖较新的处理结果。');
         value={...value!,...(patch.phase&&patch.phase!==value!.phase?{phase_at:Date.now()}:{}),...patch};store.setSetting(claudeAutoKey(peer.id),value);
@@ -580,6 +587,26 @@ export class BrokerLifecycleCoordinator {
       }
     }
   }
+  private async repairFencedCodexSubscription(peer:Peer):Promise<void>{
+    const {store,adapters}=this.environment,pair=store.pairFor(peer.id);
+    if(peer.host!=='codex'||peer.owner!=='nxbridge'||!peer.sessionId||!pair||this.preparing.has(peer.id)||this.codexRecycle.fenced(peer.id))return;
+    const endpoint=store.endpoint(peer.id)??store.endpoints(peer.id).filter(ep=>ep.mode==='app-server'&&!ep.daemon&&!ep.pendingContext).sort((a,b)=>b.seenAt-a.seenAt)[0];
+    if(!endpoint||endpoint.mode!=='app-server'||endpoint.daemon||endpoint.pendingContext)return;
+    const guard=()=>{
+      const current=store.peer(peer.id),paired=store.pairFor(peer.id);
+      if(this.hooks.producersPaused()||current.owner!=='nxbridge'||current.sessionId!==peer.sessionId||paired?.id!==pair.id||paired.paused
+        ||!this.enabled(peer.id)||!this.enabled(pair.claude)||this.retiring.has(peer.id)||this.restarting.has(peer.id)||this.services.takeovers.get(peer.id)
+        ||store.setting('managedSessionConflict:'+peer.id)||store.bindings.current(peer.id)?.transitioning||hostingRecord(store,current)?.released||this.codexRecycle.fenced(peer.id))
+        throw new RuntimeRecoveryHold('owned_subscription_waiting','核对原订阅期间会话或归属已改变，等待重新核验。');
+    };
+    this.restoringMembers.add(peer.id);
+    try{
+      guard();
+                                                        
+      await adapters.codex.attach(peer,endpoint,{prepare:guard});guard();
+    }catch(error){this.codexRecycle.noteHold(peer,error);throw error;}
+    finally{this.restoringMembers.delete(peer.id);}
+  }
   private async recoverPairedPeer(id:string,hasPending:boolean):Promise<void>{
     const {store}=this.environment;
     const peer=store.getPeer(id),pair=store.pairFor(id);
@@ -589,6 +616,7 @@ export class BrokerLifecycleCoordinator {
       if(peer.host==='codex')this.codexRecycle.reconcileAuthority(peer);
       return;
     }
+    if(this.hooks.startupBlocked?.(id)){await this.repairFencedCodexSubscription(peer);return;}
     if(peer.state==='ready')this.services.deliveryHealth.promoteIdleNotices(pair.id,id);
     if(peer.host==='codex'){
       if(peer.owner==='nxbridge'&&!this.preparing.has(id)){
@@ -651,6 +679,7 @@ export class BrokerLifecycleCoordinator {
     return migration||limitation?{...(migration?{id:migration.id,state:migration.state,source:migration.source,paths:migration.paths,attempts:migration.attempts,max_attempts:1,code:migration.code,reason:migration.reason,next_at:migration.nextAt,replacement:migration.replacement}:{}),...(limitation?{limitation}:{})}:undefined;
   }
   private async restartCodexTransport(peer:Peer,endpoint:Endpoint,migration?:TransportMigration,extraReason?:string):Promise<void>{
+    if(this.hooks.startupBlocked?.(peer.id))return;
     const {store}=this.environment,pair=store.pairFor(peer.id);
     if(!pair||pair.paused||peer.owner!=='nxbridge'||!peer.sessionId||this.restarting.has(peer.id)||this.retiring.has(peer.id)||this.services.takeovers.get(peer.id))return;
     const engine=this.services.managedRecovery,incident=migration?undefined:this.recoveryIncident(peer);
@@ -697,6 +726,7 @@ export class BrokerLifecycleCoordinator {
 
                                              
   private async repairClaudeInbox(peer:Peer,endpoint:Endpoint,extraReason?:string,migration?:TransportMigration):Promise<void>{
+    if(this.hooks.startupBlocked?.(peer.id))return;
     const {store,home,adapters}=this.environment,pair=store.pairFor(peer.id),current=store.peer(peer.id);
     if(this.hooks.stopped()||!pair||pair.paused||current.owner!=='nxbridge'||current.sessionId!==peer.sessionId||store.endpoint(peer.id)?.epoch!==endpoint.epoch||this.restarting.has(peer.id)||this.retiring.has(peer.id)||this.services.takeovers.get(peer.id))return;
     peer=current;
@@ -757,7 +787,7 @@ export class BrokerLifecycleCoordinator {
   }
   schedulePairedRecovery(id:string,hasPending:boolean):Promise<boolean>{
     const pending=this.memberRecoveries.get(id);if(pending)return pending;
-    if(this.hooks.producersPaused())return Promise.resolve(false);
+    if(this.hooks.producersPaused()||(this.hooks.startupRecoveryBlocked??this.hooks.startupBlocked)?.(id))return Promise.resolve(false);
     const work=this.pumpStage('member_recovery:'+id,()=>this.recoverPairedPeer(id,hasPending)).finally(()=>{if(this.memberRecoveries.get(id)===work)this.memberRecoveries.delete(id);});
     this.memberRecoveries.set(id,work);return work;
   }

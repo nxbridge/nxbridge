@@ -35,7 +35,9 @@ export interface ProvisionalCodexGroup {
 }
 
                                        
-export async function acquireCodexGroups(custody:CustodyAcquisition,open:(offers:readonly CustodyOffer[])=>Promise<ProvisionalCodexGroup>):Promise<{promoted:readonly string[];transferred:number;held:number}>{
+export const HANDOFF_GROUP_BUDGET_MS=12000;
+export async function acquireCodexGroups(custody:CustodyAcquisition,open:(offers:readonly CustodyOffer[],signal:AbortSignal)=>Promise<ProvisionalCodexGroup>,
+  measure?:<T>(stage:string,work:()=>Promise<T>,memberId?:string)=>Promise<T>,budgetMs=HANDOFF_GROUP_BUDGET_MS):Promise<{promoted:readonly string[];transferred:number;held:number}>{
   const groups=new Map<string,CustodyOffer[]>(),addressGroups=new Map<string,string>();
   const ambiguous=new Set<string>();
   for(const offer of custody.offers){
@@ -45,8 +47,15 @@ export async function acquireCodexGroups(custody:CustodyAcquisition,open:(offers
     const group=groups.get(offer.groupId)??[];group.push(offer);groups.set(offer.groupId,group);
   }
   const results=await Promise.all([...groups].map(async([group,offers])=>{
+    const budget=new AbortController(),signal=AbortSignal.any([custody.signal,budget.signal]);
+    const timer=setTimeout(()=>budget.abort(),budgetMs);
     let provisional:ProvisionalCodexGroup|undefined;
-    const check=()=>{if(custody.signal.aborted)throw handoffUnavailable();};
+    const check=()=>{if(signal.aborted)throw handoffUnavailable();};
+    let interrupted!:()=>void;
+    const aborted=new Promise<never>((_resolve,reject)=>{
+      interrupted=()=>reject(handoffUnavailable());
+      signal.addEventListener('abort',interrupted,{once:true});if(signal.aborted)interrupted();
+    });
     const verify=async()=>{
       check();
       if(!(await Promise.all(offers.map(offer=>custody.verify(offer.id)))).every(Boolean))throw handoffUnavailable();
@@ -54,17 +63,32 @@ export async function acquireCodexGroups(custody:CustodyAcquisition,open:(offers
     };
     const ids=offers.map(offer=>offer.id);
     try{
+      const acquireGroup=async()=>{
       if(ambiguous.has(group)||offers.some(offer=>offer.address!==offers[0]!.address||!offer.profile)||new Set(ids).size!==ids.length)throw handoffUnavailable();
-      await verify();provisional=await open(offers);await verify();
-      for(const offer of offers)await provisional.acquire(offer,verify);
-      await verify();await custody.resolve(ids,'transferred');
-      check();provisional.validate();provisional.promote();
+      await verify();
+                                                    
+      const opened=await(measure?measure('route_connect',()=>open(offers,signal),offers[0]!.memberId):open(offers,signal));
+      if(signal.aborted){await opened.close();throw handoffUnavailable();}
+      provisional=opened;
+      await verify();
+      for(const offer of offers){
+        const acquire=()=>provisional!.acquire(offer,verify);
+        await(measure?measure('route_resume',acquire,offer.memberId):acquire());
+      }
+      await verify();
+      };
+      await Promise.race([acquireGroup(),aborted]);
+                                                    
+      clearTimeout(timer);
+      await custody.resolve(ids,'transferred');
+      check();provisional!.validate();provisional!.promote();
       return offers.map(offer=>offer.memberId);
     }catch{
+      budget.abort();
       await provisional?.close();
       await custody.resolve(ids,'held').catch(()=>{});
       return [];
-    }
+    }finally{clearTimeout(timer);signal.removeEventListener('abort',interrupted);}
   }));
   const promoted=results.flat();
   return {promoted,transferred:promoted.length,held:custody.offers.length-promoted.length};

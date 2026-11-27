@@ -34,7 +34,7 @@ function recycleFixture(t:TestContext,initialWork:CodexRecycleWork,loadedUnlease
   let work=initialWork,oldAlive=true,afterObserve:(()=>void)|undefined,checkingHolders:(()=>void)|undefined,afterSignal:(()=>void)|undefined,
     retiringOld:(()=>void)|undefined,draining=false,lostAck=false,baseSubscription=false,observeFailed=false,firstReplacementExited=false,stopPending=false;
   const effects={stops:0,launches:0,subscriptions:0},finalized:Parameters<CodexAdapter['finalizeRecycle']>[]=[];
-  let failProfileCleanup=false,observeTimeout:'return'|'throw'|undefined;
+  let failProfileCleanup=false,observeTimeout:'return'|'throw'|'census'|undefined;
   const input={...registration('codex',peer.sessionId!),cwd:home,endpoint:{
     ...registration('codex',peer.sessionId!).endpoint,address:fresh.endpoint,epoch:fresh.runtimeId,runtimeId:fresh.runtimeId,
     pid:fresh.pid,procStart:fresh.procStart,configHome:home,
@@ -48,6 +48,7 @@ function recycleFixture(t:TestContext,initialWork:CodexRecycleWork,loadedUnlease
       afterObserve?.();
       if(observeTimeout==='throw')throw new BridgeError('timeout','thread/list 等待确认超时');
       if(observeTimeout==='return')return {kind:'held',code:'timeout',reason:'thread/list 等待确认超时'};
+      if(observeTimeout==='census')return {kind:'held',code:'process_census_incomplete',reason:'Windows 原生进程查询没有返回完整快照'};
       if(observeFailed)return {kind:'held',code:'codex_recycle_evidence_unverified',reason:'原进程已无法连接'};
       if(trigger==='loaded_unleased'&&work.progress==='idle')return {kind:'natural',idleLoaded:true};
       return {kind:'available',old,profile:{sourceId:old.runtimeId,sessionId:peer.sessionId,file:rollout,settingsKey:'exact'},work};
@@ -75,7 +76,7 @@ function recycleFixture(t:TestContext,initialWork:CodexRecycleWork,loadedUnlease
   return {store,peer,sender,pair,old,fresh,get recovery(){return recovery;},delivery,get control(){return control;},effects,rollout,finalized,
     reopenControl:(restartRecovery=false)=>{if(restartRecovery)recovery=new ManagedRecovery(store);control=makeControl();},
     failProfileCleanup:(value:boolean)=>{failProfileCleanup=value;},
-    timeOutObservation:(value:'return'|'throw'|undefined)=>{observeTimeout=value;},
+    timeOutObservation:(value:'return'|'throw'|'census'|undefined)=>{observeTimeout=value;},
     advanceStable:async(acceptance?:Parameters<typeof control.advance>[1])=>{
       await control.advance(peer,acceptance);
       const stage=recovery.get(peer.id)?.recycle;
@@ -302,6 +303,39 @@ test('反复取证失败达到次数上限后只留一条阻塞通知，继续�
   assert.equal(f.store.message(held.id).state,'accepted');
   f.timeOutObservation(undefined);await f.control.advance(f.peer);
   assert.equal(f.effects.stops,1);assert.equal(f.recovery.get(f.peer.id)?.recycle?.phase,'ready');
+});
+
+test('忙碌根会话的进程快照反复截断三十分钟，只发布一次同事实决定并保留最初时间',async t=>{
+  let now=Date.now();t.mock.method(Date,'now',()=>now);
+  const work:CodexRecycleWork={activeTurnIds:['root-turn','child-turn'],progress:'progressing',lastProgressAt:now,roles:['child'],unresolved:[]};
+  const f=recycleFixture(t,work);f.store.accept(f.pair,f.sender,'等待中的原消息','held');
+  const emitted:string[]=[];const enqueue=f.delivery.enqueue.bind(f.delivery);
+  t.mock.method(f.delivery,'enqueue',(...args:Parameters<typeof f.delivery.enqueue>)=>{
+    if(args[2].kind==='codex_recycle_decision:'+f.peer.id)emitted.push(args[2].id);
+    enqueue(...args);
+  });
+  await f.advanceStable();
+  const initial=f.recovery.get(f.peer.id)?.recycle;assert.ok(initial?.phase==='awaiting_partner');
+  const {revision,noticeId,since}=initial.basis.decision;
+  for(let minute=0;minute<30;minute++){
+    f.timeOutObservation(minute%8===7?undefined:'census');
+    if(minute===10||minute===20)f.reopenControl(true);
+    now+=60000;await f.advanceStable();
+    assert.deepEqual(f.notices('decision').map(notice=>notice.id),[noticeId]);
+    assert.deepEqual(f.delivery.peek(f.pair.id,f.sender.id).filter(notice=>notice.kind==='codex_recycle_held:'+f.peer.id),[]);
+    assert.equal(f.effects.stops,0);
+  }
+  f.timeOutObservation(undefined);now+=60000;await f.advanceStable();
+  const restored=f.recovery.get(f.peer.id)?.recycle;assert.ok(restored?.phase==='awaiting_partner');
+  assert.equal(restored.basis.decision.revision,revision);assert.equal(restored.basis.decision.since,since);
+  assert.deepEqual(emitted,[noticeId]);assert.deepEqual(f.effects,{stops:0,launches:0,subscriptions:0});
+  f.timeOutObservation('census');
+  for(let i=0;i<6;i++){now+=60000;await f.advanceStable();}
+  f.timeOutObservation(undefined);f.setWork({...work,activeTurnIds:['next-root-turn']});
+  now+=60000;await f.advanceStable();now+=60000;await f.advanceStable();
+  const changed=f.recovery.get(f.peer.id)?.recycle;assert.ok(changed?.phase==='awaiting_partner');
+  assert.notEqual(changed.basis.decision.revision,revision);assert.equal(changed.basis.decision.since,since);
+  assert.equal(emitted.length,2);assert.equal(f.effects.stops,0);
 });
 
 test('排队确认超过时限即使当前读取恢复也已作废，同一份忙碌证据须重新确认',async t=>{

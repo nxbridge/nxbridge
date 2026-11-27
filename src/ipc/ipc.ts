@@ -240,7 +240,17 @@ export function localRpcServer(secret:string,handler:(method:string,params:unkno
       });
     },MAX_LINE);
   });
-  const listen=(address:string)=>new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(address,()=>{server.off('error',reject);resolve();});});
+  const listen=(address:string)=>new Promise<void>((resolve,reject)=>{
+    server.once('error',reject);
+    const onListening=()=>{server.off('error',reject);resolve();};
+    const pendingInstances=process.platform==='win32'?process.env.NODE_PENDING_PIPE_INSTANCES:undefined;
+    if(pendingInstances===undefined){server.listen(address,onListening);return;}
+                                                           
+                                                      
+    delete process.env.NODE_PENDING_PIPE_INSTANCES;
+    try{server.listen({path:address,exclusive:true},onListening);}
+    finally{process.env.NODE_PENDING_PIPE_INSTANCES=pendingInstances;}
+  });
   let closing:Promise<void>|undefined;
   const close=()=>closing??=new Promise<void>(resolve=>{for(const s of sockets)s.destroy();server.close(()=>resolve());});
   return{listen,close};

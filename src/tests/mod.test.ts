@@ -1881,6 +1881,30 @@ test('Mod 展开子代理 prompt，保留 model/effort，失败拒绝启动',asy
   h.fail();assert.match((await h.run('agent.spawn',input,async()=>{count++;})).deny,/^nxref not expanded: .*; fix ref or inline text$/);assert.equal(count,1);
 });
 
+test('Mod 继续已有子代理时拒绝实际引用改写，空引用和无引用原样通过',async()=>{
+  const h=await harness(),reason='nxref is not expanded when continuing an existing subagent; resend with the needed text inline';
+  const input={prompt:'任务 nxref:msg:source',resume:'existing',model:'haiku',effort:0,tool_use_id:'continue',parentAgentId:'parent'};
+  h.response('ref-expand',{text:'任务 完整正文'});let count=0;
+  const denied=await h.run('agent.spawn',input,async()=>{count++;return{agentId:'existing'};});
+  assert.equal(denied.deny,reason);assert.equal(count,0);
+  let received:any;
+  const plain={...input,prompt:'继续任务'};
+  await h.run('agent.spawn',plain,async(e:any)=>{count++;received=e;return{agentId:'existing'};});
+  assert.equal(received,plain);assert.equal(count,1);
+  const mention={...input,prompt:'说明 nxref: 的用途'};
+  h.response('ref-expand',{text:mention.prompt});
+  await h.run('agent.spawn',mention,async(e:any)=>{count++;received=e;return{agentId:'existing'};});
+  assert.equal(received,mention);assert.equal(count,2);
+});
+
+for(const type of [{workflow:'workflow-id'},{isTeammate:true},{fork:true,tool_use_id:''},{}])
+test('Mod 非继续运行的子代理仍展开引用并保留原生类型：'+JSON.stringify(type),async()=>{
+  const h=await harness(),input={prompt:'任务 nxref:msg:source',model:'haiku',effort:0,tool_use_id:'spawn',...type};
+  h.response('ref-expand',{text:'任务 完整正文'});let received:any;
+  await h.run('agent.spawn',input,async(e:any)=>{received=e;return{agentId:'new'};});
+  assert.deepEqual(received,{...input,prompt:'任务 完整正文'});
+});
+
 test('Mod 原生表单保留多题、预览和批注，ui.ask 字符串解析失败不丢失已提交答案',async()=>{
   const h=await harness();await h.run('session.start',{});
   const questions=[{question:'多选？',header:'选择',multiSelect:true,options:[{label:'甲',description:'说明甲',preview:'原始预览'},{label:'乙',description:'说明乙'}]},{question:'补充？',header:'补充',multiSelect:false,options:[{label:'是',description:'确认'},{label:'否',description:'拒绝'}]}];

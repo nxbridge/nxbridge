@@ -324,10 +324,13 @@ export class CodexRecycleControl {
     }
     const exhausted=stage?.phase==='held'&&stage.observationGap?.exhausted;
     const lapsed=exhausted?stage?.observationGap?.lapsedRevision:undefined;
-    if(exhausted&&!lapsed)cancelDecisions();
+                                                          
+    const publication=exhausted&&stage.observationGap?.publication;
+    if(exhausted&&!lapsed&&!publication)cancelDecisions();
+    if(publication)delivery.cancelKind(pair.id,owner.id,'codex_recycle_held:'+peer.id);
     if(operation?.observationGap?.exhausted&&!exhausted&&stage&&stage.phase!=='held')
       delivery.cancelKind(pair.id,owner.id,'codex_recycle_held:'+peer.id);
-    if(!lapsed&&stage?.phase==='held'&&stage.code!=='codex_recycle_partner_unreachable'&&stage.code!=='incident_changed'&&(result.kind!=='stale'||exhausted)
+    if(!lapsed&&!publication&&stage?.phase==='held'&&stage.code!=='codex_recycle_partner_unreachable'&&stage.code!=='incident_changed'&&(result.kind!=='stale'||exhausted)
       &&store.endpoint(owner.id)&&!['offline','unknown','paused'].includes(store.peer(owner.id).state)){
       const stopFailed=stage.code==='codex_recycle_stop_deadline',revision=stage.basis?.decision.revision;
       const fact=JSON.stringify([result.incident.id,copyStage(stage),stage.code,stage.reason,stage.leftover,stopFailed?revision:undefined,...(stage.retryPending?['awaiting_stable_evidence']:[])]);

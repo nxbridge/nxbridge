@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import path from 'node:path';
 import { mkdirSync, writeFileSync,readFileSync,readdirSync } from 'node:fs';
+import { appendFile,stat } from 'node:fs/promises';
 import { readModelBody } from './model-http-fixture.js';
 import { stringify } from 'smol-toml';
 import type { TestContext } from 'node:test';
@@ -15,6 +16,7 @@ import { processIdentity } from '../process/process.js';
 import { setupPublish } from './publish-fixture.js';
 import { configClient } from '../hosts/codex/stdio-codex.js';
 import { connectAppServer } from '../hosts/codex/adapter.js';
+import { planCodexResume,readSessionProfile,sessionFile } from '../hosts/codex/codex-session-profile.js';
 
 export async function multiRuntimeFixture(t:TestContext,installed=false,routeCount=2){
   const temp=temporaryDirectory(),root=temp.directory,home=path.join(root,'bridge'),codexhome=path.join(root,'codex'),claudehome=path.join(root,'claude');for(const d of [home,codexhome,claudehome])mkdirSync(d,{recursive:true});
@@ -56,7 +58,41 @@ export async function multiRuntimeFixture(t:TestContext,installed=false,routeCou
     const threads=await Promise.all(inspectors.map((rpc,i)=>rpc.request('thread/read',{threadId:targets[i].sessionId,includeTurns:true})));
     return targets.every(target=>current.peers.find((peer:any)=>peer.id===target.id)?.state==='ready')&&threads.every(value=>value.thread.status.type==='idle'&&value.thread.turns?.at(-1)?.status==='completed');
   },'初始输入尚未确认消费并完成原生轮次');}finally{await Promise.all(inspectors.map(rpc=>rpc.close()));}
-  const busy=async(i:number,suffix='')=>{holding.add(i);await call('send',{actor:actor(sources[i],'busy-'+i+suffix),message:'MULTI_BUSY_'+i+suffix});await wait(()=>held.has(i),'真实模型请求未进入挂起状态');};
+  const holdModel=async<T>(i:number,submit:()=>Promise<T>)=>{holding.add(i);const result=await submit();await wait(()=>held.has(i),'原生模型请求未进入隔离挂起状态');return result;};
+  const busy=async(i:number,suffix='')=>{await holdModel(i,()=>call('send',{actor:actor(sources[i],'busy-'+i+suffix),message:'MULTI_BUSY_'+i+suffix}));};
+  const busyNative=async(i:number)=>{
+    const rpc=await connectAppServer(endpoints[i].address,config,undefined,home);
+    try{
+      const file=sessionFile(endpoints[i].configHome,targets[i].sessionId);assert.ok(file);
+                                                          
+      const profile=await readSessionProfile(file,targets[i].sessionId),{args}=planCodexResume(targets[i].sessionId,profile,targets[i].cwd,{exact:true});
+      const resumed=await rpc.request('thread/resume',args,{mutation:true});assert.equal(resumed.thread.id,targets[i].sessionId);
+      return await holdModel(i,async()=>{
+      const {turn}=await rpc.request<{turn:{id:string}}>('turn/start',{threadId:targets[i].sessionId,
+        input:[{type:'text',text:'MULTI_BUSY_'+i+'-native'}]},{mutation:true});
+      return turn.id;
+      });
+    }finally{rpc.close();}
+  };
+  const readNativeThreads=()=>Promise.all(targets.map(async(target,index)=>{
+    const rpc=await connectAppServer(endpoints[index].address,config,undefined,home,{readOnly:true});
+    try{return(await rpc.request('thread/read',{threadId:target.sessionId,includeTurns:true})).thread;}
+    finally{rpc.close();}
+  }));
+  const extendHeldHistories=async(mebibytes:number)=>{
+    const record=JSON.stringify({timestamp:new Date().toISOString(),type:'event_msg',
+      payload:{type:'token_count',info:null,rate_limits:null},fixturePadding:'x'.repeat(1024*1024-300)})+'\n';
+    let bytes=0;
+    for(const [index,target] of targets.entries()){
+      assert.ok(held.has(index),'追加历史时必须有实际原生轮次在等待模型响应');
+      const file=sessionFile(endpoints[index].configHome,target.sessionId);
+      assert.ok(file);
+      for(let offset=0;offset<mebibytes;offset+=4)await appendFile(file,record.repeat(Math.min(4,mebibytes-offset)));
+      bytes+=(await stat(file)).size;
+    }
+    return bytes;
+  };
   const question=(i:number)=>call('question.create',{actor:actor(targets[i],'q-'+i),questions:[{id:'q',header:'独立',question:'选择第 '+i+' 组？',options:[{label:'甲',description:'甲'},{label:'乙',description:'乙'}]}]});
-  return{root,home,call,status,wait,actor,sources,pairs,targets,endpoints,requests,errors,busy,question,release:(i:number)=>{holding.delete(i);held.get(i)?.();held.delete(i);}};
+  return{root,home,call,status,wait,actor,sources,pairs,targets,endpoints,requests,errors,busy,busyNative,readNativeThreads,
+    extendHeldHistories,question,release:(i:number)=>{holding.delete(i);held.get(i)?.();held.delete(i);}};
 }

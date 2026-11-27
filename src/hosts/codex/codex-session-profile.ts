@@ -5,6 +5,7 @@ import {BridgeError,RuntimeRecoveryHold,describeError} from '../../shared/errors
 import { sameDirectory } from '../../shared/files.js';
 import type { RpcClient } from '../../ipc/rpc.js';
 import {delay} from '../../shared/time.js';
+import {setImmediate as yieldToIo} from 'node:timers/promises';
 import {CodexServiceTierError,nativeServiceTier,observedServiceTier} from './codex-service-tier.js';
 
 export interface SessionPolicy {
@@ -80,10 +81,12 @@ async function readProfile(file:string,sessionId:string,key:string,fd:number,sta
     const append=previous&&sameFile(previous.stat,stat)&&stat.size>previous.stat.size;
     const cache=append?structuredClone(previous.profile):{...empty(),file};
     let invalid=append?previous.invalid:false;
-    let tail=Buffer.alloc(0);
+    let tail=Buffer.alloc(0),fairnessBytes=0;
     if(size>cache.offset){
       stream=createReadStream(file,{fd,start:cache.offset,end:size-1});
-      for await(const chunk of stream){tail=tail.length?Buffer.concat([tail,chunk]):chunk;let newline:number;
+      for await(const chunk of stream){
+        fairnessBytes+=chunk.length;if(fairnessBytes>=1024*1024){await yieldToIo();fairnessBytes=0;}
+        tail=tail.length?Buffer.concat([tail,chunk]):chunk;let newline:number;
         while((newline=tail.indexOf(10))>=0){
           const line=tail.subarray(0,newline).toString('utf8');tail=tail.subarray(newline+1);cache.offset+=newline+1;
           if(!line.trim())continue;

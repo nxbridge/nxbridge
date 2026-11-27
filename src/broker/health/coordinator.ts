@@ -45,6 +45,7 @@ interface HealthEnvironment {readonly store:Store;readonly config:BridgeConfig;r
 interface HealthServices {readonly incidents:RuntimeIncidents;readonly deliveryHealth:DeliveryHealth;readonly communicationTips:CommunicationTips;readonly pairAnomalies:PairAnomalies;readonly idleNotices:IdleNotices;readonly profiles:PartnerProfiles;readonly foregroundHealth:ForegroundHealth;readonly managedRecovery:ManagedRecovery;readonly health:TurnHealthTracker;readonly codexDirect:CodexDirectDelivery;readonly daemons:CodexDaemons;readonly questions:Questions;readonly turnEnds:TurnEndCoordinator;}
 interface HealthHooks {
  stopped():boolean;
+ startupPending?(id:string):boolean;
  actor(input:Actor):Peer;
  enabled(id:string):boolean;
  requireEnabled(peer:Peer):void;
@@ -163,6 +164,7 @@ export class BrokerHealthCoordinator {
   async prepareNotices(actor:Actor,ids?:string[],admit=true,requireWake=false,readyBoundary=false):Promise<RuntimeNotice[]>{
     const {store}=this.environment;
       const sender=this.hooks.actor(actor),pair=store.pairFor(sender.id);if(!pair||pair.paused)return[];
+      if(this.hooks.stopped()||this.hooks.startupPending?.(sender.id))return[];
       if(hostingGate(store,sender))return[];
       if(!this.hooks.enabled(pair.claude)||!this.hooks.enabled(pair.codex))return[];
       this.refreshNoticeConditions(pair,'prepare_notices_before_probe');
@@ -278,6 +280,7 @@ export class BrokerHealthCoordinator {
 
   private async probePendingTools(peer:Peer,endpoint:Endpoint,health:TurnHealth,file:unknown):Promise<TurnHealth|undefined>{
       const scope=this.pendingToolScope(peer,endpoint,health),evidence=await readCodexPendingTools(file,peer.sessionId!,health.turnId);
+      if(this.hooks.stopped())return;
       const current=this.environment.store.peer(peer.id),currentEndpoint=this.environment.store.endpoint(peer.id);
       if(current.sessionId!==peer.sessionId||currentEndpoint?.epoch!==endpoint.epoch)throw new BridgeError('session_changed','工具等待核对期间目标会话已经改变。');
       const latest=endpoint.mode==='app-server'?this.services.health.get(endpoint.address,peer.sessionId!):this.services.foregroundHealth.get(current);
@@ -309,10 +312,14 @@ export class BrokerHealthCoordinator {
       let result:{thread:Awaited<ReturnType<typeof readCodexThread>>};
       try{const rpc=await this.environment.adapters.codex.connect(endpoint.address);this.hooks.requireEnabled(peer);result={thread:await readCodexThread(rpc,peer.sessionId!,{timeout:5000,progress:true})};}
       catch(error){this.services.health.unverified(endpoint.address,peer.sessionId!,revision);throw error;}
+      if(this.hooks.stopped())return;
       if(result.thread?.id!==peer.sessionId)throw new BridgeError('session_changed','原生状态返回了不同的线程，未处理目标。');
       const current=store.peer(peer.id),status=result.thread.status;
       if(current.sessionId!==peer.sessionId||store.endpoint(peer.id)?.epoch!==endpoint.epoch)throw new BridgeError('session_changed','原生状态核对期间目标会话已经改变。');
       await this.refreshCodexPermission(current,result.thread.path);
+      if(this.hooks.stopped())return;
+      if(store.peer(peer.id).sessionId!==peer.sessionId||store.endpoint(peer.id)?.epoch!==endpoint.epoch)
+        throw new BridgeError('session_changed','历史补证期间目标会话已经改变。');
       if(this.services.health.revision(endpoint.address,peer.sessionId!)===revision&&store.peer(peer.id).state==='unknown'&&status?.type)store.updatePeer(peer.id,{state:status.activeFlags?.some((flag:string)=>/approval|input/i.test(flag))?'needsHuman':status.type==='active'?'busy':status.type==='idle'?'ready':status.type==='notLoaded'?'offline':'unknown'});
       let health=this.services.health.read(endpoint.address,result.thread,revision);
                                             
@@ -323,7 +330,10 @@ export class BrokerHealthCoordinator {
   async refreshCodexPermission(peer:Peer,file:unknown):Promise<void>{
     const {store}=this.environment;
       if(!peer.sessionId)return;const endpoint=store.endpoint(peer.id);if(!endpoint)return;
-      const profile=await readSessionProfile(file,peer.sessionId),current=store.endpoint(peer.id),currentPeer=store.peer(peer.id);
+      const profile=await readSessionProfile(file,peer.sessionId);
+                                              
+      if(this.hooks.stopped())return;
+      const current=store.endpoint(peer.id),currentPeer=store.peer(peer.id);
       if(currentPeer.sessionId!==peer.sessionId||current?.epoch!==endpoint.epoch)return;
       if(profile.verified&&profile.complete){
         const observed=runtimeProfile(currentPeer,{model:profile.settings.model,effort:profile.settings.reasoningEffort});store.updatePeer(peer.id,observed);
@@ -337,6 +347,7 @@ export class BrokerHealthCoordinator {
 
   private async healthNotice(pairId:string,peer:Peer,id:string,message:string,source?:RuntimeNotice['source']):Promise<'submitted'|'pending'|'unknown'|'denied'>{
     const {store}=this.environment;
+      if(this.hooks.startupPending?.(peer.id))return'pending';
       if(hostingGate(store,peer))return'pending';
       const scoped=store.pairFor(peer.id);if(!this.hooks.enabled(peer.id)||scoped&&(!this.hooks.enabled(scoped.claude)||!this.hooks.enabled(scoped.codex)))return'pending';
       if(this.hooks.stopped())return'pending';
@@ -387,6 +398,7 @@ export class BrokerHealthCoordinator {
       const monitor=Date.now()-this.unqueuedHealthCheckedAt>=30000;if(monitor)this.unqueuedHealthCheckedAt=Date.now();
       await Promise.allSettled(store.pairs().filter(pair=>!pair.paused).flatMap(pair=>[pair.codex,pair.claude].map(id=>({pair,id}))).map(({pair,id})=>this.hooks.pumpStage('delivery_health:'+id,async()=>{
         const sender=store.peer(id),partner=store.peer(pair[sender.host==='codex'?'claude':'codex']),counts=store.deliveryCounts(pair.id,id);
+        if(this.hooks.startupPending?.(id))return;
         if(!this.hooks.enabled(id)||!this.hooks.enabled(partner.id))return;
         if(!monitor&&!unsettledCount(counts)&&!this.services.deliveryHealth.active(pair.id,id)&&!this.services.deliveryHealth.hasPending(pair.id,id))return;
         const availability=await this.deliveryAvailability(sender,partner);
@@ -419,6 +431,7 @@ export class BrokerHealthCoordinator {
 
   private async checkPairTurnHealth(pair:Pair):Promise<void>{
     const {store}=this.environment;
+      if(this.hooks.startupPending?.(pair.codex))return;
       if(!this.hooks.enabled(pair.codex)||!this.hooks.enabled(pair.claude))return;
       const peer=store.peer(pair.codex),endpoint=store.endpoint(peer.id);if(!peer.sessionId||!endpoint)return;
       if(endpoint.mode!=='app-server'){

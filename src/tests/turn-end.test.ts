@@ -13,15 +13,19 @@ import {temporary} from './support/temporary.js';
 import {saveManagedRuntime} from '../hosts/managed-runtimes.js';
 import {managedMarker} from '../install/installation.js';
 import {MOD_REVISION} from '../mod-revision.js';
+import {StartupRoutes} from '../broker/startup-routes.js';
+import {catchUpCodexTurnEvidence,readCodexTurnEvidence} from '../hosts/codex/codex-turn-evidence.js';
+import {BridgeError,RuntimeRecoveryHold} from '../shared/errors.js';
+import type {CodexAdapter} from '../hosts/codex/adapter.js';
 
-function setup(t:TestContext,limit=4){
+function setup(t:TestContext,limit=4,startup?:StartupRoutes){
   t.mock.timers.enable({apis:['Date'],now:1000000});
   const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),health=new DeliveryHealth(f.store);
   f.store.updatePeer(f.x.id,{owner:'nxbridge',state:'ready'});f.store.updatePeer(f.c.id,{state:'ready'});
   let hold:CompletionHold|undefined,owned=true;
   const file=path.join(temporary(t),'native.jsonl');
   const guard=new TurnEndCoordinator(f.store,health,{owned:()=>owned,source:()=>file,stats:()=>undefined,
-    gate:(background,foreground,boundary)=>hold??(f.store.pairFor(background.id)?.paused?'paused':
+    gate:(background,foreground,boundary)=>hold??(startup?.incomplete(f.x.id)?'native_state_unverified':f.store.pairFor(background.id)?.paused?'paused':
       background.id!==boundary&&f.store.peer(background.id).state!=='ready'?'background_busy':
       foreground.id!==boundary&&f.store.peer(foreground.id).state!=='ready'?'foreground_busy':undefined)},()=>limit);
   const bg=()=>f.store.peer(f.x.id),fg=()=>f.store.peer(f.c.id);
@@ -44,6 +48,173 @@ test('后台无工具且没有最终正文的完成事实仍提醒；不伪造�
   f.admit();assert.equal(f.guard.status(f.bg()).state,'completed');
   f.guard.complete(f.bg(),{turnId:'answer-without-tools',completedAt:Date.now(),stats:f.stats()});f.guard.refresh(f.pair);
   assert.deepEqual(f.pending(),[]);assert.equal(f.store.messages().length,0);assert.equal(f.guard.budget.status(f.c.id).used,1);
+});
+
+function completedHistory(file:string,sessionId:string,turnId:string,startedAt:number,workAt:number,completedAt:number){
+  const row=(type:string,payload:unknown,at:number)=>JSON.stringify({type,payload,timestamp:new Date(at).toISOString()});
+  writeFileSync(file,[row('session_meta',{id:sessionId},startedAt-1),row('event_msg',{type:'task_started',turn_id:turnId},startedAt),
+    row('response_item',{type:'function_call',name:'exec_command',call_id:'work'},workAt),
+    row('event_msg',{type:'task_complete',turn_id:turnId},completedAt)].join('\n')+'\n','utf8');
+}
+
+async function startupCheck(guard:TurnEndCoordinator){
+  guard.retryStartupChecks();
+  const pending=guard as unknown as {startupChecks:Map<string,{work?:Promise<void>}>};
+  await Promise.all([...pending.startupChecks.values()].map(state=>state.work));
+}
+
+for(const kind of ['long','oversized','invalid','rollback'] as const)test('冷启动仅剩同轮终态仍能核对完成，不补造计数：'+kind,async t=>{
+  const f=setup(t),turnId='same-completed',at=Date.now(),row=(type:string,payload:unknown,time=at)=>JSON.stringify({type,payload,timestamp:new Date(time).toISOString()})+'\n';
+  f.finish(turnId,f.stats({covered:false}));f.guard.recoverAtStartup(()=>true);
+  assert.equal(f.guard.status(f.bg()).hold,'native_state_unverified');assert.deepEqual(f.pending(),[]);
+  const padding=kind==='long'?row('event_msg',{type:'token_count',padding:'x'.repeat(2*1024*1024)}).repeat(5):
+    kind==='oversized'?row('event_msg',{type:'token_count',padding:'x'.repeat(5*1024*1024)}):
+    kind==='invalid'?'{"truncated":\n':row('event_msg',{type:'thread_rolled_back'});
+  writeFileSync(f.file,row('session_meta',{id:f.x.sessionId})+row('event_msg',{type:'task_started',turn_id:turnId})+padding+
+    row('event_msg',{type:'task_complete',turn_id:turnId},at+1),'utf8');
+  await startupCheck(f.guard);
+  const evidence=await readCodexTurnEvidence(f.file,f.x.sessionId!);
+  assert.equal(evidence.caughtUp,true);assert.equal(evidence.latestTurnId,turnId);assert.equal(evidence.turns.length,0);
+  assert.deepEqual(f.guard.startupStatus(),[]);assert.equal(f.guard.status(f.bg()).reason,'unverified');
+  assert.equal(f.pending().length,1);assert.equal(f.guard.budget.status(f.c.id).used,0);
+  f.admit();f.guard.refresh(f.pair);assert.deepEqual(f.pending(),[]);assert.equal(f.guard.budget.status(f.c.id).used,1);
+});
+
+test('启动核对连续读取同一次有界尾部的时间分片，不为每个分片等待重试周期',async t=>{
+  const f=setup(t),turnId='cold-sliced',row=(payload:unknown)=>JSON.stringify({type:'event_msg',timestamp:new Date().toISOString(),payload})+'\n';
+  f.finish(turnId,f.stats({covered:false}));
+  writeFileSync(f.file,JSON.stringify({type:'session_meta',payload:{id:f.x.sessionId}})+'\n'+
+    row({type:'task_started',turn_id:turnId})+row({type:'token_count',padding:'x'.repeat(1024*1024)}).repeat(10)+
+    row({type:'task_complete',turn_id:turnId}),'utf8');
+                                         
+  let elapsed=0;t.mock.method(performance,'now',()=>elapsed+=60);
+  f.guard.recoverAtStartup(()=>true);await startupCheck(f.guard);
+  assert.deepEqual(f.guard.startupStatus(),[]);
+  assert.equal(f.guard.status(f.bg()).turn_id,turnId);assert.equal(f.guard.status(f.bg()).reason,'unverified');
+  assert.equal(f.pending().length,1);assert.equal(f.guard.budget.status(f.c.id).used,0);
+});
+
+test('启动分片追读遇到持续增长的原生记录仍止于一次尾部预算，交接取消后不再读下一片',async t=>{
+  const f=setup(t),row=JSON.stringify({type:'event_msg',timestamp:new Date().toISOString(),payload:{type:'token_count',padding:'x'.repeat(128*1024)}})+'\n';
+  writeFileSync(f.file,JSON.stringify({type:'session_meta',payload:{id:f.x.sessionId}})+'\n'+row.repeat(8),'utf8');
+  let elapsed=0;t.mock.method(performance,'now',()=>elapsed+=60);
+                                           
+  const evidence=await catchUpCodexTurnEvidence(f.file,f.x.sessionId!,()=>{appendFileSync(f.file,row,'utf8');return true;});
+  assert.equal(evidence.status,'supported');assert.equal(evidence.caughtUp,false);assert.equal(evidence.bytesRead,8*1024*1024);
+  const cancelled=await catchUpCodexTurnEvidence(f.file,f.x.sessionId!,()=>false);
+  assert.ok(cancelled.bytesRead<=128*1024,'取消后只允许已经开始的时间片结束');
+});
+
+test('最新轮次无法重建时只等待完成核对，新鲜运行轮次取消旧事实并撤掉核对状态',async t=>{
+  const f=setup(t),at=Date.now();
+  f.finish('old',f.stats({covered:false}));f.guard.recoverAtStartup(()=>true);
+  writeFileSync(f.file,JSON.stringify({type:'session_meta',payload:{id:f.x.sessionId}})+'\n'+
+    JSON.stringify({type:'event_msg',timestamp:new Date(at).toISOString(),payload:{type:'task_complete',turn_id:'newer-unreconstructed'}})+'\n','utf8');
+  await startupCheck(f.guard);assert.equal(f.guard.startupStatus().length,1);assert.deepEqual(f.pending(),[]);
+  f.guard.native(f.bg(),{turnId:'fresh-live',state:'running'});f.guard.refresh(f.pair);
+  assert.deepEqual(f.guard.startupStatus(),[]);assert.equal(f.guard.status(f.bg()).state,'running');assert.deepEqual(f.pending(),[]);
+});
+
+test('已经看过的完成事实无需继续补证，不读取不可用历史也不重新提供提醒',async t=>{
+  const f=setup(t);f.finish('already-observed');f.admit();
+  const read=t.mock.method(f.guard as unknown as {read(peer:typeof f.x):Promise<boolean>},'read',async()=>{throw Error('不应读取已结清事实');});
+  f.guard.recoverAtStartup(()=>true);await startupCheck(f.guard);f.guard.refresh(f.pair);
+  assert.deepEqual(f.guard.startupStatus(),[]);assert.equal(read.mock.callCount(),0);assert.deepEqual(f.pending(),[]);
+});
+
+for(const missing of ['foreground','ownership'] as const)test('核对期间角色失效时保留完成门禁，恢复角色后实际折叠新事实：'+missing,async t=>{
+  const f=setup(t),at=Date.now(),foreground=f.store.endpoint(f.c.id)!;
+  f.finish('before-role-loss');
+  completedHistory(f.file,f.x.sessionId!,'after-role-loss',at+1,at+2,at+3);
+  f.guard.recoverAtStartup(()=>true);
+  const checking=startupCheck(f.guard);
+                                    
+  if(missing==='foreground')f.store.deactivate(f.c.id,foreground.epoch);else f.owned(false);
+  await checking;
+  assert.equal(f.guard.startupStatus().length,1);
+  assert.equal(f.store.setting<{turnId:string}>('turnEndFact:'+f.x.id)?.turnId,'before-role-loss');
+  assert.equal(f.guard.native(f.bg(),{turnId:'after-role-loss',state:'running'}),false);
+  assert.equal(f.guard.startupStatus().length,1,'没有应用的原生开始也不能撤下门禁');
+  assert.equal(f.guard.budget.status(f.c.id).used,0);assert.deepEqual(f.pending(),[]);
+  if(missing==='foreground')f.store.saveEndpoint(foreground);else f.owned(true);
+  t.mock.timers.tick(5001);await startupCheck(f.guard);f.guard.refresh(f.pair);
+  assert.deepEqual(f.guard.startupStatus(),[]);assert.equal(f.guard.status(f.bg()).turn_id,'after-role-loss');
+  assert.equal(f.pending().length,1);assert.equal(f.guard.budget.status(f.c.id).used,0);
+});
+
+for(const unavailable of [false,true])for(const failed of [false,true])test('切换间隙结束的同一长轮次补回真实终态且不补造计数：'+unavailable+'/'+failed,async t=>{
+  const f=setup(t),at=Date.now(),turnId='gap-turn',row=(payload:unknown,time=at)=>JSON.stringify({type:'event_msg',timestamp:new Date(time).toISOString(),payload})+'\n';
+  f.guard.begin(f.bg(),turnId);
+  if(unavailable)f.guard.native(f.bg(),{turnId,state:'ready'});
+  writeFileSync(f.file,JSON.stringify({type:'session_meta',payload:{id:f.x.sessionId}})+'\n'+
+    row({type:'task_started',turn_id:turnId})+row({type:'token_count',padding:'x'.repeat(2*1024*1024)},at+1).repeat(5)+
+    row({type:'task_complete',turn_id:turnId,...(failed?{status:'failed',error:'原生轮次失败'}:{})},at+2),'utf8');
+  let folded=false;for(let read=0;read<32&&!folded;read++)folded=await f.guard.scan(f.bg());
+  assert.equal(folded,true);f.guard.refresh(f.pair);
+  const fact=f.store.setting<{state:string;terminal?:string;stats?:TurnEndStats}>('turnEndFact:'+f.x.id)!;
+  assert.equal(fact.stats,undefined);assert.equal(f.guard.status(f.bg()).turn_id,turnId);
+  if(failed){
+    assert.equal(fact.state,'unavailable');assert.equal(fact.terminal,'failed');assert.deepEqual(f.pending(),[]);
+  }else{
+    assert.equal(fact.state,'completed');assert.equal(f.guard.status(f.bg()).reason,'unverified');
+    assert.equal(f.guard.status(f.bg()).completed_at,at+2);assert.equal(f.pending().length,1);
+    f.admit();await f.guard.scan(f.bg());f.guard.refresh(f.pair);assert.deepEqual(f.pending(),[]);
+  }
+  assert.equal(f.guard.budget.status(f.c.id).used,failed?0:1);
+});
+
+test('补证恢复同轮新范围前不会复活旧通知，完整持久统计只更新汇报判定而不增加额度',async t=>{
+  const f=setup(t),at=Date.now();
+  f.finish('persisted',f.stats({covered:true,workTools:1,actions:1,lastWorkAt:at-1}));
+  f.store.accept(f.pair,f.bg(),'该轮工作已汇报','reported-after-old-completion');
+  f.guard.recoverAtStartup(()=>true);
+  const endpoint=f.store.endpoint(f.x.id)!;f.store.deactivate(f.x.id,endpoint.epoch);f.store.saveEndpoint({...endpoint,epoch:'reconnected-scope'});
+  f.guard.refresh(f.pair);assert.deepEqual(f.pending(),[]);assert.equal(f.guard.budget.status(f.c.id).used,0);
+  writeFileSync(f.file,JSON.stringify({type:'session_meta',payload:{id:f.x.sessionId}})+'\n'+
+    JSON.stringify({type:'event_msg',timestamp:new Date(at).toISOString(),payload:{type:'task_complete',turn_id:'persisted'}})+'\n','utf8');
+  await startupCheck(f.guard);f.guard.refresh(f.pair);
+  assert.deepEqual(f.guard.startupStatus(),[]);assert.equal(f.guard.status(f.bg()).reason,'reported');assert.deepEqual(f.pending(),[]);
+  assert.equal(f.guard.budget.status(f.c.id).used,0);
+});
+
+for(const reported of [false,true])test(reported?'降级期间不提醒，补证发现已汇报后撤回旧未知事实且不扣额度':'降级期间不提醒，完整补证后只为未汇报工作提供一次完成唤醒',async t=>{
+  const startup=new StartupRoutes(()=>{}),f=setup(t,4,startup);t.after(()=>startup.close());
+  const began=Date.now()+1,work=Date.now()+2;
+  startup.begin([f.x.id]);startup.fail(f.x.id);t.mock.timers.tick(3);
+  if(reported)f.store.accept(f.pair,f.bg(),'工作已汇报','reported-before-complete');
+  t.mock.timers.tick(1);f.finish('finished',f.stats({covered:false}));
+  assert.equal(f.guard.status(f.bg()).hold,'native_state_unverified');assert.deepEqual(f.pending(),[]);
+  assert.equal(f.guard.budget.status(f.c.id).used,0);
+  completedHistory(f.file,f.x.sessionId!,'finished',began,work,Date.now());
+  assert.equal(await f.guard.scan(f.bg()),true);f.guard.refresh(f.pair);
+  assert.equal(f.guard.status(f.bg()).reason,reported?'reported':'work_after_message');
+  assert.deepEqual(f.pending(),[]);assert.equal(f.guard.budget.status(f.c.id).used,0);
+  startup.finish(f.x.id);f.guard.refresh(f.pair);f.guard.refresh(f.pair);
+  assert.equal(f.pending().length,reported?0:1);
+  if(!reported){f.admit();f.guard.refresh(f.pair);assert.equal(f.guard.budget.status(f.c.id).used,1);assert.deepEqual(f.pending(),[]);}
+});
+
+test('补证期间已经换轮时不能采用旧完成，新的运行事实不会变成陈旧唤醒',async t=>{
+  const startup=new StartupRoutes(()=>{}),f=setup(t,4,startup);t.after(()=>startup.close());
+  startup.begin([f.x.id]);f.finish('old',f.stats({covered:false}));f.guard.begin(f.bg(),'new');
+  completedHistory(f.file,f.x.sessionId!,'old',Date.now()-3,Date.now()-2,Date.now()-1);
+  assert.equal(await f.guard.scan(f.bg(),()=>false),false);
+  startup.finish(f.x.id);f.guard.refresh(f.pair);
+  assert.equal(f.guard.status(f.bg()).state,'running');assert.equal(f.guard.status(f.bg()).turn_id,'new');assert.deepEqual(f.pending(),[]);
+});
+
+test('补证中重新创建协调器时重建内存门禁，持久的未知完成在新补证前不能唤醒',async t=>{
+  const first=new StartupRoutes(()=>{}),f=setup(t,4,first);t.after(()=>first.close());
+  first.begin([f.x.id]);f.finish('durable-completion',f.stats({covered:false}));assert.deepEqual(f.pending(),[]);
+  first.close();
+  const resumed=new StartupRoutes(()=>{});t.after(()=>resumed.close());resumed.begin([f.x.id]);
+  const guard=new TurnEndCoordinator(f.store,f.health,{owned:()=>true,source:()=>f.file,stats:()=>undefined,
+    gate:()=>resumed.incomplete(f.x.id)?'native_state_unverified':undefined},()=>4);
+  guard.refresh(f.pair);assert.deepEqual(f.pending(),[]);assert.equal(guard.budget.status(f.c.id).used,0);
+  completedHistory(f.file,f.x.sessionId!,'durable-completion',Date.now()-3,Date.now()-2,Date.now()-1);
+  assert.equal(await guard.scan(f.bg()),true);guard.refresh(f.pair);assert.deepEqual(f.pending(),[]);
+  resumed.finish(f.x.id);guard.refresh(f.pair);
+  assert.equal(f.pending().length,1);assert.equal(guard.status(f.bg()).reason,'work_after_message');
 });
 
 test('来源只接受一后台一用户的根配对；双用户、双后台和归属不明均不干预',t=>{
@@ -181,6 +352,100 @@ function managedFixture(t:TestContext){
   const native=(method:string,extra:object)=>f.codex.emit('native',{address:previous.address,message:{jsonrpc:'2.0',method,params:{threadId:f.x.sessionId,...extra}}});
   return{...f,pair,native,previous};
 }
+
+for(const inactive of [false,true])test('投递栅栏内只修复原 Codex 订阅，真实回执前不激活离线端点：'+inactive,async t=>{
+  const f=managedFixture(t),life=lifecycle(f.broker),b=f.broker as unknown as {startupRoutes:StartupRoutes;catchUpOwnedRoutes(ids:Iterable<string>):Promise<void>};
+  f.store.updatePeer(f.x.id,{state:'ready'});
+  if(inactive)f.store.deactivate(f.x.id,f.store.endpoint(f.x.id)!.epoch);
+  b.startupRoutes.begin([f.x.id]);
+  let subscribed=false,enter!:()=>void,resume!:()=>void;
+  const entered=new Promise<void>(resolve=>{enter=resolve;}),wait=new Promise<void>(resolve=>{resume=resolve;});
+  t.after(()=>resume());
+  t.mock.method(f.codex,'hasSubscription',()=>subscribed);
+  t.mock.method(f.codex,'connect',async()=>({request:async()=>({thread:{id:f.x.sessionId,status:{type:'idle'},turns:[]}})}));
+  const attach=f.codex.attach.bind(f.codex);
+  f.codex.attach=async(peer,endpoint,...[options]:[{prepare?:()=>void}?])=>{
+    options?.prepare?.();enter();await wait;options?.prepare?.();
+    const result=await attach(peer,{...endpoint,active:true});subscribed=true;return result;
+  };
+  const recovery=life.schedulePairedRecovery(f.x.id,false);await entered;
+  assert.equal(!!f.store.endpoint(f.x.id),!inactive,'订阅回执前不把历史端点冒充当前端点');
+  await assert.rejects(life.prepare(f.store.peer(f.x.id)),{code:'startup_route_pending'});
+  const sent:any=await f.broker.dispatch('send',{actor:{host:'claude',sessionId:f.c.sessionId,callId:'repair-lease'},message:'订阅修复期间排队'});
+  assert.equal(f.store.message(sent.message_id).attempts,0);
+  resume();await recovery;
+  assert.equal(subscribed,true);assert.equal(b.startupRoutes.blocked(f.x.id),true);
+  assert.equal(f.codex.ensured,0);assert.equal(f.codex.created.length,0);assert.equal(f.codex.released.length,0);
+  assert.equal(f.codex.woken.length,0);assert.equal(f.codex.injected.length,0);assert.equal(f.broker.turnEnds.budget.status(f.c.id).used,0);
+  await b.catchUpOwnedRoutes([f.x.id]);assert.deepEqual(b.startupRoutes.status(),[]);
+});
+
+for(const failed of [false,true])test('投递核对期间完成 T1 补证后，T2 原生终态覆盖旧事实且不提前扣额：'+(failed?'失败':'成功'),async t=>{
+  const f=managedFixture(t),b=f.broker as unknown as {startupRoutes:StartupRoutes};
+  const file=path.join(f.broker.home,'completion-before-delivery.jsonl'),bg=()=>f.store.peer(f.x.id);
+  f.store.updatePeer(f.x.id,{state:'ready'});
+  b.startupRoutes.begin([f.x.id]);
+  const at=Date.now();
+  f.broker.turnEnds.begin(bg(),'T1');
+  f.broker.turnEnds.complete(bg(),{turnId:'T1',completedAt:at,stats:{startedAt:at-3,covered:true,actions:0,workTools:0}});
+  f.store.setSetting('codexTranscript:'+f.x.id,{sessionId:f.x.sessionId,file});
+  completedHistory(file,f.x.sessionId!,'T1',at-3,at-2,at-1);
+  f.broker.turnEnds.recoverAtStartup(()=>true);await startupCheck(f.broker.turnEnds);
+  assert.deepEqual(f.broker.turnEnds.startupStatus(),[]);
+  assert.equal(f.broker.turnEnds.status(bg()).turn_id,'T1');
+  f.broker.turnEnds.refresh(f.pair);
+  assert.equal(f.broker.turnEnds.ready(f.pair,true),false);
+  f.native('turn/started',{turn:{id:'T2',status:'inProgress'}});
+  assert.equal(f.broker.turnEnds.status(bg()).turn_id,'T2');
+  f.native('turn/completed',{turn:{id:'T2',status:failed?'failed':'completed'}});
+  f.codex.emit('state',f.x.sessionId,'ready',f.previous.address);
+  await new Promise(resolve=>setImmediate(resolve));
+  f.broker.turnEnds.refresh(f.pair);
+  assert.equal(f.broker.turnEnds.status(bg()).turn_id,'T2');
+  assert.equal(f.broker.turnEnds.ready(f.pair,true),false);
+  assert.equal(f.broker.turnEnds.budget.status(f.c.id).used,0);
+  assert.equal(f.broker.deliveryHealth.peek(f.pair.id,f.c.id).some(n=>n.source==='background_completed'),false);
+  b.startupRoutes.finish(f.x.id);f.broker.turnEnds.refresh(f.pair);
+  const notices=f.broker.deliveryHealth.peek(f.pair.id,f.c.id).filter(n=>n.source==='background_completed');
+  assert.equal(notices.length,failed?0:1);
+  assert.equal(f.broker.turnEnds.ready(f.pair,true),!failed);
+  if(!failed){
+    assert.equal(f.broker.turnEnds.status(bg()).reason,'no_tools');
+    const notice=notices[0]!,prepared=f.broker.deliveryHealth.prepare(f.pair.id,f.c.id,notice.id,notice.scope,false,true,true);
+    assert.ok(prepared);f.broker.turnEnds.admitted(f.pair,prepared);
+    assert.equal(f.broker.turnEnds.budget.status(f.c.id).used,1);
+  }
+});
+
+test('交接路由丢失订阅时仍做普通复核，但空闲 L2 回收直到投递栅栏退出才执行',async t=>{
+  const f=managedFixture(t),life=lifecycle(f.broker),b=f.broker as unknown as {startupRoutes:StartupRoutes};
+  f.store.updatePeer(f.x.id,{state:'ready'});
+  t.mock.method(f.codex,'hasSubscription',()=>false);
+  const route=f.store.endpoint(f.x.id)!;
+  const old={runtimeId:route.runtimeId!,endpoint:route.address,pid:route.pid!,procStart:route.procStart!};
+  let observations=0,signals=0;
+  Object.assign(f.codex,{recycleHost:()=>({
+    observe:async()=>{observations++;return {kind:'available',old,profile:{sourceId:old.runtimeId,sessionId:f.x.sessionId!,file:path.join(f.broker.home,'recycle.jsonl'),settingsKey:'same'},
+      work:{activeTurnIds:[],progress:'idle',roles:[],unresolved:[]}};},
+    persistProfile(){},
+    inspectOld:async()=> 'alive',
+    stop:async(_old:unknown,_deadline:number,guard:()=>void,markSignal:()=>void)=>{guard();markSignal();signals++;throw new BridgeError('process_stop_pending','模拟原进程尚未退出');},
+  } as unknown as ReturnType<CodexAdapter['recycleHost']>)});
+  t.mock.method(life as unknown as {assertNoLiveSessionHolder(peer:typeof f.x):Promise<void>},'assertNoLiveSessionHolder',async()=>{});
+  assert.equal(life.codexRecycle.noteHold(f.store.peer(f.x.id),new RuntimeRecoveryHold('native_thread_wedged','隔离的卡住信号')),true);
+  b.startupRoutes.begin([f.x.id]);
+  await life.schedulePairedRecovery(f.x.id,false);
+  assert.ok(f.codex.attached.length>0,'弱恢复门禁仍允许核对原进程并接回原订阅');
+  assert.equal(life.blocksDeliveryActivation(f.x.id),true);
+  await assert.rejects(life.prepare(f.store.peer(f.x.id)),{code:'startup_route_pending'});
+  await assert.rejects(life.acceptCodexRecycle(f.store.peer(f.x.id),{incidentId:'pending',evidenceRevision:'pending',reason:'隔离验收'}),{code:'startup_route_pending'});
+  assert.equal(observations,0);assert.equal(signals,0);
+  assert.equal(f.broker.deliveryHealth.peek(f.pair.id,f.c.id).length,0);
+  assert.equal(f.broker.turnEnds.budget.status(f.c.id).used,0);
+  b.startupRoutes.finish(f.x.id);
+  await life.schedulePairedRecovery(f.x.id,false);
+  assert.ok(observations>0);assert.equal(signals,1);
+});
 
 test('Codex 真实 hook 分发在原生终态之前拦 Stop，保持工作状态且只在成功终态后登记完成',async t=>{
   const f=managedFixture(t),{native,pair,previous}=f;

@@ -97,6 +97,8 @@ export function formatGlobalStatus(status:any):string{
     return `配对 ${index+1} · ${terminalText(claude.cwd)}\n`+formatStatus({paired:true,paused:pair.paused,self:claude,partner:codex,pending:status.messages.filter((m:Message)=>m.pairId===pair.id&&['accepted','sending','runtimeQueued','held','unknown'].includes(m.state)).length,questions:status.questions.filter((q:PartnerQuestion)=>q.pairId===pair.id&&['pending','awaiting_user','needs_user'].includes(q.status))});
   });
   sections.push(...(status.capabilities?.identityIssues??[]).map((issue:{message:string})=>terminalText('Codex 客户端身份：'+issue.message)));
+  sections.push(...(status.capabilities?.startupRoutes??[]).map((route:{memberId:string;reason:string})=>
+    terminalText('会话核对：「'+(status.peers.find((peer:Peer)=>peer.id===route.memberId)?.name??route.memberId)+'」'+route.reason)));
   const lost=[...new Map((status.lostPairs??[]).map((loss:any)=>[loss.pair_id,loss])).values()] as any[];
   sections.push(...lost.map(loss=>terminalText('原配对 '+loss.pair_id+' 被意外解除：「'+loss.member_name+'」与「'+loss.partner_name+'」，原因：'+lossReason(loss.reason)+(loss.actor?'（'+loss.actor+'）':'')+'。\n'+lossRestore(loss))));
   sections.push(...Object.entries(status.capabilities?.frozen_profiles??{}).flatMap(([host,profile]:[string,any])=>profileText(profile)?[`新建的后台 ${host==='codex'?'Codex':'Claude'} 固定用：${profileText(profile)}（${new Date(profile.at).toLocaleString('zh-CN',{hour12:false})} 记下）`]:[]));

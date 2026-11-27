@@ -11,7 +11,7 @@ import path from 'node:path';
 import { temporaryDirectory } from './support/temporary.js';
 import { registration } from './support/registration.js';
 import { processIdentity, windowsArguments, codexArguments } from '../process/process.js';
-import { readWindowsHookIdentity, readWindowsJobMembers, windowsHelperStatus, withWindowsIdentityHome, watchWindowsJobNative } from '../process/windows/windows-hook-identity.js';
+import { parseWindowsProcessSnapshot, readWindowsHookIdentity, readWindowsJobMembers, windowsHelperStatus, windowsHookIdentityHelper, withWindowsIdentityHome, watchWindowsJobNative } from '../process/windows/windows-hook-identity.js';
 import { launchIndependentWindows } from '../process/windows/windows-background.js';
 import { requireIndependentWindows } from './support/windows-job.js';
 import { releaseOwnedProcess, ownedRecordState, completeOwnedContainer, rememberOwnedDescendants, declareOwnedNative, ownedProcesses } from '../process/owned-processes.js';
@@ -23,6 +23,29 @@ import {sameDirectory} from '../shared/files.js';
 import {delay} from '../shared/time.js';
 import {windowsPowerShell} from '../shared/windows-tools.js';
 import { WindowsIdentitySession } from '../process/windows/windows-identity-session.js';
+
+test('Windows 进程查询只接受带完整结束标记的原生快照',()=>{
+  const rows=[{pid:42,generation:'123'},{pid:43,missing:true}],json=JSON.stringify(rows),end='\nNXBRIDGE_READ_COMPLETE\n';
+  assert.deepEqual(parseWindowsProcessSnapshot(json+end),rows);
+  for(const partial of ['',json,json.slice(0,-1)+end,json+end.slice(0,-2)])
+    assert.throws(()=>parseWindowsProcessSnapshot(partial),{code:'process_census_incomplete'});
+});
+
+test('Windows 原生查询通过受检管道输出跨块快照，输出中断时退出失败',{skip:process.platform!=='win32'},async()=>{
+  const binary=await windowsHookIdentityHelper(),identity=await processIdentity(process.pid);
+  const args=['read-result','probe',...Array<string>(1200).fill(String(process.pid))];
+  const result=await promisify(execFile)(binary,args,{windowsHide:true,encoding:'utf8',timeout:4000});
+  assert.ok(Buffer.byteLength(result.stdout)>65536);
+  const rows=parseWindowsProcessSnapshot<{pid:number;generation:string}[]>(result.stdout);
+  assert.equal(rows.length,1200);
+  assert.ok(rows.every(row=>row.pid===process.pid&&row.generation===identity.startedAt));
+  const child=spawn(binary,args,{windowsHide:true,stdio:['ignore','pipe','pipe'],timeout:4000});
+  const ended=once(child,'close');
+  child.stdout.destroy();child.stderr.resume();
+  const [code,signal]=await ended;
+  assert.equal(signal,null);
+  assert.notEqual(code,0,'写入失败不能作为成功快照退出');
+});
 
 test('预检原生助手目录仅作用于当前异步调用，并行上下文与退出后的默认值保持独立',async t=>{
   const temp=temporaryDirectory(),original=windowsHelperStatus().binary;t.after(temp.cleanup);

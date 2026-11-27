@@ -13,7 +13,7 @@ import type {RuntimeManifest} from './runtime-install.js';
 
                          
 const knownPreHandoff=new Set(['0.1.1-20462655d259','0.1.1-b5073b5c0020','0.1.1-2441d4ab28d8']);
-type Ping={pid:number;runtime?:{generation?:string;buildId?:string;windowsIndependent?:boolean};handoff?:{protocol:number}&CustodyResult};
+type Ping={pid:number;runtime?:{generation?:string;buildId?:string;windowsIndependent?:boolean};handoff?:{protocol:number;pending?:boolean}&CustodyResult};
 type ServingGeneration={pid:number;generation?:string;buildId?:string};
 export type BrokerUpdate={restarted:boolean;servingGeneration:ServingGeneration|null;handoff:{supported:boolean|null}&CustodyResult;windowsIndependent?:boolean;error?:unknown;retryCommand?:string};
 const absent=(error:unknown)=>['ENOENT','ECONNREFUSED'].includes((error as NodeJS.ErrnoException).code??'');
@@ -104,7 +104,15 @@ export async function updateBroker(home:string,{buildId,files}:RuntimeManifest,b
     await reservation.assertCurrent();
     started=true;
     checkpoint('wait_ready',{old:result.servingGeneration,offered:result.handoff.held,withCustody:!!launch});
-    const after=await broker<Ping>('ping',{}, {home,reserved:true,custody:launch,deadline});
+    let after=await broker<Ping>('ping',{}, {home,reserved:true,custody:launch,deadline});
+    const serving=generation(after),settledBy=deadline??performance.now()+30000;
+                                            
+    while(after.handoff?.pending){
+      await delay(remainingTime(settledBy,100));
+      after=await broker<Ping>('ping',{}, {home,start:false,timeout:remainingTime(settledBy,1500)});
+      if(after.pid!==serving.pid||after.runtime?.generation!==serving.generation)
+        throw new BridgeError('broker_changed','接班结果尚未结算时协调器代次已改变。');
+    }
     recordServing(after);
     if(after.runtime?.buildId!==buildId||!after.runtime.generation||before&&after.runtime.generation===before.runtime?.generation&&after.pid===before.pid)
       throw new BridgeError('broker_update_unconfirmed','当前服务代次与本次安装不匹配。');
@@ -117,7 +125,8 @@ export async function updateBroker(home:string,{buildId,files}:RuntimeManifest,b
     checkpoint('ready',{serving:result.servingGeneration,handoff:result.handoff});
   }catch(error){
     result.error=error;
-    checkpoint('failed',{failedAt:phase,code:(error as {code?:string})?.code,observed:result.servingGeneration,handoff:result.handoff});
+    checkpoint('failed',{failedAt:phase,code:(error as {code?:string})?.code,observed:result.servingGeneration,handoff:result.handoff,
+      ...(process.platform==='win32'&&descriptor&&started?{startupLog:path.join(home,'run','broker-startup.log')}:{})});
     if(error instanceof BridgeError&&['handoff_legacy_wait','handoff_legacy_unverified'].includes(error.code))result.retryCommand='nxbridge update';
     if(descriptor&&!started){
       const {deadline}=custodyDeadlines(descriptor.expiresAt);

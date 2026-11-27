@@ -119,6 +119,25 @@ test('已存在的协调器首次探测断线后仍被识别，竞争者安静�
   await within(once(child,'exit'),15000,()=> '竞争者未退出');assert.equal(child.exitCode,0,logs);assert.equal(logs,'');assert.ok(connections>=2);
 });
 
+test('Windows 命名管道占用时继承的实例设置不会导致进程崩溃',{skip:process.platform!=='win32'},async t=>{
+  const temporary=temporaryDirectory(),address=ipcAddress(temporary.directory),owner=net.createServer();
+  await new Promise<void>(resolve=>owner.listen(address,resolve));
+  t.after(async()=>{await new Promise<void>(resolve=>owner.close(()=>resolve()));await temporary.cleanup();});
+  const script=`
+    import assert from 'node:assert/strict';
+    import {localRpcServer} from ${JSON.stringify(new URL('../ipc/ipc.js',import.meta.url).href)};
+    const server=localRpcServer('fixture',async()=>null);
+    await assert.rejects(server.listen(process.argv[1]),{code:'EADDRINUSE'});
+    assert.equal(process.env.NODE_PENDING_PIPE_INSTANCES,'32');
+  `;
+  const child=spawn(process.execPath,['--input-type=module','--eval',script,address],{
+    env:{...process.env,NODE_PENDING_PIPE_INSTANCES:'32'},stdio:['ignore','ignore','pipe'],windowsHide:true,
+  });
+  const closed=once(child,'close');let logs='';child.stderr!.on('data',chunk=>logs+=chunk.toString());
+  t.after(async()=>{if(child.exitCode===null&&child.signalCode===null)child.kill();await closed;});
+  await within(closed,5000,()=> '占用管道的竞争者未退出');assert.equal(child.exitCode,0,logs);
+});
+
 async function within<T>(promise: Promise<T>, timeout: number, message: () => string): Promise<T> {
   let timer: NodeJS.Timeout;
   try {
