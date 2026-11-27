@@ -113,7 +113,13 @@ export class Takeovers {
     const current=this.get(peerId);
                                          
     if(current?.id!==id||identityKey(current.foreground)!==identityKey(value.foreground)||holderSet()!==before)return false;
-    this.store.setSetting(key(peerId),null);this.store.event('takeover.returned',{peerId,leaseId:id,backend:server??'unknown'});return true;
+    this.store.transaction(()=>{
+      this.store.setSetting(key(peerId),null);
+      const peer=this.store.peer(peerId);
+      if(hostingRecord(this.store,peer)?.verificationTakeoverId===id)
+        writeHosting(this.store,peer,{verifying:false,verificationRuntimeId:undefined,verificationEndpoint:undefined,verificationTakeoverId:undefined,verificationError:undefined});
+      this.store.event('takeover.returned',{peerId,leaseId:id,backend:server??'unknown'});
+    });return true;
   }
 }
 

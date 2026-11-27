@@ -828,11 +828,12 @@ export class CodexAdapter extends EventEmitter {
     const id=peer.sessionId!,runtime=runtimeFor(this.home,{endpoint:endpoint.address})!.value;
     let guard:(()=>void)|undefined;
     try{
+      const leaseGuard=await authorize();
+      guard=()=>{currentRoute();leaseGuard();};
       const saved=runtime.sessionVerification?.profile;
       const original=saved??await readSessionProfile(endpoint.nativeSession?.transcriptPath??sessionFile(runtime.configHome??endpoint.configHome??'',id),id);
       const latest=saved?await readAppliedSessionSettings(original.file,id):original;
-      const {args,profile}=planTakenOverCodexResume(id,original,latest,peer.cwd),leaseGuard=await authorize();
-      guard=()=>{currentRoute();leaseGuard();};
+      const {args,profile}=planTakenOverCodexResume(id,original,latest,peer.cwd);
                                                   
       this.coldControls.set(guard,{rpc,id});
       const ack=await rpc.request('thread/resume',args,{mutation:true,timeout:3000,beforeSend:guard,onResponse});
@@ -847,8 +848,9 @@ export class CodexAdapter extends EventEmitter {
       if(current?.sessionVerification){completeRestartProfile(this.home,current);delete current.sessionVerification;saveManagedRuntime(this.home,current);}
       return ack;
     }catch(error){
-      if(error instanceof BridgeError&&['policy_verification_failed','restart_profile_changed','takeover_profile_unverified'].includes(error.code)){
-        currentRoute();
+      if(guard&&error instanceof BridgeError&&['policy_verification_failed','restart_profile_changed','restart_profile_unverified','takeover_profile_unverified'].includes(error.code)){
+                                           
+        try{guard();}catch{throw error;}
         this.emit('sessionVerificationFailed',{memberId:peer.id,sessionId:id,runtimeId:runtime.id,endpoint:endpoint.address,takeover:true,error:{code:error.code,message:describeError(error),pauseDetail:(error as Partial<CodexServiceTierError>|null)?.pauseDetail}});
       }
       throw error;

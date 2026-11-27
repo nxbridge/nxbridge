@@ -9,7 +9,7 @@ import {saveManagedRuntime} from '../hosts/managed-runtimes.js';
 import {managedMarker} from '../install/installation.js';
 import {processIdentity} from '../process/process.js';
 import {codexDeliveryHoldText} from '../broker/delivery/codex-delivery-hold-text.js';
-import {writeHosting} from '../broker/recovery/session-hosting.js';
+import {hostingRecord,writeHosting} from '../broker/recovery/session-hosting.js';
 import {formatGlobalStatus} from '../integration/mcp/presentation.js';
 import {RuntimeRecoveryHold} from '../shared/errors.js';
 import {type Peer,type Endpoint} from '../types.js';
@@ -45,6 +45,23 @@ test('远程窗口打开后保留原后台的物理订阅许可',async t=>{
   assert.ok(route);assert.equal(f.routes.permits(route,f.rpc),true);
   f.lease();
   assert.equal(f.routes.permits(route,f.rpc),true,'接管窗口沿用同一后台时，已核验订阅不能因此失效');
+});
+
+for(const ordinary of [false,true])test('租约结束只撤下本次接管的核验失败，不清除后来普通恢复的门禁：'+ordinary,async t=>{
+  const f=await setup(t),foreground={pid:91231,procStart:'ended-window'};
+  const takeovers=new Takeovers(f.store,async rows=>rows.map(row=>row.pid===foreground.pid?'dead':'alive'),undefined,undefined,()=>false);
+  const lease=takeovers.begin(f.peer(),f.endpoint());takeovers.claim(f.x.id,lease.id,foreground);
+  const event={memberId:f.x.id,sessionId:f.peer().sessionId,runtimeId:f.endpoint().runtimeId,endpoint:f.endpoint().address};
+  f.codex.emit('sessionVerificationFailed',{...event,takeover:true,error:{code:'takeover_profile_unverified',message:'原窗口记录尚未确认'}});
+  assert.equal(f.hosting().phase,'blocked');
+  if(ordinary){
+    f.codex.emit('sessionVerifying',{...event,runtimeId:'ordinary-restart'});
+    f.codex.emit('sessionVerificationFailed',{...event,runtimeId:'ordinary-restart',error:{code:'policy_verification_failed',message:'普通恢复仍待核验'}});
+  }
+  assert.equal(await takeovers.returned(f.x.id,lease.id),true);
+  assert.equal(f.hosting().phase,ordinary?'blocked':'background');
+  assert.equal(hostingRecord(f.store,f.peer())?.verificationError?.code,ordinary?'policy_verification_failed':undefined);
+  assert.equal(f.codex.ensured,0);assert.deepEqual(f.codex.created,[]);assert.deepEqual(f.codex.released,[]);
 });
 
 test('接管前台结局未知仍沿用原订阅投递，退出租约后不重复送信或唤醒',async t=>{

@@ -6,6 +6,7 @@ import type {CodexTurnCause,CodexTurnOrigin} from '../hosts/codex/codex-turn-ori
 import {CompletionWakeBudget,type CompletionWakeStatus} from './health/completion-wake-budget.js';
 import type {DeliveryHealth} from './health/delivery.js';
 import {noticeScope,type RuntimeNotice} from './health/contracts.js';
+import {noticeForegroundKey} from './health/notice-policy.js';
 import {turnNativeScope,type TurnEndStats} from './turn-end-evidence.js';
 import {completionGuardText,turnEndTip,type CompletionGuardView,type CompletionHold} from './turn-end-text.js';
 
@@ -44,6 +45,7 @@ export class TurnEndCoordinator {
   private startupCurrent=()=>false;
   constructor(private store:Store,private notices:DeliveryHealth,private options:Options,limit:()=>number){
     this.budget=new CompletionWakeBudget(store,limit);
+    this.notices.bindForegroundEdge(id=>this.foregroundEdge(this.store.peer(id)));
     if(!store.setting('turnEndUpgrade:1'))store.transaction(()=>{
       for(const pair of store.pairs())for(const id of [pair.claude,pair.codex])notices.cancelSource(pair.id,id,'codex_final');
       store.retireFinalForwarding();
@@ -66,15 +68,15 @@ export class TurnEndCoordinator {
     return{...members,source,target};
   }
   private foregroundState(peer:Peer,turnId:string,busy:boolean,at=Date.now()):void {
-    if(this.members(peer)?.foreground.id!==peer.id)return;
+    if(!['root','fork'].includes(peer.kind)||!this.store.pairFor(peer.id))return;
     const endpoint=this.store.endpoint(peer.id);if(!endpoint)return;
-    const key='turnEndForeground:'+peer.id,scope=turnNativeScope(peer,endpoint),old=this.store.setting<ForegroundState>(key);
+    const key=noticeForegroundKey(peer.id),scope=turnNativeScope(peer,endpoint),old=this.store.setting<ForegroundState>(key);
     if(old?.scope===scope&&at<old.at)return;
     if(old?.scope===scope&&old.turnId===turnId&&old.busy===busy)return;
     const edge=!busy&&old?.scope===scope&&old.busy&&old.turnId===turnId?turnId:old?.scope===scope?old.edge:'initial';
     this.store.transaction(()=>{
       this.store.setSetting(key,{scope,turnId,busy,edge,at} satisfies ForegroundState);
-      if(!busy&&old?.scope===scope&&old.busy&&old.turnId===turnId){
+      if(!busy&&old?.scope===scope&&old.busy&&old.turnId===turnId&&this.members(peer)?.foreground.id===peer.id){
         const value=this.store.setting<Intervention>(segmentKey(peer.id));
                                                         
         if(value?.kind==='stop'&&!value.confirmed&&value.scope===scope&&value.turnId===turnId){value.released=true;this.store.setSetting(segmentKey(peer.id),value);}
@@ -83,7 +85,7 @@ export class TurnEndCoordinator {
   }
   stopped(peer:Peer,turnId:string):void {this.foregroundState(peer,turnId,false);}
   private foregroundEdge(peer:Peer):string {
-    const endpoint=this.store.endpoint(peer.id),value=this.store.setting<ForegroundState>('turnEndForeground:'+peer.id);
+    const endpoint=this.store.endpoint(peer.id),value=this.store.setting<ForegroundState>(noticeForegroundKey(peer.id));
     return JSON.stringify([endpoint?turnNativeScope(peer,endpoint):peer.sessionId,value?.edge??'initial']);
   }
   private fact(peer:Peer):Fact|undefined {
@@ -142,8 +144,7 @@ export class TurnEndCoordinator {
                                   
   }
   private retryHeld(role:Role,fact:Fact):boolean {
-    const notice=fact.noticeId?this.notices.get(role.pair.id,role.foreground.id,fact.noticeId):undefined;
-    return notice?.retryBeforeSubmit===true&&notice.completionRetry?.edge===this.foregroundEdge(role.foreground)&&notice.completionRetry.offers>=2;
+    return !!fact.noticeId&&this.notices.retryHold(role.pair.id,role.foreground.id,fact.noticeId)==='notice_retry_held';
   }
   private meta(other:Peer,recipient:Peer,remaining:number,limit:number,fact?:Fact){
     return{peerName:other.name,peerHost:other.host,recipientHost:recipient.host,remaining,limit,
@@ -332,7 +333,6 @@ export class TurnEndCoordinator {
     if(!role||!fact?.noticeId||notice.id!==fact.noticeId&&!notice.componentIds?.includes(fact.noticeId))return;
                                 
     this.segment(role.foreground,role,fact.noticeId,'notice');
-    this.notices.completionOffer(pair.id,role.foreground.id,fact.noticeId,this.foregroundEdge(role.foreground));
     fact.observed=fact.turnId;this.store.setSetting(factKey(role.background.id),fact);
     this.store.event('turn.end.notified',{peerId:role.foreground.id,source:role.background.id,turnId:fact.turnId,noticeId:fact.noticeId});
   }

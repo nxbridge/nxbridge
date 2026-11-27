@@ -138,6 +138,22 @@ test('Stop 建议的总截止时间涵盖凭据准备；准备晚到后不会再
   release();await new Promise(resolve=>setImmediate(resolve));assert.equal(calls.length,1,'准备的迟到结果不能转为业务提交');
 });
 
+test('Stop 已报告超时后即使墙钟仍在截止前，迟到凭据也不能启动业务进程',async()=>{
+  const native=await import(pathToFileURL(path.join(PACKAGE_ROOT,'plugins/claude/hooks/mod-control.js')).href);native.setModVersion(undefined);
+  let entered!:()=>void,release!:()=>void,expire!:()=>void;
+  const started=new Promise<void>(resolve=>entered=resolve),credentials=new Promise<void>(resolve=>release=resolve),timer=new Promise<void>(resolve=>expire=resolve),calls:string[]=[];
+  const sdk={session:{id:async()=>'cancelled-stop',cwd:async()=>'/project'},env:{get:async()=>undefined},plugin:{root:'/plugin'},
+    clock:{sleep:()=>timer},process:{run:async(args:string[])=>{
+      const operation=JSON.parse(args.at(-1)!).operation;calls.push(operation);
+      if(operation==='control-open'){entered();await credentials;}
+      return{exitCode:0,stdout:JSON.stringify({credential:{id:'a'.repeat(64),secret:'b'.repeat(64)}})};
+    }}};
+                                          
+  const pending=native.call(sdk,'turn-stop-check',{turn_id:'turn',stop_hook_active:false,deadline_at:Date.now()+60000});
+  await started;expire();await assert.rejects(pending,/deadline/);release();await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(calls,['control-open']);
+});
+
 test('去重与事务合并保持同序列状态和通知等价，每次响应前保存精确进展，重启不变',async t=>{
   t.mock.timers.enable({apis:['Date'],now:2000000});
   const start=Date.now();

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PACKAGE_ROOT } from '../shared/package-location.js';
-import { codexDeliveryHoldText, type CodexDeliveryHoldCode } from '../broker/delivery/codex-delivery-hold-text.js';
+import { codexDeliveryHoldText, TAKEOVER_VERIFY_STEPS, type CodexDeliveryHoldCode } from '../broker/delivery/codex-delivery-hold-text.js';
 import { formatStatus } from '../integration/mcp/presentation.js';
 
 const hosting = async () => await import(pathToFileURL(path.join(PACKAGE_ROOT, 'plugins/claude/hooks/hosting.js')).href);
@@ -40,4 +40,15 @@ test('nxbridge status 写出消息暂缓的原因，对方正在工作也写', (
   const text = formatStatus({ paired: true, pending: 1, questions: [], self: peer('claude'),
     partner: peer('codex', { hosting: { phase: 'background', held_unsent: 1, delivery_hold: hold('session_busy') } }) });
   assert.match(text, /消息暂缓：对方正在工作，下次调用工具或这一轮结束时会取到/);
+});
+
+test('nxbridge 自己的后台会话没接上时，不再说成要等用户在窗口里输入', async () => {
+  const { hostingModel } = await hosting();
+  assert.match(hostingModel({ preference: 'bg', phase: 'background', wake_capable: false, held_unsent: 1 }), /no wake \(bg session not attached; delivers after nxbridge reattaches it\), 1 held/);
+});
+
+test('原会话记录暂时核对不全时只说证据不够，不请用户改设置', () => {
+  const step = TAKEOVER_VERIFY_STEPS.restart_profile_unverified;
+  assert.match(step, /暂时没法完整核对/);
+  assert.doesNotMatch(step, /改回|--reset/);
 });

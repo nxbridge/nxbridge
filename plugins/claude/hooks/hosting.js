@@ -17,6 +17,7 @@ const BLOCK_REASON={
   policy_unknown_unstartable:'读不到原来的权限，而最严格的权限下 Codex 起不来',
   takeover_profile_unverified:'模型设置和记录的不一样，又没法确认是在打开的窗口里改的',
   restart_profile_changed:'会话记录里的会话设置（如协作模式、指令、模型服务或目录）和 nxbridge 记录的不一样',
+  restart_profile_unverified:'原会话记录暂时没法完整核对',
 };
                                       
 export function policyText(policy){
@@ -52,7 +53,7 @@ export function hostingModel(h){
   if(!h?.phase)return '';
   const p=h.policy;
   return [`hosting pref=${h.preference??'unknown'} phase=${h.phase}${h.verifying===true?' (verifying policy, delivery held)':''}`,h.session_id?`session ${h.session_id}`:'',h.cwd?`cwd ${h.cwd}`:'',
-    h.wake_capable===false?'no wake (picks up only on user input in that window)':'',h.held_unsent?`${h.held_unsent} held${h.delivery_hold?.model?': '+h.delivery_hold.model:''}`:'',h.uncertain?`${h.uncertain} uncertain (never resend)`:'',
+    h.wake_capable===false?(h.preference==='bg'||h.phase==='background'?'no wake (bg session not attached; delivers after nxbridge reattaches it)':'no wake (picks up only on user input in that window)'):'',h.held_unsent?`${h.held_unsent} held${h.delivery_hold?.model?': '+h.delivery_hold.model:''}`:'',h.uncertain?`${h.uncertain} uncertain (never resend)`:'',
     p?`policy ${p.source}${p.unknown?.length?' unknown='+p.unknown.join('/'):''}${p.narrowed?.length?' narrowed='+p.narrowed.length:''}`:'',
     h.reason?`reason ${h.reason}`:'',h.holder?.pid?`holder ${h.holder.mode??'?'} pid ${h.holder.pid}`:'',h.user_step?`user step \`${h.user_step}\``:'',
     h.phase==='window_closed'?'next send asks user: continue in bg / wait for window / new / unpair (never adopt yourself)':''].filter(Boolean).join(', ');

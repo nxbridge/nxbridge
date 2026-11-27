@@ -40,7 +40,7 @@ test('并发读取只推进完整记录，跨写入的多字节尾行等待补�
   assert.equal(complete.settings.model,'新模型');
   appendFileSync(file,'{"type":"turn_context","payload":\n{"type":');const corrupted=await readSessionProfile(file,id,{trackWork:true});
   assert.equal(corrupted.pendingTail,undefined);
-  await assert.rejects(verifyRestartProfileCurrent(complete,{current:corrupted}),{code:'restart_profile_changed'});
+  await assert.rejects(verifyRestartProfileCurrent(complete,{current:corrupted}),{code:'restart_profile_unverified'});
 });
 
 test('轮换后大小和修改时间相同，精确文件编号仍使旧权限快照失效',async t=>{

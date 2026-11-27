@@ -648,7 +648,8 @@ export function register(on) {
                                                   
           : autoModeText(status.self?.claude_auto_mode) ? autoModeText(status.self.claude_auto_mode)
                                                          
-          : profileHeldText(status.partner?.partner_profile) ? profileHeldText(status.partner.partner_profile)
+                                                       
+          : status.partner?.hosting?.delivery_hold?.code !== 'profile_pending_takeover' && profileHeldText(status.partner?.partner_profile) ? profileHeldText(status.partner.partner_profile)
           : hostingText(status.partner?.hosting) ? hostingText(status.partner.hosting)
                                               
           : recoveryText(status.partner?.recovery, 'Codex') ? recoveryText(status.partner.recovery, 'Codex')

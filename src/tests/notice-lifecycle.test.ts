@@ -8,6 +8,7 @@ import { modMonitorAdmission } from '../integration/mod/mod-protocol.js';
 import {writeFileSync} from 'node:fs';
 import path from 'node:path';
 import {temporary} from './support/temporary.js';
+import type {DeliveryMessage} from '../broker/delivery/file-references.js';
 
 const availability=(blocked:boolean)=>({state:blocked?'blocked' as const:'reachable' as const,reasons:blocked?['隔离故障']:[],checked_at:Date.now()});
 
@@ -81,6 +82,42 @@ test('已提交但回执未知的告警不重放，功能恢复后不生成额�
   health.outcome(pair.id,f.c.id,alert.id,'unknown');assert.deepEqual(health.take(pair.id,f.c.id),[]);
   const functional=Date.now();health.observe(pair,f.c,f.x,counts,{...availability(false),functionalSuccessAt:functional},true);t.mock.timers.tick(30000);
   health.observe(pair,f.c,f.x,counts,{...availability(false),functionalSuccessAt:functional},true);assert.equal(health.active(pair.id,f.c.id),false);assert.deepEqual(health.take(pair.id,f.c.id),[]);
+});
+
+for(const cause of ['deadline','profile'] as const)test('通用通知在提交检查放弃后退回有界重试，下一边界送达一次，未知结果不重放：'+cause,async t=>{
+  t.mock.timers.enable({apis:['Date'],now:1000000});
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),health=f.broker.deliveryHealth,runtime=(f.broker as any).runtimeHealth,id='abandoned-generic';
+  let abandon=true,profileHeld=false;
+  t.mock.method(f.broker.profiles,'blocks',()=>profileHeld);
+  const prepare=runtime.prepareNotices.bind(runtime);
+  t.mock.method(runtime,'prepareNotices',async(...args:unknown[])=>{
+    const value=await prepare(...args);if(abandon&&cause==='profile')profileHeld=true;return value;
+  });
+  const deliver=f.claude.deliver.bind(f.claude);
+  f.claude.deliver=async(...args)=>{
+    if(!abandon)return deliver(...args);
+    assert.equal(await(args[2] as DeliveryMessage).beforeSubmit?.(cause==='deadline'?performance.now()-1:undefined),false);
+    return{state:'expired',evidence:'提交前门禁撤销许可'};
+  };
+  const enqueue=(noticeId:string)=>health.enqueue(pair.id,f.c.id,{id:noticeId,source:'turn_health',kind:'explicit_recovery',factKey:noticeId,tier:4,state:'pending',message:'处理当前故障'});
+  const send=(noticeId:string)=>runtime.healthNotice(pair.id,f.x,noticeId,'处理当前故障','turn_health');
+  enqueue(id);
+  for(let index=0;index<2;index++){
+    profileHeld=false;assert.equal(health.take(pair.id,f.c.id)[0]?.id,id);await send(id);
+    const rolledBack=health.get(pair.id,f.c.id,id)!;assert.equal(rolledBack?.state,'pending');assert.equal(rolledBack.retryBeforeSubmit,true);
+    assert.equal(rolledBack.completionRetry?.offers,index+1);t.mock.timers.tick(60001);
+  }
+  profileHeld=false;
+  for(let index=0;index<6;index++){t.mock.timers.tick(60001);assert.deepEqual(health.take(pair.id,f.c.id),[]);}
+  assert.equal(health.retryHold(pair.id,f.c.id,id),'notice_retry_held');assert.deepEqual(f.claude.delivered,[]);
+  f.broker.turnEnds.begin(f.store.peer(f.c.id),'next-real-turn');f.broker.turnEnds.stopped(f.store.peer(f.c.id),'next-real-turn');
+  abandon=false;assert.equal(health.take(pair.id,f.c.id)[0]?.id,id);assert.equal(await send(id),'submitted');assert.equal(f.claude.delivered.length,1);
+  assert.deepEqual(health.take(pair.id,f.c.id),[]);
+  f.claude.deliver=async(...args)=>{assert.equal(await(args[2] as DeliveryMessage).beforeSubmit?.(),true);return{state:'unknown',evidence:'宿主未确认'};};
+  enqueue('unknown-generic');assert.equal(await send('unknown-generic'),'unknown');
+  f.broker.turnEnds.begin(f.store.peer(f.c.id),'later-real-turn');f.broker.turnEnds.stopped(f.store.peer(f.c.id),'later-real-turn');
+  t.mock.timers.tick(600001);assert.deepEqual(health.take(pair.id,f.c.id),[]);assert.equal(health.prepare(pair.id,f.c.id,'unknown-generic'),undefined);
+  assert.equal(f.claude.delivered.length,1);
 });
 
 test('最终消费重查 hooks 证据，不提交已领取的陈旧正文',async t=>{

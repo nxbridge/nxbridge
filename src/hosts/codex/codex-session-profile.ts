@@ -304,16 +304,19 @@ export function requireExactRestartProfile(profile:SessionProfile):void{
 export async function verifyRestartProfileCurrent(profile:SessionProfile,options:{exact?:boolean;current?:SessionProfile}={}):Promise<void>{
   const current=options.current??await readSessionProfile(profile.file,profile.sessionId);
   if(!current.verified&&current.pendingTail)throw new BridgeError('restart_profile_pending_tail','原会话历史正在写入首条记录，等待下一次核验。');
-  if(!current.verified||(current.settingsOffset??0)<(profile.settingsOffset??0)
-    ||(options.exact||(current.settingsOffset??0)>(profile.settingsOffset??0))&&(
+  const regressed=(current.settingsOffset??0)<(profile.settingsOffset??0);
+  if(!current.verified||!current.complete||regressed){
+    if(current.pendingTail&&!regressed)throw new BridgeError('restart_profile_pending_tail','原会话历史正在写入下一条记录，等待下一次核验。');
+    throw new BridgeError('restart_profile_unverified','原会话历史暂时无法完整核验，已保留消息，稍后再核对。');
+  }
+  if((options.exact||(current.settingsOffset??0)>(profile.settingsOffset??0))&&(
       !samePermission(current.settings.permissionProfile,profile.settings.permissionProfile)
       ||knownTier(current)!==knownTier(profile)
       ||options.exact&&profile.activePermission!==undefined&&!isDeepStrictEqual(current.activePermission,profile.activePermission)
       ||(options.exact?['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots','collaborationMode','disabledPluginIds']:
         ['model','modelProvider','reasoningEffort','cwd','approvalPolicy','approvalsReviewer','runtimeWorkspaceRoots']).some(key=>!isDeepStrictEqual(current.settings[key],profile.settings[key]))))
-    throw new BridgeError('restart_profile_changed','原会话历史无法核验，或在自动重启快照后写入了不同的设置。已保留消息，等待确认原会话设置。');
+    throw new BridgeError('restart_profile_changed','原会话在自动重启快照后写入了不同的设置，已保留消息，等待确认原会话设置。');
   if(current.pendingTail)throw new BridgeError('restart_profile_pending_tail','原会话历史正在写入下一条记录，等待下一次核验。');
-  if(!current.complete)throw new BridgeError('restart_profile_changed','原会话历史无法完整核验。');
 }
 
                                        

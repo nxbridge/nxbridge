@@ -432,12 +432,13 @@ export class Broker {
     });
                                             
     on(adapters.codex,'sessionPolicy',({memberId,sessionId,policy,runtimeId})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.sessionId===sessionId&&this.store.pairFor(peer.id)&&(!hostingRecord(this.store,peer)?.verificationRuntimeId||hostingRecord(this.store,peer)?.verificationRuntimeId===runtimeId))writeHosting(this.store,peer,{policy,verifying:false,verified:true,verificationError:undefined});},true);
-    on(adapters.codex,'sessionVerifying',({memberId,sessionId,runtimeId,endpoint})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.owner==='nxbridge'&&peer.sessionId===sessionId&&this.store.pairFor(peer.id))writeHosting(this.store,peer,{verifying:true,verified:false,verificationRuntimeId:runtimeId,verificationEndpoint:endpoint,verificationError:undefined});},true);
+    on(adapters.codex,'sessionVerifying',({memberId,sessionId,runtimeId,endpoint})=>{const peer=this.store.getPeer(memberId);if(peer&&peer.owner==='nxbridge'&&peer.sessionId===sessionId&&this.store.pairFor(peer.id))writeHosting(this.store,peer,{verifying:true,verified:false,verificationRuntimeId:runtimeId,verificationEndpoint:endpoint,verificationTakeoverId:undefined,verificationError:undefined});},true);
     on(adapters.codex,'sessionVerificationFailed',({memberId,sessionId,runtimeId,endpoint,error,takeover})=>{
       const peer=this.store.getPeer(memberId);
       if(peer&&peer.owner==='nxbridge'&&peer.sessionId===sessionId&&this.store.pairFor(peer.id)&&(takeover||hostingRecord(this.store,peer)?.verificationRuntimeId===runtimeId)){
         const step=takeover?TAKEOVER_VERIFY_STEPS[error.code as keyof typeof TAKEOVER_VERIFY_STEPS]:undefined;
         writeHosting(this.store,peer,{...(takeover?{verifying:true,verified:false,verificationRuntimeId:runtimeId,verificationEndpoint:endpoint}:{}),
+          verificationTakeoverId:takeover?this.takeovers.get(peer.id)?.id:undefined,
           verificationError:{...error,message:step?[error.message,step].join(' '):error.message}});
       }
     });

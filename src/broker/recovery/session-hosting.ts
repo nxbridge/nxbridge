@@ -20,7 +20,7 @@ export interface HostingRecord {
   pairId:string;memberId:string;sessionId:string;configHome:string;cwd:string;origin:'user'|'managed';
   background:boolean;released?:boolean;phase?:'adopting'|'releasing'|'awaiting_window';
   verified?:boolean;verifying?:boolean;reason?:string;userStep?:string;policy?:SessionPolicy;at:number;
-  verificationRuntimeId?:string;verificationEndpoint?:string;verificationError?:{code:string;message:string;pauseDetail?:CodexServiceTierPauseDetail};
+  verificationRuntimeId?:string;verificationEndpoint?:string;verificationTakeoverId?:string;verificationError?:{code:string;message:string;pauseDetail?:CodexServiceTierPauseDetail};
   attempts?:number;nextAt?:number;bootstrapProbeKey?:string;launchPark?:LaunchPark;
 }
 export const hostingKey=(id:string)=>'hosting:'+id;
@@ -38,8 +38,8 @@ export function writeHosting(store:Store,peer:Peer,patch:Partial<HostingRecord>=
   const pair=store.pairFor(peer.id);if(!pair||!peer.sessionId)throw Error('托管状态必须属于当前配对及会话。');
   const prior=hostingRecord(store,peer),endpoints=store.endpoints(peer.id).sort((a,b)=>b.seenAt-a.seenAt);
   const value:HostingRecord={pairId:pair.id,memberId:peer.id,sessionId:peer.sessionId,configHome:home??prior?.configHome??endpoints.find(ep=>ep.configHome)?.configHome??'',cwd:peer.cwd,origin:prior?.origin??(peer.owner==='nxbridge'?'managed':'user'),background:prior?.background??peer.owner==='nxbridge',...prior,...patch,at:Date.now()};
-  if(patch.verified===true){delete value.launchPark;delete value.bootstrapProbeKey;}
-  if(peer.owner==='user'){value.verifying=false;delete value.verificationRuntimeId;delete value.verificationEndpoint;delete value.verificationError;}
+  if(patch.verified===true){delete value.launchPark;delete value.bootstrapProbeKey;delete value.verificationTakeoverId;}
+  if(peer.owner==='user'){value.verifying=false;delete value.verificationRuntimeId;delete value.verificationEndpoint;delete value.verificationTakeoverId;delete value.verificationError;}
   store.setSetting(hostingKey(peer.id),value);return value;
 }
 function verificationPending(peer:Peer,value:HostingRecord|undefined):boolean{

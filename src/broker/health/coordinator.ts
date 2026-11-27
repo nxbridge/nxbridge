@@ -362,7 +362,7 @@ export class BrokerHealthCoordinator {
         const fresh=(await this.prepareNotices(actor,[id],true,true,true))[0];if(!fresh)return false;
         const completionId=fresh.interventionIds?.[0]??fresh.interventionId;
         if(finished||deadline!==undefined&&performance.now()>=deadline||this.services.profiles.blocks(store.peer(target.id))||completionId&&!this.services.turnEnds.reservedReady(pair,completionId)){
-          if(completionId)unsubmitted(fresh);return false;
+          unsubmitted(fresh);return false;
         }
         admitted=true;delivery.body=fresh.message;return true;
       }};

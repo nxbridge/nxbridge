@@ -104,6 +104,41 @@ test('最终合并排除已恢复分量，并发消费者只有一个能推进�
   health.outcome(pair.id,f.c.id,'a','unknown');assert.deepEqual(health.take(pair.id,f.c.id),[]);
 });
 
+test('L2 决策通知确定未提交后可重新准入，同一前台边界最多两次，未知结果永不重放',t=>{
+  t.mock.timers.enable({apis:['Date'],now:1000000});
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),health=f.broker.deliveryHealth,id='l2-decision';
+  health.enqueue(pair.id,f.c.id,{id,source:'managed_recovery',kind:'codex_recycle_decision:'+f.x.id,factKey:'same-decision',message:'等待当前接收方处理',tier:4,state:'pending'});
+  const offer=()=>health.prepare(pair.id,f.c.id,id);
+  assert.ok(offer());health.outcome(pair.id,f.c.id,id,'pending');
+  t.mock.timers.tick(59999);assert.equal(offer(),undefined,'未提交重试仍遵守一分钟限频');
+  t.mock.timers.tick(1);assert.ok(offer());health.outcome(pair.id,f.c.id,id,'pending');
+  for(let index=0;index<5;index++){t.mock.timers.tick(60001);assert.equal(offer(),undefined);}
+  assert.equal(health.retryHold(pair.id,f.c.id,id),'notice_retry_held');
+  f.broker.turnEnds.begin(f.store.peer(f.c.id),'next-foreground');f.broker.turnEnds.stopped(f.store.peer(f.c.id),'next-foreground');
+  assert.ok(offer());health.outcome(pair.id,f.c.id,id,'submitted');
+  t.mock.timers.tick(600001);assert.equal(offer(),undefined,'已提交后不能随新边界重复提供');
+  health.enqueue(pair.id,f.c.id,{id:'unknown',source:'managed_recovery',kind:'codex_recycle_decision:next',factKey:'next-decision',message:'结果不明',tier:4,state:'pending'});
+  assert.ok(health.prepare(pair.id,f.c.id,'unknown'));health.outcome(pair.id,f.c.id,'unknown','unknown');
+  f.broker.turnEnds.begin(f.store.peer(f.c.id),'another-foreground');f.broker.turnEnds.stopped(f.store.peer(f.c.id),'another-foreground');
+  t.mock.timers.tick(600001);assert.equal(health.prepare(pair.id,f.c.id,'unknown'),undefined);
+});
+
+test('自有接收方实际忙完只解封被动通知，下一次正常取件只送一次且不新增唤醒',t=>{
+  t.mock.timers.enable({apis:['Date'],now:1000000});
+  const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),health=f.broker.deliveryHealth,id='owned-passive';
+  f.store.updatePeer(f.x.id,{owner:'nxbridge'});
+  health.enqueue(pair.id,f.x.id,{id,kind:'runtime',factKey:'same-fault',message:'随正常对话取件',tier:3,state:'pending'});
+  for(let index=0;index<2;index++){
+    assert.ok(health.prepare(pair.id,f.x.id,id));health.outcome(pair.id,f.x.id,id,'pending');t.mock.timers.tick(60001);
+  }
+  assert.equal(health.retryHold(pair.id,f.x.id,id),'notice_retry_held');assert.deepEqual(health.take(pair.id,f.x.id),[]);
+  f.broker.turnEnds.begin(f.store.peer(f.x.id),'owned-next');f.broker.turnEnds.stopped(f.store.peer(f.x.id),'owned-next');
+  assert.equal(health.retryHold(pair.id,f.x.id,id),undefined);assert.deepEqual(f.codex.woken,[]);assert.deepEqual(f.codex.injected,[]);
+  const pickup=health.take(pair.id,f.x.id);assert.equal(pickup.length,1);assert.equal(pickup[0]!.wake,false);
+  const prepared=health.prepare(pair.id,f.x.id,pickup[0]!.id)!;assert.equal(prepared.message,'随正常对话取件');
+  health.outcome(pair.id,f.x.id,prepared.id,'submitted');assert.deepEqual(health.take(pair.id,f.x.id),[]);assert.deepEqual(f.codex.woken,[]);
+});
+
 test('短暂握手恢复不结清投递故障，稳定功能恢复不追加模型通知',t=>{
   t.mock.timers.enable({apis:['Date'],now:1000000});
   const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),health=f.broker.deliveryHealth;

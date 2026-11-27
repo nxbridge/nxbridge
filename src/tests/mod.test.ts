@@ -2356,3 +2356,12 @@ test('状态栏：消息暂缓的原因只作兜底，不盖住审批、启动�
                       
   assert.equal(await show({state:'ready'}),'1 条消息在等：对方在等你批准操作或回答问题，处理完再送');
 });
+
+test('状态栏：接手窗口开着时的模型变更说明等窗口关掉，不说成正在换模型',async()=>{
+  const h=await harness();await h.run('session.start',{});
+  const profile={delivery_held:true,status:'pending',requested:{effort:'high'}};
+  const takeover={code:'profile_pending_takeover',status:'有模型设置的变更要等你关掉打开查看的窗口后才能生效，之前先不送',model:'held: pending profile change cannot apply while the session is open in a window; delivers after it closes'};
+  const show=async(hosting:any)=>{h.response('status',{paired:true,self:{state:'ready'},partner:{state:'ready',partner_profile:profile,hosting},integrationIssues:[]});await h.tick();return h.statuses.at(-1);};
+  assert.equal(await show({preference:'bg',phase:'background',wake_capable:true,held_unsent:1,delivery_hold:takeover}),'1 条消息在等：有模型设置的变更要等你关掉打开查看的窗口后才能生效，之前先不送');
+  assert.match(await show({preference:'bg',phase:'background',wake_capable:true,held_unsent:1}) ?? '',/正在换成推理强度 high/);
+});

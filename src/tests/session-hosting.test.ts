@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { RpcClient } from '../ipc/rpc.js';
 import { Store } from '../storage/store.js';
-import { readSessionProfile, resumeSession, snapshotLiveSession, verifyCodexResumeAck, planTakenOverCodexResume } from '../hosts/codex/codex-session-profile.js';
+import { readSessionProfile, resumeSession, snapshotLiveSession, verifyCodexResumeAck, verifyRestartProfileCurrent, planTakenOverCodexResume } from '../hosts/codex/codex-session-profile.js';
 import { closeHostedWindow, hostingGate, hostingKey, hostingRecord, hostingStatus, SessionTransfers, writeHosting, profileVersionSupported } from '../broker/recovery/session-hosting.js';
 import { WindowRecovery } from '../broker/recovery/window-recovery.js';
 import { hostingArguments } from '../app/commands/hosting-command.js';
@@ -23,6 +23,7 @@ import { Broker, type Adapters } from '../broker/coordinator.js';
 import { bootstrapPolicyRejected, restoreBootstrapKey } from '../hosts/codex/codex-isolation.js';
 import { selectHostLaunch } from '../hosts/host-launch.js';
 import { processIdentity } from '../process/process.js';
+import { Takeovers } from '../broker/recovery/takeover.js';
 
 const row=(type:string,payload:unknown)=>JSON.stringify({type,payload})+'\n';
 
@@ -34,6 +35,18 @@ test('持有者快照中的进程已退出时继续核验，未知身份或代�
   failure=undefined;await assert.rejects((transfers as any).assertNoExternalHolder(x),{code:'holder_unknown'});
 });
 const profile={type:'managed',file_system:{type:'restricted',entries:[{path:{type:'special',value:{kind:'root'}},access:'none'}]},network:'restricted'};
+
+for(const kind of ['identity','incomplete','truncated','changed'] as const)test('原会话历史不足和已确认设置矛盾使用不同的阻塞原因：'+kind,async t=>{
+  const home=temporary(t),file=path.join(home,'profile-classification.jsonl'),id='profile-classification';
+  const settings={cwd:home,model:'model-a',model_provider:'fixture',reasoning_effort:'high',service_tier:'priority',approval_policy:'never',approvals_reviewer:'user',permission_profile:profile};
+  const start=row('session_meta',{id})+row('turn_context',settings),full=start+row('turn_context',settings);
+  writeFileSync(file,full,'utf8');const original=await readSessionProfile(file,id);assert.equal(original.verified,true);assert.equal(original.complete,true);
+  if(kind==='identity')writeFileSync(file,row('session_meta',{id:'other'})+row('turn_context',settings),'utf8');
+  else if(kind==='truncated')writeFileSync(file,start,'utf8');
+  else if(kind==='changed')appendFileSync(file,row('turn_context',{...settings,approval_policy:'on-request'}),'utf8');
+  const current=kind==='incomplete'?{...original,complete:false}:undefined;
+  await assert.rejects(verifyRestartProfileCurrent(original,{exact:true,...(current?{current}:{})}),{code:kind==='changed'?'restart_profile_changed':'restart_profile_unverified'});
+});
 
 test('权限读取按持久顺序覆盖、增量跟随半行并拒绝错误身份',async t=>{
   const home=temporary(t),file=path.join(home,'history.jsonl');
@@ -467,6 +480,37 @@ for(const failure of ['timeout','busy','guard','plain','stale'] as const)test('�
     failure==='stale'?{code:'owned_subscription_waiting'}:error=>error===fault);
   assert.equal(failedEvents,0);assert.equal(verifyingEvents,0);assert.equal(hostingGate(store,store.peer(peer.id)),false);
   assert.equal(hostingRecord(store,store.peer(peer.id))?.verificationError,undefined);
+});
+
+for(const outcome of ['ended','replaced','success'] as const)test('接管结束或替换后不复活迟到核验失败，已发请求的有效成功仍接纳：'+outcome,async t=>{
+  const home=temporary(t),id='takeover-late',file=path.join(home,'history.jsonl'),store=new Store(':memory:'),adapter=new CodexAdapter(DEFAULT_CONFIG,home);
+  const broker=new Broker(store,DEFAULT_CONFIG,{codex:adapter,claude:new FakeAdapter()} as unknown as Adapters,home);
+  t.after(async()=>{await broker.stop();store.close();});
+  const peer=store.register(registration('codex',id,{cwd:home})),partner=store.register(registration('claude','late-partner'));store.pair(partner.id,peer.id);
+  store.updatePeer(peer.id,{owner:'nxbridge',state:'ready'});
+  const saved={cwd:home,runtime_workspace_roots:[home],model:'model-a',model_provider:'fixture',reasoning_effort:'high',service_tier:'priority',
+    approval_policy:'never',approvals_reviewer:'user',permission_profile:{type:'disabled'}};
+  writeFileSync(file,row('session_meta',{id})+row('turn_context',saved),'utf8');
+  const endpoint=store.endpoint(peer.id)!,runtimeId=randomUUID();Object.assign(endpoint,{runtimeId,pid:process.pid,procStart:'fixture-native',nativeSession:{transcriptPath:file}});store.saveEndpoint(endpoint);
+  saveManagedRuntime(home,{id:runtimeId,peerId:peer.id,sessionId:id,configHome:home,owner:managedMarker(home),kind:'owned',state:'ready',pid:endpoint.pid!,procStart:endpoint.procStart!,
+    endpoint:endpoint.address,createdAt:Date.now()});
+  let foregroundAlive=true;
+  const takeovers=new Takeovers(store,async rows=>rows.map(value=>value.pid===91231&&!foregroundAlive?'dead':'alive'),undefined,undefined,()=>foregroundAlive);
+  const lease=takeovers.begin(store.peer(peer.id),endpoint);takeovers.claim(peer.id,lease.id,{pid:91231,procStart:'old-window'});
+  let failedEvents=0;adapter.on('sessionVerificationFailed',()=>{failedEvents++;});
+  const rpc=new RpcClient(message=>{void(async()=>{
+    if(message.method==='thread/loaded/list'){rpc.receive({id:message.id,result:{data:[id]}});return;}
+                                         
+    foregroundAlive=false;assert.equal(await takeovers.returned(peer.id,lease.id),true);
+    if(outcome==='replaced'){const next=takeovers.begin(store.peer(peer.id),endpoint);takeovers.claim(peer.id,next.id,{pid:91232,procStart:'new-window'});}
+    rpc.receive({id:message.id,result:{thread:{id,path:file,status:{type:'idle'}},cwd:home,runtimeWorkspaceRoots:[home],model:'model-a',modelProvider:'fixture',
+      reasoningEffort:outcome==='success'?'high':'medium',serviceTier:'priority',approvalPolicy:'never',approvalsReviewer:'user'}});
+  })().catch(error=>rpc.receive({id:message.id,error:{code:-32000,message:String(error)}}));},()=>{});
+  t.after(()=>rpc.close());adapter.connect=async()=>rpc;(adapter as any).clients.set(endpoint.address,rpc);
+  const attaching=adapter.attach(store.peer(peer.id),endpoint,{subscribeLoaded:()=>takeovers.codexSubscriptionGuard(store.peer(peer.id),endpoint)});
+  if(outcome==='success')await attaching;else await assert.rejects(attaching,{code:'takeover_profile_unverified'});
+  assert.equal(failedEvents,0);assert.equal(hostingRecord(store,store.peer(peer.id))?.verificationError,undefined);
+  assert.equal(adapter.hasSubscription(store.peer(peer.id),store.endpoint(peer.id)!),outcome==='success');
 });
 
 test('普通冷恢复的核验门禁成功后解除，显式接管仍保留自己的门禁',t=>{

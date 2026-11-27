@@ -82,6 +82,33 @@ test('Stop 建议的准备和提交共用截止时间，已应用提示的确认
   assert.equal(writes,1);
 });
 
+test('Stop 在 HTTP 提交签名期间已经超时，摘要晚到也不能发送 commit 或回退进程',async t=>{
+  const native=await import(pathToFileURL(path.join(PACKAGE_ROOT,'plugins/claude/hooks/mod-control.js')).href),read=await import(pathToFileURL(path.join(PACKAGE_ROOT,'plugins/claude/hooks/mod-read.js')).href);
+  native.setModVersion(undefined);
+  const temp=temporaryDirectory();let writes=0,requests=0,digests=0,processes=0;
+  const server=new ModReadServer(temp.directory,async()=>({}),async(_input,_actor,_receipt,_epoch,admit)=>{admit();writes++;return{ok:true};});
+  t.after(async()=>{await server.close();await temp.cleanup();});
+  let entered!:()=>void,release!:()=>void,expire!:()=>void;
+  const signing=new Promise<void>(resolve=>entered=resolve),gate=new Promise<void>(resolve=>release=resolve),timer=new Promise<void>(resolve=>expire=resolve);
+  const sdk={session:{id:async()=>'signing-stop',cwd:async()=>'/project'},env:{get:async()=>undefined},plugin:{root:'/plugin'},
+    clock:{sleep:()=>timer},process:{run:async()=>{processes++;throw Error('取消后不能回退进程');}},http:{fetch:async(url:string,options:RequestInit)=>{
+      requests++;const response=await fetch(url,options);return{status:response.status,text:await response.text()};
+    }}};
+  const context=await native.captureContext(sdk);Object.assign(context,{contextStart:false,binding:{key:'key',epoch:'epoch'}});
+  await read.prepareRead(sdk,context,async()=>({credential:{id:'a'.repeat(64),secret:'b'.repeat(64)}}));
+  read.attachRead(context,await server.open({} as any,{host:'claude',sessionId:context.sessionId,callId:'call',binding:context.binding},'epoch'));
+  const digest=crypto.subtle.digest.bind(crypto.subtle);
+  t.mock.method(crypto.subtle,'digest',async(...args:Parameters<typeof crypto.subtle.digest>)=>{
+    const result=await digest(...args);
+    if(++digests===6){entered();await gate;}
+    return result;
+  });
+                                             
+  const pending=native.call(sdk,'turn-stop-check',{context,turn_id:'turn',stop_hook_active:false,deadline_at:Date.now()+60000});
+  await signing;expire();await assert.rejects(pending,/deadline/);release();await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(requests,1);assert.equal(writes,0);assert.equal(processes,0);
+});
+
 test('代理环境只在明确绕过目标回环地址时允许 HTTP',async()=>{
   const {loopbackAllowed}=await import(pathToFileURL(path.join(PACKAGE_ROOT,'plugins/claude/hooks/mod-proxy.js')).href),url='http://127.0.0.1:1234/mod-read';
   assert.equal(loopbackAllowed({},url),true);
