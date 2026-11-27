@@ -23,6 +23,14 @@ import { launchIndependentWindows } from '../process/windows/windows-background.
 import { requireIndependentWindows } from './support/windows-job.js';
 import { stopOwnedProcess } from '../process/process-stop.js';
 
+function differentGeneration(startedAt:string,offset=1):string{
+  if(/^\d+$/.test(startedAt))return(BigInt(startedAt)+BigInt(offset)).toString();
+                                                 
+  const generation=new Date(Date.parse(startedAt+' UTC')+offset*1000);
+  const [weekday,,month,year,time]=generation.toUTCString().split(' ');
+  return `${weekday!.slice(0,-1)} ${month} ${String(generation.getUTCDate()).padStart(2,' ')} ${time} ${year}`;
+}
+
 test('周期回收删除已死及复用 PID 的旧代次记录，保留活进程、外来及损坏证据',async t=>{
   const temp=temporaryDirectory(),home=path.join(temp.directory,'bridge'),run=path.join(home,'run');mkdirSync(run,{recursive:true});
   const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',windowsHide:true}),closed=once(child,'close');
@@ -32,7 +40,7 @@ test('周期回收删除已死及复用 PID 的旧代次记录，保留活进程
   await recordOwnedProcess(home,{role:'proxy',identity,parent,proof:{kind:'spawn'}});
   await recordOwnedProcess(home,{role:'broker',identity:parent,proof:{kind:'spawn'}});
   const runtime=(name:string,pid:number,generation:string,owner=managedMarker(home))=>{const file=path.join(run,`runtime-${name}.json`);atomicJson(file,{owner,pid,generation,entry:process.execPath});return file;};
-  const dead=runtime('dead',identity.pid,identity.startedAt),reused=runtime('reused',parent.pid,parent.startedAt+'0'),live=runtime('live',parent.pid,parent.startedAt),foreign=runtime('foreign',identity.pid,identity.startedAt,'other-owner');
+  const dead=runtime('dead',identity.pid,identity.startedAt),reused=runtime('reused',parent.pid,differentGeneration(parent.startedAt)),live=runtime('live',parent.pid,parent.startedAt),foreign=runtime('foreign',identity.pid,identity.startedAt,'other-owner');
   const broken=path.join(run,'runtime-broken.json');writeFileSync(broken,'{未完成的记录','utf8');
   child.kill();await closed;
   const result=await pruneDeadProcessRecords(home);
@@ -51,7 +59,7 @@ test('已绑定原生后台退休同次启动的旧代次、旧会话和旧格�
     {proof:{kind:'native-session',launchId}},{sessionId:randomUUID(),configHome:path.join(home,'previous-config')},
     {proof:{kind:'legacy-ledger'}},{proof:{kind:'legacy-runtime'}},{proof:{kind:'spawn'}},
   ];
-  for(const [index,variant] of variants.entries())retired.push(await recordOwnedProcess(home,{role:'claude-native',identity:{...identity,startedAt:(BigInt(identity.startedAt)+BigInt(index+1)).toString()},peerId,sessionId,configHome:process.platform==='win32'?home.toUpperCase():home,proof:{kind:'native-session',launchId:randomUUID()},...variant}));
+  for(const [index,variant] of variants.entries())retired.push(await recordOwnedProcess(home,{role:'claude-native',identity:{...identity,startedAt:differentGeneration(identity.startedAt,index+1)},peerId,sessionId,configHome:process.platform==='win32'?home.toUpperCase():home,proof:{kind:'native-session',launchId:randomUUID()},...variant}));
   const options={referencedPeers:new Set([peerId])},result=await pruneDeadProcessRecords(home,options);
   assert.equal(result.owned,variants.length);assert.deepEqual(result.notes,[]);assert.deepEqual(ownedProcesses(home).records.map(record=>record.id),[current.id]);assert.equal(liveProcess(process.pid),true);
   for(const record of retired){const snapshot=JSON.parse(readFileSync(path.join(processRegistryRoot(),'retired',record.id+'.json'),'utf8'));assert.equal(snapshot.reason,'superseded-native-generation');assert.equal(snapshot.generation,record.identity.startedAt);}
@@ -59,7 +67,7 @@ test('已绑定原生后台退休同次启动的旧代次、旧会话和旧格�
 });
 
 test('保留未结算及无法核验的后继、用户归属、容器和当前原生代次的配对证明',async t=>{
-  const temp=temporaryDirectory(),home=temp.directory,identity=await processIdentity(process.pid),old={...identity,startedAt:identity.startedAt+'0'},references=new Set<string>(),ids:string[]=[];
+  const temp=temporaryDirectory(),home=temp.directory,identity=await processIdentity(process.pid),old={...identity,startedAt:differentGeneration(identity.startedAt)},references=new Set<string>(),ids:string[]=[];
   t.after(async()=>{for(const record of ownedProcesses(home).records)forgetOwnedProcess(record);for(const peerId of references)unlinkSync(path.join(processRegistryDirectory(home),'native-'+peerId+'.json'));await temp.cleanup();});
   const cases:{binding?:Partial<NativeOwnership>;record?:Partial<OwnedProcessRecord>}[]=[
     {binding:{phase:'intent'}},{binding:{native:undefined}},{binding:{native:{pid:0,startedAt:''}}},{binding:{id:''}},{binding:{home:path.join(home,'other')}},
@@ -83,7 +91,7 @@ test('托管 Claude 的已绑定原生代次替代旧 worker、child 和控制�
   mkdirSync(path.join(home,'run'),{recursive:true});
   atomicJson(claudeChildFile(home,peerId),{version:1,bootId:currentLinuxBootId(),peerId,sessionId,cwd:home,configHome:home,address:'unused-test-socket',phase:'active',hasSession:true,native:identity,worker:identity,updatedAt:Date.now()});
   for(const role of ['claude-worker','claude-child','host-control'] as const)
-    await recordOwnedProcess(home,{role,identity:{...identity,startedAt:(BigInt(identity.startedAt)+1n).toString()},peerId,sessionId:randomUUID(),configHome:home,proof:{kind:'spawn'}});
+    await recordOwnedProcess(home,{role,identity:{...identity,startedAt:differentGeneration(identity.startedAt)},peerId,sessionId:randomUUID(),configHome:home,proof:{kind:'spawn'}});
   const current=await recordOwnedProcess(home,{role:'claude-worker',identity,peerId,sessionId,configHome:home,proof:{kind:'spawn'}});
   const result=await pruneDeadProcessRecords(home,{referencedPeers:new Set([peerId])});assert.equal(result.owned,3);assert.deepEqual(result.notes,[]);
   assert.deepEqual(ownedProcesses(home).records.map(record=>record.id),[current.id]);assert.equal(liveProcess(process.pid),true);
@@ -107,7 +115,8 @@ test('周期维护只归档有完成凭据的旧容器，不向仍存活的持�
   await once(holder,'spawn');const holderIdentity=await processIdentity(holder.pid!);
   await recordOwnedProcess(home,{role:'host-control',identity:holderIdentity,parent:identity,proof:{kind:'spawn'}});
   saveManagedRuntime(home,{id:launchId,peerId,owner:managedMarker(home),kind:'owned',state:'ready',endpoint:'current-container-test',createdAt:Date.now(),pid:identity.pid,procStart:identity.startedAt});
-  const input={role:'codex-runtime' as const,identity:{...identity,startedAt:(BigInt(identity.startedAt)+1n).toString()},peerId,proof:{kind:'spawn' as const,launchId:randomUUID()},windowsJob:'isolated-completed-job',windowsHolder:holderIdentity,native:{pid:identity.pid,startedAt:(BigInt(identity.startedAt)+1n).toString()}};
+  const oldGeneration=differentGeneration(identity.startedAt);
+  const input={role:'codex-runtime' as const,identity:{...identity,startedAt:oldGeneration},peerId,proof:{kind:'spawn' as const,launchId:randomUUID()},windowsJob:'isolated-completed-job',windowsHolder:holderIdentity,native:{pid:identity.pid,startedAt:oldGeneration}};
   const old=await recordOwnedProcess(home,input),nonComplete=await recordOwnedProcess(home,{...input,identity,windowsJob:undefined,windowsHolder:undefined,posixGroup:true,native:identity}),current=await recordOwnedProcess(home,{...input,proof:{kind:'spawn',launchId},native:identity});
   completeOwnedContainer(old);completeOwnedContainer(current);
   const result=await pruneDeadProcessRecords(home,{referencedPeers:new Set([peerId])});
@@ -125,7 +134,7 @@ test('Windows 旧推断完成凭据仍须核验 Job，存活成员及查询错�
   t.after(async()=>{await stopOwnedProcess(record.identity);completeOwnedContainer(record);await releaseOwnedProcess(record);await temp.cleanup();});
   saveManagedRuntime(home,{id:randomUUID(),peerId,owner:managedMarker(home),kind:'owned',state:'ready',endpoint:'newer-runtime',createdAt:Date.now(),pid:identity.pid,procStart:identity.startedAt});
   completeOwnedContainer(record);
-  assert.equal(await ownedContainerRetirementReady({...record,identity:{...record.identity,startedAt:(BigInt(record.identity.startedAt)+1n).toString()}}),false,'身份查询失败不能当作 Job 已消失');
+  assert.equal(await ownedContainerRetirementReady({...record,identity:{...record.identity,startedAt:differentGeneration(record.identity.startedAt)}}),false,'身份查询失败不能当作 Job 已消失');
   const result=await pruneDeadProcessRecords(home,{referencedPeers:new Set([peerId])});assert.equal(result.owned,0);assert.deepEqual(result.notes,[]);
   assert.ok(ownedProcesses(home).records.some(value=>value.id===record.id));assert.equal(liveProcess(record.identity.pid),true);assert.equal(liveProcess(record.windowsHolder!.pid),true);
   await stopOwnedProcess(record.windowsHolder!);
@@ -136,7 +145,7 @@ test('Windows 旧推断完成凭据仍须核验 Job，存活成员及查询错�
 });
 
 test('Codex 旧单进程证明只由唯一就绪的自有运行时代次取代，未知和歧义仍保留',async t=>{
-  const temp=temporaryDirectory(),home=temp.directory,identity=await processIdentity(process.pid),old={...identity,startedAt:identity.startedAt+'0'},references=new Set<string>(),kept:string[]=[];
+  const temp=temporaryDirectory(),home=temp.directory,identity=await processIdentity(process.pid),old={...identity,startedAt:differentGeneration(identity.startedAt)},references=new Set<string>(),kept:string[]=[];
   t.after(async()=>{for(const record of ownedProcesses(home).records)forgetOwnedProcess(record);await temp.cleanup();});
   const cases:{state?:ManagedRuntime['state'];kind?:ManagedRuntime['kind'];duplicate?:boolean;noNative?:boolean;current?:boolean}[]=[
     {},{state:'starting'},{state:'failed'},{kind:'legacy'},{duplicate:true},{noNative:true},{current:true},
@@ -157,7 +166,7 @@ test('进程核验期间 Codex 后继从就绪变回启动中时保留原证明'
   const temp=temporaryDirectory(),home=temp.directory,identity=await processIdentity(process.pid),peerId=randomUUID();
   t.after(async()=>{for(const record of ownedProcesses(home).records)forgetOwnedProcess(record);await temp.cleanup();});
   const runtime:ManagedRuntime={id:randomUUID(),peerId,owner:managedMarker(home),kind:'owned',state:'ready',endpoint:'runtime-race',createdAt:Date.now(),pid:identity.pid,procStart:identity.startedAt};saveManagedRuntime(home,runtime);
-  const record=await recordOwnedProcess(home,{role:'codex-runtime',identity:{...identity,startedAt:identity.startedAt+'0'},peerId,proof:{kind:'spawn'}});
+  const record=await recordOwnedProcess(home,{role:'codex-runtime',identity:{...identity,startedAt:differentGeneration(identity.startedAt)},peerId,proof:{kind:'spawn'}});
   const pending=pruneDeadProcessRecords(home,{referencedPeers:new Set([peerId])});saveManagedRuntime(home,{...runtime,state:'starting'});
   const result=await pending;assert.equal(result.owned,0);assert.match(result.notes.join(' '),/后继原生归属已经变化/);assert.deepEqual(ownedProcesses(home).records.map(value=>value.id),[record.id]);
 });
@@ -166,7 +175,7 @@ test('进程核验期间原生绑定被后继预约替换时保留原记录',asy
   const temp=temporaryDirectory(),home=temp.directory,identity=await processIdentity(process.pid),peerId=randomUUID(),sessionId=randomUUID();
   t.after(async()=>{for(const record of ownedProcesses(home).records)forgetOwnedProcess(record);await temp.cleanup();});
   const binding:NativeOwnership={version:1,id:randomUUID(),home,peerId,sessionId,configHome:home,phase:'bound',createdAt:Date.now(),native:identity};saveNativeOwnership(binding);
-  const record=await recordOwnedProcess(home,{role:'claude-native',identity:{...identity,startedAt:identity.startedAt+'0'},peerId,sessionId,configHome:home,proof:{kind:'native-session',launchId:randomUUID()}});
+  const record=await recordOwnedProcess(home,{role:'claude-native',identity:{...identity,startedAt:differentGeneration(identity.startedAt)},peerId,sessionId,configHome:home,proof:{kind:'native-session',launchId:randomUUID()}});
   const pending=pruneDeadProcessRecords(home,{referencedPeers:new Set([peerId])});saveNativeOwnership({...binding,id:randomUUID(),phase:'intent'});
   const result=await pending;assert.equal(result.owned,0);assert.match(result.notes.join(' '),/后继原生归属已经变化/);assert.deepEqual(ownedProcesses(home).records.map(value=>value.id),[record.id]);
 });
@@ -185,7 +194,7 @@ test('Linux 旧启动的单进程证明不会因 PID 和 tick 恰好复用而永
 test('旧容器完成证明不覆盖相同 PID 和启动代次的直接进程存活证明',async t=>{
   const temp=temporaryDirectory(),home=temp.directory,identity=await processIdentity(process.pid),peerId=randomUUID(),sessionId=randomUUID();
   t.after(async()=>{for(const record of ownedProcesses(home).records)forgetOwnedProcess(record);await temp.cleanup();});
-  saveNativeOwnership({version:1,id:randomUUID(),home,peerId,sessionId,configHome:home,phase:'bound',createdAt:Date.now(),native:{pid:identity.pid,startedAt:identity.startedAt+'0'}});
+  saveNativeOwnership({version:1,id:randomUUID(),home,peerId,sessionId,configHome:home,phase:'bound',createdAt:Date.now(),native:{pid:identity.pid,startedAt:differentGeneration(identity.startedAt)}});
   const input={role:'claude-native' as const,identity,peerId,sessionId,configHome:home,proof:{kind:'native-session' as const,launchId:randomUUID()}};
   const plain=await recordOwnedProcess(home,input),container=await recordOwnedProcess(home,{...input,posixGroup:true});
   if(process.platform==='linux')atomicJson(path.join(processRegistryDirectory(home),container.id+'.json'),{...container,bootId:'previous-boot'});
@@ -260,7 +269,7 @@ test('旧版临时完成目录已丢失时，确认退出的事实仍能保存�
 
 test('协调器启动维护回收失效运行时记录，关闭等待维护完成',async t=>{
   const temp=temporaryDirectory(),home=path.join(temp.directory,'bridge'),run=path.join(home,'run');mkdirSync(run,{recursive:true});
-  const identity=await processIdentity(process.pid),file=path.join(run,'runtime-stale.json');atomicJson(file,{owner:managedMarker(home),pid:identity.pid,generation:identity.startedAt+'0',entry:process.execPath});
+  const identity=await processIdentity(process.pid),file=path.join(run,'runtime-stale.json');atomicJson(file,{owner:managedMarker(home),pid:identity.pid,generation:differentGeneration(identity.startedAt),entry:process.execPath});
   const store=new Store(path.join(home,'nxbridge.db')),broker=new Broker(store,DEFAULT_CONFIG,{codex:new FakeAdapter(),claude:new FakeAdapter()} as unknown as Adapters,home);
   t.after(async()=>{await broker.stop();store.close();await temp.cleanup();});
   await broker.start();await broker.stop();assert.equal(existsSync(file),false);

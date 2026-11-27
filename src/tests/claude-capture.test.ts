@@ -14,6 +14,7 @@ import { currentLinuxBootId, forgetOwnedProcess, ownedProcesses, processRegistry
 import { saveClaudeBackground } from '../hosts/claude/claude-capability.js';
 import { atomicJson } from '../shared/files.js';
 import { liveProcess } from '../process/process.js';
+import { ownedProcessState } from '../process/process-stop.js';
 import {DEFAULT_CONFIG} from '../config/defaults.js';
 import { Store } from '../storage/store.js';
 import { temporaryDirectory } from './support/temporary.js';
@@ -30,7 +31,10 @@ async function fixture(t:TestContext){
     }
   });
   copyFileSync(process.execPath,executable);
-  child=spawn(executable,['-e',"process.title='claude';process.send('ready');process.disconnect();setInterval(()=>{},1000)"],{stdio:['ignore','ignore','ignore','ipc'],windowsHide:true});await once(child,'message');
+  const spawned=child=spawn(executable,['-e',"process.title='claude';process.send('ready');process.disconnect();setInterval(()=>{},1000)"],{stdio:['ignore','ignore','ignore','ipc'],windowsHide:true});
+                                      
+  const exited=new Promise<void>(resolve=>spawned.once('exit',()=>resolve()));
+  await once(spawned,'message');
   processProof=await rememberOwnedChild(home,child,'claude-native',{peerId:peer.id,sessionId,configHome:home});assert.ok(processProof);
   const identity=processProof.identity,record={sessionId,cwd:home,procStart:identity.procStartFt??identity.procStart??identity.startedAt,messagingSocketPath:'native-inbox'};
   mkdirSync(path.join(home,'sessions'));const file=path.join(home,'sessions',identity.pid+'.json');writeFileSync(file,JSON.stringify(record),'utf8');
@@ -38,7 +42,13 @@ async function fixture(t:TestContext){
   saveNativeOwnership(proof);
   adapter=new ClaudeAdapter({...DEFAULT_CONFIG,claudeBinary:executable,claudeHome:home},home);const agent={id:proof.handle,sessionId,pid:identity.pid,kind:'background',status:'idle'};
   adapter.list=async()=>[agent];
-  return{home,peer,record,file,proof,identity,agent,adapter,processProof};
+  return{home,peer,record,file,proof,identity,agent,adapter,processProof,exited};
+}
+
+async function assertExited(f:Awaited<ReturnType<typeof fixture>>){
+  assert.equal(await ownedProcessState(f.identity),'dead');
+  await f.exited;
+  assert.equal(liveProcess(f.identity.pid),false);
 }
 
 function identityQueries(t:TestContext,pid:number){
@@ -220,7 +230,8 @@ test('原生停止返回时回收同次启动新登记的进程，保留其他�
     await adapter.release(peer);
     assert.equal(existsSync(sentinel),true);
     const remaining=ownedProcesses(f.home).records;
-    assert.ok(!remaining.some(record=>record.id===sameLaunch.id));assert.equal(liveProcess(late.identity.pid),false);
+    assert.ok(!remaining.some(record=>record.id===sameLaunch.id));
+    await assertExited(late);
     assert.ok(remaining.some(record=>record.id===differentLaunch.id));assert.equal(liveProcess(other.identity.pid),true);
     assert.equal(nativeOwnership(f.home,f.peer.id),undefined);
   }finally{forgetOwnedProcess(sameLaunch);forgetOwnedProcess(differentLaunch);}
@@ -234,7 +245,7 @@ for(const [label,bound,hasSupervisor] of [['相同启动绑定',true,true],['仅
     await adapter.release(peer);
     assert.equal(existsSync(sentinel),hasSupervisor);assert.equal(nativeOwnership(f.home,f.peer.id),undefined);
     assert.ok(!ownedProcesses(f.home).records.some(record=>record.id===f.processProof.id));
-    assert.equal(liveProcess(f.identity.pid),false);
+    await assertExited(f);
   });
 
 test('上次 Linux 启动的回执不能认领或停止复用同一 PID 与代次的 Claude',{skip:process.platform!=='linux'},async t=>{
