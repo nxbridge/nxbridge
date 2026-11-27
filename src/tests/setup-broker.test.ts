@@ -31,6 +31,44 @@ for(const changed of [false,true])test(changed?'接班待结算期间换代不�
   else assert.deepEqual(result.handoff,{supported:true,used:true,transferred:2,held:0});
 });
 
+for(const code of ['timeout','broker_timeout'])test('接班查询的一次短超时不抢占整体截止，也不重发启动：'+code,async t=>{
+  const home=temporary(t),next={pid:process.pid,runtime:{generation:'successor',buildId:candidate.buildId}};
+  let initial=true,launches=0,polls=0;
+  const broker=(async(method,_params,options)=>{
+    assert.equal(method,'ping');
+    if(options?.reserved){launches++;return{...next,handoff:{protocol:CUSTODY_PROTOCOL,used:true,transferred:0,held:9,pending:true}};}
+    assert.equal(options?.start,false);
+    if(initial){initial=false;throw Object.assign(Error('尚未运行'),{code:'ENOENT'});}
+    if(++polls===1)throw new BridgeError(code,'初始化回补期间的短查询超时');
+    return{...next,handoff:{protocol:CUSTODY_PROTOCOL,used:true,transferred:9,held:0}};
+  }) as typeof brokerCall;
+  const result=await updateBroker(home,candidate,broker);
+  assert.equal(result.restarted,true);assert.equal(result.error,undefined);assert.equal(launches,1);
+  assert.deepEqual(result.handoff,{supported:true,used:true,transferred:9,held:0});
+});
+
+for(const failure of ['换代','身份错误','总截止'] as const)test('接班短查询超时后的重查仍遵守原代次、身份和总截止：'+failure,async t=>{
+  const home=temporary(t),clock=performance.now.bind(performance);let initial=true,launches=0,polls=0,offset=0;
+  t.mock.method(performance,'now',()=>clock()+offset);
+  const fault=new BridgeError('ipc_token_invalid','原 IPC 身份不再有效');
+  const next={pid:process.pid,runtime:{generation:'successor',buildId:candidate.buildId}};
+  const broker=(async(_method,_params,options)=>{
+    if(options?.reserved){launches++;return{...next,handoff:{protocol:CUSTODY_PROTOCOL,used:true,transferred:0,held:9,pending:true}};}
+    if(initial){initial=false;throw Object.assign(Error('尚未运行'),{code:'ENOENT'});}
+    if(options?.timeout!==undefined){
+      polls++;
+      if(polls===1){if(failure==='总截止')offset+=60000;throw new BridgeError('timeout','单次回执未及时到达');}
+      if(failure==='身份错误')throw fault;
+    }
+    return{...next,runtime:{...next.runtime,generation:failure==='换代'?'different-successor':'successor'},
+      handoff:{protocol:CUSTODY_PROTOCOL,used:true,transferred:9,held:0}};
+  }) as typeof brokerCall;
+  const result=await updateBroker(home,candidate,broker);
+  assert.equal(result.restarted,false);assert.equal(launches,1);
+  assert.equal((result.error as BridgeError).code,failure==='换代'?'broker_changed':failure==='身份错误'?'ipc_token_invalid':'timeout');
+  if(failure==='总截止')assert.equal(polls,1,'总截止耗尽后不能再发下一次查询');
+});
+
 test('已开始服务但接班结果一直未结算时沿用固定预算，不再次启动或无限等待',async t=>{
   const home=temporary(t),clock=performance.now.bind(performance);let calls=0,offset=0,launches=0;
   t.mock.method(performance,'now',()=>clock()+offset);

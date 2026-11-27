@@ -18,7 +18,7 @@ import { configClient } from '../hosts/codex/stdio-codex.js';
 import { connectAppServer } from '../hosts/codex/adapter.js';
 import { planCodexResume,readSessionProfile,sessionFile } from '../hosts/codex/codex-session-profile.js';
 
-export async function multiRuntimeFixture(t:TestContext,installed=false,routeCount=2){
+export async function multiRuntimeFixture(t:TestContext,installed=false,routeCount=2,initialPublish?:string){
   const temp=temporaryDirectory(),root=temp.directory,home=path.join(root,'bridge'),codexhome=path.join(root,'codex'),claudehome=path.join(root,'claude');for(const d of [home,codexhome,claudehome])mkdirSync(d,{recursive:true});
   const requests:any[]=[],held=new Map<number,()=>void>(),holding=new Set<number>(),errors:string[]=[];
   const model=http.createServer(async(req,res)=>{try{
@@ -35,7 +35,7 @@ export async function multiRuntimeFixture(t:TestContext,installed=false,routeCou
   writeFileSync(path.join(codexhome,'config.toml'),stringify({model:'gpt-5.1-codex',model_provider:'multi_local',approval_policy:'never',sandbox_mode:'read-only',web_search:'disabled',features:{apps:false,remote_plugin:false},model_providers:{multi_local:{name:'多运行时本地验收',base_url:`http://127.0.0.1:${(model.address() as any).port}/v1`,wire_api:'responses',requires_openai_auth:false}}}),'utf8');
                                                             
   const control=await configClient(config,home);try{await control.request('config/read',{});}finally{await control.close();}
-  if(installed)assert.equal((await setupPublish() as any).installed,true);else(await ensureBroker(home)).close();
+  if(installed)assert.equal((await setupPublish(initialPublish) as any).installed,true);else(await ensureBroker(home)).close();
   const call=<T=any>(method:string,params:any={})=>brokerCall<T>(method,params,{home,timeout:60000}),status=()=>call('status');
   const wait=async(check:()=>boolean|Promise<boolean>,reason:string,timeout=60000)=>{const end=Date.now()+timeout;while(!await check()){
     if(Date.now()>=end){let brokerLog='';try{brokerLog=readFileSync(path.join(home,'run','broker.log'),'utf8').slice(-10000);}catch{}

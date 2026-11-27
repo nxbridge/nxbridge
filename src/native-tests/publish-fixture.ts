@@ -37,9 +37,9 @@ export function publishEnvironment(home:string,bin:string,input:NodeJS.ProcessEn
   return{...input,PATH:[bin,...directories].join(path.delimiter)};
 }
                                             
-export async function setupPublish():Promise<any>{
+export async function setupPublish(publish=path.join(PACKAGE_ROOT,'publish')):Promise<any>{
   const bin=path.join(path.dirname(bridgeHome()),'fixture-bin');mkdirSync(bin,{recursive:true});
-  const {stdout}=await execute(process.execPath,['--no-warnings',path.join(PACKAGE_ROOT,'publish','nxbridge.mjs'),'setup','--bin-dir',bin],{env:publishEnvironment(bridgeHome(),bin),windowsHide:true,timeout:90000,maxBuffer:8*1024*1024});
+  const {stdout}=await execute(process.execPath,['--no-warnings',path.join(publish,'nxbridge.mjs'),'setup','--bin-dir',bin],{env:publishEnvironment(bridgeHome(),bin),windowsHide:true,timeout:90000,maxBuffer:8*1024*1024});
   return JSON.parse(stdout);
 }
 export async function uninstallPublish():Promise<any>{

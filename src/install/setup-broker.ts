@@ -109,7 +109,13 @@ export async function updateBroker(home:string,{buildId,files}:RuntimeManifest,b
                                             
     while(after.handoff?.pending){
       await delay(remainingTime(settledBy,100));
-      after=await broker<Ping>('ping',{}, {home,start:false,timeout:remainingTime(settledBy,1500)});
+      try{after=await broker<Ping>('ping',{}, {home,start:false,timeout:remainingTime(settledBy,1500)});}
+      catch(error){
+                                                    
+        const code=(error as {code?:string}|null)?.code;
+        if(code==='timeout'||code==='broker_timeout')continue;
+        throw error;
+      }
       if(after.pid!==serving.pid||after.runtime?.generation!==serving.generation)
         throw new BridgeError('broker_changed','接班结果尚未结算时协调器代次已改变。');
     }
