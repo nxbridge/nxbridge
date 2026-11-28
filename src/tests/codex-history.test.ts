@@ -165,9 +165,13 @@ test('回收补证无法及时定位早先轮次时，尾部正向回执仍可�
     {type:'response_item',payload:{type:'function_call',name:'receive_messages',namespace:'claude',call_id:'latest'}},
     {type:'response_item',payload:{type:'function_call_output',call_id:'latest',output:{messages:[{message_id:'received'}]}}},
   ]);
-  const result=await catchUpCodexHistory(file,id,Date.parse('2026-11-26T10:05:00Z'));
-  assert.deepEqual(result.receipts.map(value=>value.messageId),['received']);
-  assert.equal(result.complete,false);assert.equal(result.cursor,undefined);
+                                     
+  t.mock.method(performance,'now',()=>0);
+  try{
+    const result=await catchUpCodexHistory(file,id,Date.parse('2026-11-26T10:05:00Z'));
+    assert.deepEqual(result.receipts.map(value=>value.messageId),['received']);
+    assert.equal(result.complete,false);assert.equal(result.cursor,undefined);
+  }finally{t.mock.restoreAll();}
 });
 
 test('旧版修复扫描检查点保留跨批调用配对，缓存被释放后仍可继续验证',async t=>{
