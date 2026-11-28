@@ -25,6 +25,9 @@ type Connection=DaemonDomain&{rpc:RpcClient;at:number;revision:number;threads:Co
 const parent=codexParent;
 const interactive=(thread:CodexThread)=>!thread.ephemeral&&!codexSubagent(thread)&&['cli','vscode'].includes(thread.source);
 const sameHome=(endpoint:Endpoint,home:string)=>!!endpoint.daemon&&!!endpoint.configHome&&normalizedHome(endpoint.configHome)===normalizedHome(home);
+const wakeRoute=(endpoint:Endpoint)=>JSON.stringify([endpoint.epoch,endpoint.bindingEpoch,endpoint.address,endpoint.daemon?.address,endpoint.configHome?normalizedHome(endpoint.configHome):null,endpoint.pid,endpoint.procStart]);
+const WAKE_RECHECK_MS=5000;
+interface WakeCheck {scope:string;at:number;ready?:boolean}
 export function daemonPermission(evidence:CodexPermissionEvidence):PermissionClass{
   return classifyCodexPermission(evidence);
 }
@@ -47,45 +50,62 @@ export class CodexDaemons {
   private failures=new Map<string,string>();
   private endedThreads=new Set<string>();
   private threadRevisions=new Map<string,number>();
-  private wakeChecks=new Map<string,{scope:string;at:number;ready:boolean}>();
+  private wakeChecks=new Map<string,WakeCheck>();
   private closed=false;
   constructor(private store:Store,private config:BridgeConfig,private home:string,private register:(input:RegisterInput)=>Promise<Peer>){}
   private wakeScope(peer:Peer,endpoint:Endpoint):string|undefined{
     const current=this.store.peer(peer.id),active=this.store.endpoint(peer.id),pair=this.store.pairFor(peer.id),binding=this.store.bindings.current(peer.id);
-    if(this.closed||!pair||pair.paused||!daemonWakeAuthorized(this.store,pair)||daemonContextChanged(this.store,current,active)||[pair.claude,pair.codex].some(id=>this.store.peer(id).enabled===false)||current.state!=='ready'||current.sessionId!==peer.sessionId||!['root','fork'].includes(current.kind)||!endpoint.daemon||!endpoint.configHome||!endpoint.pid||!endpoint.procStart||!active?.active||active.epoch!==endpoint.epoch||active.bindingEpoch!==endpoint.bindingEpoch||active.pendingContext||!binding?.active||binding.transitioning)return;
-    return JSON.stringify([pair.id,peer.sessionId,endpoint.epoch,endpoint.bindingEpoch]);
+    if(this.closed||!pair||pair.paused||!daemonWakeAuthorized(this.store,pair)||daemonContextChanged(this.store,current,active)||[pair.claude,pair.codex].some(id=>this.store.peer(id).enabled===false)||current.state!=='ready'||current.sessionId!==peer.sessionId||!['root','fork'].includes(current.kind)||!endpoint.daemon||!endpoint.configHome||!endpoint.pid||!endpoint.procStart||!active?.active||active.pendingContext||!binding?.active||binding.transitioning)return;
+    const route=wakeRoute(endpoint);
+    if(route===wakeRoute(active))return JSON.stringify([pair.id,peer.sessionId,route]);
+  }
+  private clearWakeCheck(id:string,scope:string|undefined):void{
+    if(scope!==undefined&&this.wakeChecks.get(id)?.scope===scope)this.wakeChecks.delete(id);
+  }
+  nativeReady(peer:Peer,endpoint:Endpoint):void{
+    const check=this.wakeChecks.get(peer.id);
+    if(check&&check.ready!==true)this.clearWakeCheck(peer.id,this.wakeScope(peer,endpoint));
   }
                                   
   canWake(peer:Peer,endpoint:Endpoint|undefined):boolean{
     if(!endpoint)return false;const scope=this.wakeScope(peer,endpoint),checked=this.wakeChecks.get(peer.id);
-    return !!scope&&checked?.scope===scope&&checked.ready&&Date.now()-checked.at<2000;
+    return !!scope&&checked?.scope===scope&&checked.ready===true&&Date.now()-checked.at<2000;
   }
   wakeMayAdvance(peer:Peer,endpoint:Endpoint):boolean{
     const scope=this.wakeScope(peer,endpoint),checked=this.wakeChecks.get(peer.id);
-    return !!scope&&(checked?.scope!==scope||checked.ready||Date.now()-checked.at>=5000);
+    return !!scope&&(checked?.scope!==scope||checked.ready===true||checked.ready===false&&Date.now()-checked.at>=WAKE_RECHECK_MS);
   }
   async wakeReady(peer:Peer,endpoint:Endpoint):Promise<boolean>{
-    const scope=this.wakeScope(peer,endpoint);if(!scope){this.wakeChecks.delete(peer.id);return false;}
+    const scope=this.wakeScope(peer,endpoint);if(!scope)return false;
+    const check:WakeCheck={scope,at:Date.now()},current=()=>this.wakeChecks.get(peer.id)===check;
+    this.wakeChecks.set(peer.id,check);
+    let idle=false;
     try{
-      const {thread}=await this.readTarget(peer,endpoint,false),ready=thread.status?.type==='idle';
-      const current=this.wakeScope(peer,endpoint);this.wakeChecks.set(peer.id,{scope,at:Date.now(),ready:ready&&current===scope});return ready&&current===scope;
-    }catch{this.wakeChecks.set(peer.id,{scope,at:Date.now(),ready:false});return false;}
+      const {thread}=await this.readTarget(peer,endpoint,false,false,current);
+      idle=thread.status?.type==='idle'&&this.wakeScope(peer,endpoint)===scope;
+    }catch{                        }
+                                 
+    if(!current())return false;
+    check.at=Date.now();check.ready=idle;return idle;
   }
                                           
   async queueWakeReady(peer:Peer,endpoint:Endpoint):Promise<boolean>{
     const scope=this.wakeScope(peer,endpoint);if(!scope)return false;
     try{const {thread}=await this.readTarget(peer,endpoint,false,true);return thread.status?.type==='idle'&&this.wakeScope(peer,endpoint)===scope;}catch{return false;}
   }
-  private async readTarget(peer:Peer,endpoint:Endpoint,includeTurns:boolean,connectedOnly=false){
+  private async readTarget(peer:Peer,endpoint:Endpoint,includeTurns:boolean,connectedOnly=false,acceptObservation?:()=>boolean){
     if(this.closed||!endpoint.daemon||!endpoint.configHome||!endpoint.pid||!endpoint.procStart||!peer.sessionId)throw new DeliveryError('daemon_wake_unavailable','目标共享 daemon 路由不完整。');
     const connection=connectedOnly?this.clients.get(normalizedHome(endpoint.configHome)):await this.connection(normalizedHome(endpoint.configHome),{pid:endpoint.pid,procStart:endpoint.procStart});
     if(!connection||connection.rpc.closed||connection.pid!==endpoint.pid||connection.procStart!==endpoint.procStart||connection.address!==endpoint.daemon.address)throw new DeliveryError('daemon_identity_changed','共享 daemon 的原生路由已经改变。');
     const thread=includeTurns?await readCodexThread(connection.rpc,peer.sessionId!):(await connection.rpc.request('thread/read',{threadId:peer.sessionId,includeTurns:false},{timeout:5000})).thread as CodexThread;
     if(thread?.id!==peer.sessionId||!interactive(thread)||thread.status?.type==='notLoaded'||this.endedThreads.has(this.threadKey(connection,peer.sessionId)))throw new DeliveryError('daemon_thread_ended','原生主会话已卸载或不再可投递。');
     const permission=await persistedCodexPermission(thread.path,peer.sessionId);
-    const active=this.store.endpoint(peer.id);if(permission&&active?.epoch===endpoint.epoch&&this.store.peer(peer.id).sessionId===peer.sessionId){const observed=observeCodexPermission(active,peer.sessionId,permission,'native-rollout');this.store.saveEndpoint(observed);this.store.updatePeer(peer.id,{permission:classifyCodexPermission(permission)});}
+    if(acceptObservation&&!acceptObservation())return{connection,thread};
+    const active=this.store.endpoint(peer.id),current=this.store.getPeer(peer.id);
+    if(!active||wakeRoute(active)!==wakeRoute(endpoint)||current?.sessionId!==peer.sessionId)return{connection,thread};
+    if(permission){const observed=observeCodexPermission(active,peer.sessionId,permission,'native-rollout');this.store.saveEndpoint(observed);this.store.updatePeer(peer.id,{permission:classifyCodexPermission(permission)});}
     const state=daemonRegistration(thread,connection).state;
-    if(this.store.peer(peer.id).state!=='paused'&&state&&state!==this.store.peer(peer.id).state)this.store.updatePeer(peer.id,{state});
+    if(current.state!=='paused'&&state&&state!==current.state)this.store.updatePeer(peer.id,{state});
     return{connection,thread};
   }
   async injectionState(peer:Peer,endpoint:Endpoint,options:{cursor?:HistoryCursor;tail?:boolean;since?:number}={}){
@@ -98,7 +118,7 @@ export class CodexDaemons {
     let target:Awaited<ReturnType<CodexDaemons['readTarget']>>;
     try{target=await this.readTarget(peer,endpoint,false);}catch(error){throw new DeliveryError((error as BridgeError).code??'daemon_wake_unavailable',describeError(error));}
                                                           
-    if(target.thread.status?.type!=='idle'||this.wakeScope(peer,endpoint)!==scope){this.wakeChecks.delete(peer.id);throw new DeliveryError('daemon_wake_unavailable','原生线程不再空闲或唤醒授权已改变，继续等待原生取件。');}
+    if(target.thread.status?.type!=='idle'||this.wakeScope(peer,endpoint)!==scope){this.clearWakeCheck(peer.id,scope);throw new DeliveryError('daemon_wake_unavailable','原生线程不再空闲或唤醒授权已改变，继续等待原生取件。');}
     return target.connection.rpc;
   }
   async inject(peer:Peer,endpoint:Endpoint,callId:string,output:string):Promise<void>{
@@ -109,7 +129,7 @@ export class CodexDaemons {
     const scope=this.wakeScope(peer,endpoint),rpc=await this.mutationTarget(peer,endpoint),origin=await this.turnOrigin?.(peer,'partner');
     if(this.wakeScope(peer,endpoint)!==scope)throw new DeliveryError('daemon_wake_unavailable','原生唤醒授权或上下文已改变。');
     const result=await rpc.request('turn/start',{threadId:peer.sessionId,input:[],...origin},{mutation:true});
-    this.wakeChecks.delete(peer.id);return result.turn.id;
+    this.clearWakeCheck(peer.id,scope);return result.turn.id;
   }
   async wake(peer:Peer,endpoint:Endpoint,beforeSubmit:()=>Promise<boolean>,message:string|(()=>string)=HEALTH_WAKE_NOTICE):Promise<string|undefined>{
     const scope=this.wakeScope(peer,endpoint),rpc=await this.mutationTarget(peer,endpoint);
@@ -117,7 +137,7 @@ export class CodexDaemons {
     if(!await beforeSubmit())return;
     if(this.wakeScope(peer,endpoint)!==scope)throw new DeliveryError('daemon_wake_unavailable','共享 daemon 唤醒授权或当前上下文已改变。');
     const result=await rpc.request('turn/start',{threadId:peer.sessionId,input:[{type:'text',text:typeof message==='function'?message():message}],...origin},{mutation:true});
-    this.wakeChecks.delete(peer.id);
+    this.clearWakeCheck(peer.id,scope);
     if(typeof result?.turn?.id!=='string'||!result.turn.id)throw new DeliveryError('wake_result_unknown','原生唤醒没有返回可核验的轮次。',true);
     return result.turn.id;
   }

@@ -45,6 +45,7 @@ export class Store {
   onRotation?: (rotation: ContextRotation) => void;
   onContextEnd?: (peerId:string) => void;
   onCooperationChange?: (peerIds:string[]) => void;
+  onPeerReady?: (peer:Peer) => void;
   onDeliveryObserved?: (message:Message) => void;
   constructor(filename: string) {
     const {DatabaseSync}=createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
@@ -146,7 +147,11 @@ export class Store {
                                                
     peer.stateSince=previous?.state===peer.state&&previous.sessionId===peer.sessionId?previous.stateSince??Date.now():Date.now();
     statement(this.db,'INSERT INTO peers(id,host,session_id,data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET host=excluded.host,session_id=excluded.session_id,data=excluded.data').run(peer.id,peer.host,peer.sessionId,JSON.stringify(peer));
-    if(previous&&(previous.state!==peer.state||previous.sessionId!==peer.sessionId||previous.enabled!==peer.enabled))this.onCooperationChange?.([peer.id]);return peer;
+    if(previous&&(previous.state!==peer.state||previous.sessionId!==peer.sessionId||previous.enabled!==peer.enabled)){
+      this.onCooperationChange?.([peer.id]);
+      if(peer.state==='ready'&&(previous.state!=='ready'||previous.sessionId!==peer.sessionId))this.onPeerReady?.(peer);
+    }
+    return peer;
   }
   updatePeer(id: string, patch: Partial<Peer>): Peer { const previous=this.peer(id),peer=this.savePeer({...previous,...patch,id,updatedAt:Date.now()});if(peer.state!==previous.state)this.event('peer.state',{peerId:id,state:peer.state});return peer; }
 

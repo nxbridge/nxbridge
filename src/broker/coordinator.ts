@@ -338,6 +338,7 @@ export class Broker {
       consumeIdle:(peer,id)=>{const pair=store.pairFor(peer.id);if(pair)this.deliveryHealth.outcome(pair.id,peer.id,id,'submitted');},
     });
     store.onCooperationChange=ids=>{for(const id of ids)store.faults.sync('cooperation_clock:'+id,()=>this.communicationTips.cooperation.changed(store.peer(id)));};
+    store.onPeerReady=peer=>{if(peer.host==='codex')this.recordCodexReady(peer);};
     this.configurationReload=new ConfigurationReload(home);this.configuration=new InHostConfiguration(home,Date.now,()=>this.applyConfiguration(),(name,data)=>this.store.event(name,data));
     this.runtimeHealth=new BrokerHealthCoordinator({store,config,adapters,home,resources},{incidents:this.incidents,deliveryHealth:this.deliveryHealth,communicationTips:this.communicationTips,pairAnomalies:this.pairAnomalies,idleNotices:this.idleNotices,profiles:this.profiles,foregroundHealth:this.foregroundHealth,managedRecovery:this.managedRecovery,health:this.health,codexDirect:this.codexDirect,daemons:this.daemons,questions:this.questions,turnEnds:this.turnEnds},{hostingStatus:peer=>this.hostingStatus(peer),stopped:()=>this.producersPaused,startupPending:id=>this.startupBlocked(id),actor:(...args)=>this.actor(...args),enabled:(...args)=>this.enabled(...args),requireEnabled:(...args)=>this.requireEnabled(...args),ownedClaudeLaunchReady:(...args)=>this.memberLifecycle.ownedClaudeLaunchReady(...args),ownedClaudeLaunchFailure:(...args)=>this.memberLifecycle.ownedClaudeLaunchFailure(...args),signalCodexWake:(...args)=>this.signalCodexWake(...args),signalEmbeddedWake:(...args)=>this.signalEmbeddedWake(...args),refreshHookTrust:(...args)=>this.refreshHookTrust(...args),runtimeProbeFailed:id=>this.wakeMemberRecovery(id),pumpStage:(...args)=>this.pumpStage(...args)});
     this.memberLifecycle=new BrokerLifecycleCoordinator({store,config,adapters,home},{profileCoordination:this.profileCoordination,deletedSessions:this.deletedSessions,takeovers:this.takeovers,takeoverPermissions:this.takeoverPermissions,managedRecovery:this.managedRecovery,transfers:this.transfers,runtimeHealth:this.runtimeHealth,deliveryHealth:this.deliveryHealth,daemons:this.daemons},{
@@ -479,12 +480,9 @@ export class Broker {
       if(state==='offline'&&address){const runtime=runtimeFor(this.home,{endpoint:address})?.value;if(runtime?.peerId)clearManagedConflict(this.store,runtime.peerId,runtime.id,id);}
       const p=this.runtimePeer(id,address),newActivity=p&&!['busy','needsHuman'].includes(p.state);
       if(p&&this.enabled(p.id)&&(p.state!=='paused'||p.kind==='subagent')){
-        this.store.updatePeer(p.id,{state});
-        if(state==='ready'){
-          const pair=this.store.pairFor(p.id),endpoint=this.store.endpoint(p.id);
-          if(pair&&endpoint)this.codexDirect.nativeReady(p,endpoint,pair.id);
-          this.wakeScheduledDelivery(p.id);
-        }
+        if(state==='ready'&&address!==undefined&&!this.store.endpoints(p.id).some(endpoint=>endpoint.active&&endpoint.address===address))return;
+        const current=this.store.updatePeer(p.id,{state});
+        if(state==='ready'&&p.state==='ready')this.recordCodexReady(current,address);
       }
       if(p?.kind==='subagent'&&state==='offline')for(const endpoint of this.store.endpoints(p.id))if(endpoint.mode==='app-server'&&endpoint.address===address)this.store.deactivate(p.id,endpoint.epoch);
       if(p&&['busy','needsHuman'].includes(state))return this.observeActiveCodex(this.store.peer(p.id),newActivity);
@@ -728,7 +726,7 @@ export class Broker {
   private subagentWakeAnchor(peer:Peer,endpoint:Endpoint,pair:Pair):string|undefined{
     return this.codexDirect.continuationUncertain(peer,endpoint,pair.id)?undefined:this.subagentCompletions.batch(peer);
   }
-  private deliveryTarget(id:string):{peer:Peer;endpoint:Endpoint}|undefined{
+  private deliveryTarget(id:string,queuedAnchor?:string|null):{peer:Peer;endpoint:Endpoint}|undefined{
     const peer=this.store.getPeer(id);
     if(!peer?.sessionId||this.memberLifecycle.retryPending(id))return;
     const pair=this.store.pairFor(id);
@@ -737,7 +735,7 @@ export class Broker {
     if(!endpoint?.active||!this.incidents.canAttempt(peer,endpoint))return;
     if(peer.host==='codex'){
       if(!this.codexWakeAllowed(peer,endpoint,pair.id)||this.codexWakeWork.has(id)||this.subagentCompletions.blocked(peer))return;
-      const scope=this.wakeScope(peer,endpoint,pair),anchor=this.store.firstPendingId(id);
+      const scope=this.wakeScope(peer,endpoint,pair),anchor=queuedAnchor===undefined?this.store.firstPendingId(id):queuedAnchor;
       if(endpoint.mode==='embedded'&&!endpoint.daemon){
         if(this.config.compatibilityWake!=='notify'||!(endpoint.configHome??this.config.codexHome)||!this.wakeSignals.ready(id,scope))return;
         if(!anchor&&!this.subagentCompletions.pending(peer))return;
@@ -763,6 +761,16 @@ export class Broker {
     let ready=false;
     this.store.faults.sync('delivery_ready:'+id,()=>{ready=!!this.deliveryTarget(id);});
     return ready;
+  }
+  private recordCodexReady(peer:Peer,address?:string):void{
+    if(this.producersPaused)return;
+    this.store.faults.sync('delivery_native_ready:'+peer.id,()=>{
+      const pair=this.store.pairFor(peer.id),endpoint=pair?this.store.endpoint(peer.id):undefined;
+      if(!pair||!endpoint||address!==undefined&&endpoint.address!==address)return;
+      this.codexDirect.nativeReady(peer,endpoint,pair.id);
+      if(endpoint.daemon)this.daemons.nativeReady(peer,endpoint);
+      this.wakeScheduledDelivery(peer.id);
+    });
   }
   private wakeScheduledDelivery(id:string,explicit=false):void{
     if((!this.scheduling&&!explicit)||this.producersPaused)return;
@@ -874,6 +882,7 @@ export class Broker {
       if(current?.peer.sessionId===peer.sessionId&&current?.endpoint.epoch===endpoint.epoch&&current.peer.state!=='paused'&&health){
         const state=health.state==='ready'?'ready':health.state==='needsHuman'?'needsHuman':health.state==='failed'?current.peer.state:'busy';
         if(current.peer.state!==state)this.store.updatePeer(id,{state});
+        else if(health.state==='ready')this.recordCodexReady(current.peer,endpoint.address);
       }
       this.startupRoutes.finish(id);this.store.faults.recovered(stage);
       const pair=this.store.pairFor(id);if(pair)this.turnEnds.refresh(pair);
@@ -923,7 +932,7 @@ export class Broker {
       let parked:ParkedCustody|undefined;
       try{
         for(const detach of this.detachObservers.splice(0))detach();
-        this.store.onRotation=this.store.onContextEnd=this.store.onDeliveryObserved=this.store.onCooperationChange=undefined;
+        this.store.onRotation=this.store.onContextEnd=this.store.onDeliveryObserved=this.store.onCooperationChange=this.store.onPeerReady=undefined;
         this.questions.markHandoff(this.runtime?.generation??String(process.pid),updateId);
         parked=this.adapters.codex.parkHandoff(routes);
         await this.modReads.close();
@@ -1766,7 +1775,8 @@ export class Broker {
                                                
         const recovering=this.memberLifecycle.recoveryWork(id);if(recovering&&this.memberLifecycle.isRestoring(id))return this.memberLifecycle.deferRecoveryDelivery(id,recovering);
         if(!await recoveries.get(id))return SKIPPED;
-        const route=this.deliveryTarget(id);if(!route)return SKIPPED;
+                                                 
+        const route=this.deliveryTarget(id,messages[0]?.id??null);if(!route)return SKIPPED;
         const {peer:target,endpoint}=route;
         try{
           if(target.host==='claude'&&target.owner==='nxbridge')await this.memberLifecycle.verifyOwnedClaudeLaunch(id,false);
@@ -2057,7 +2067,7 @@ export class Broker {
       const actor:Actor={host:'codex',memberId:peer.id,sessionId:peer.sessionId,callId:randomUUID()};
       const notices=this.wakeNotices(pair,peer).map(notice=>({id:notice.id,pairId:pair.id,from:pair.claude,to:peer.id,body:notice.message,callId:notice.id,state:'accepted' as const,createdAt:Date.now(),updatedAt:Date.now(),attempts:0,inReplyTo:null,via:null,evidence:null,error:null,notice:true}));
       const guard=()=>{const fresh=this.store.pairFor(peer.id),active=this.store.endpoint(peer.id);return !hostingGate(this.store,this.store.peer(peer.id))&&!this.profiles.blocks(this.store.peer(peer.id))&&this.enabled(peer.id)&&!this.stopped&&!this.memberLifecycle.isRestarting(peer.id)&&fresh?.id===pair.id&&!fresh.paused&&this.store.peer(peer.id).sessionId===peer.sessionId&&this.store.peer(peer.id).state==='ready'&&active?.epoch===endpoint.epoch&&!this.store.bindings.current(peer.id)?.transitioning;};
-      await this.codexDirect.deliver(peer,endpoint,[...this.store.pending(peer.id),...notices],async message=>{
+      await this.codexDirect.deliver(current,endpoint,[...this.store.pending(peer.id),...notices],async message=>{
         if(message.notice){const notice=(await this.runtimeHealth.prepareNotices(actor,[message.id],true,true,true))[0];return notice?JSON.stringify({messages:[],notices:[{notice_id:notice.id,source:notice.source??'runtime_monitor',message:notice.message}]}):undefined;}
         const body=this.deliveryBody(message);return body===undefined?undefined:JSON.stringify({messages:[{message_id:message.id,from:modelPeerName(this.store.peer(message.from)),message:body,...(message.replyExpected?{reply_expected:true}:{}),...(message.inReplyTo?{in_reply_to:message.inReplyTo}:{}),...(message.via?{via:message.via}:{}),...fileHintFields(body,peer.cwd)}],status:'received'});
       },guard,receipt=>{this.observeCodexContext(peer,receipt,'原生持久历史');for(const notice of this.deliveryHealth.outcome(pair.id,peer.id,receipt.messageId,'submitted'))this.turnEnds.entered(peer,notice.id);},id=>this.deliveryHealth.recordedCanWake(pair.id,peer.id,id),turnId=>this.turnEnds.started(peer,turnId),id=>this.store.transaction(()=>this.turnEnds.notSubmitted(peer,this.deliveryHealth.outcome(pair.id,peer.id,id,'pending'))));

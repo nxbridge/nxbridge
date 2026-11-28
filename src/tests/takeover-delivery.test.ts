@@ -14,6 +14,9 @@ import {formatGlobalStatus} from '../integration/mcp/presentation.js';
 import {RuntimeRecoveryHold} from '../shared/errors.js';
 import {type Peer,type Endpoint} from '../types.js';
 import {fixture,lifecycle} from './support/broker-fixture.js';
+import {registration} from './support/registration.js';
+import type {BrokerHealthCoordinator} from '../broker/health/coordinator.js';
+import type {StartupRoutes} from '../broker/startup-routes.js';
 
 async function setup(t:TestContext){
   const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id),identity=await processIdentity(process.pid),runtimeId=randomUUID();
@@ -87,16 +90,52 @@ test('接管中的忙碌会话保持既有取件语义，空闲后只接续一�
   assert.equal(f.codex.injected.length,1);assert.equal(f.codex.woken.length,1);
 });
 
-test('窗口新输入与来信竞态不另开轮次，原生空闲后按原消息投递',async t=>{
+for(const boundary of ['ledger','event','patrol','inflight','register','handoff'] as const)test('窗口新输入与来信竞态不另开轮次，原生空闲后按原消息投递：'+boundary,async t=>{
   const f=await setup(t);f.lease();const read=f.codex.injectionState.bind(f.codex);
+  const broker=f.broker as unknown as {scheduling:boolean;runtimeHealth:BrokerHealthCoordinator;startupRoutes:StartupRoutes;catchUpOwnedRoutes(ids:Iterable<string>):Promise<void>};
+  t.mock.timers.enable({apis:['Date'],now:Date.now()});
   const message=f.store.accept(f.pair,f.c,'与人工输入同时到达','input-race');
+  let idle=false,reads=0;
   f.codex.injectionState=async(...args)=>{
-    const value=await read(...args);f.store.updatePeer(f.x.id,{state:'busy'});
+    reads++;const value=await read(...args);
+    if(idle)return value;
+    if(boundary!=='patrol'&&boundary!=='handoff')f.store.updatePeer(f.x.id,{state:'busy'});
+    if(boundary==='inflight')f.store.updatePeer(f.x.id,{state:'ready'});
     return{...value,thread:{...value.thread,status:{type:'active'},turns:[{id:'user-turn',status:'inProgress'}]}};
   };
   await f.wake();assert.equal(f.store.message(message.id).state,'accepted');assert.equal(f.store.message(message.id).attempts,0);
   assert.equal(f.codex.injected.length,0);assert.equal(f.codex.woken.length,0);
-  f.codex.injectionState=read;f.store.updatePeer(f.x.id,{state:'ready'});await f.wake();await f.wake();
+  idle=true;
+  if(boundary==='ledger')f.store.updatePeer(f.x.id,{state:'ready'});
+  if(boundary==='event'){
+    const stale={...f.endpoint(),epoch:'historical-route',address:'ws://127.0.0.1:9124',active:false};
+    f.store.saveEndpoint(stale);
+    f.codex.emit('state',f.peer().sessionId,'ready',stale.address);
+    assert.equal(f.peer().state,'busy','历史端点的空闲事件不能替代当前原生路线的证据');
+    f.codex.emit('state',f.peer().sessionId,'ready',f.endpoint().address);
+  }
+  if(boundary==='register'||boundary==='handoff'){
+    broker.scheduling=true;
+    if(boundary==='register')f.codex.emit('register',registration('codex',f.peer().sessionId!,{state:'ready',endpoint:f.endpoint()}),f.x.id);
+    else{
+      broker.startupRoutes.begin([f.x.id]);
+      t.mock.method(f.codex,'connect',async()=>({request:async(method:string)=>method==='thread/turns/list'
+        ?{data:[{id:'user-turn',status:'completed'}]}
+        :{thread:{id:f.peer().sessionId,status:{type:'idle'}}}}));
+      await broker.catchUpOwnedRoutes([f.x.id]);
+      assert.equal(broker.startupRoutes.blocked(f.x.id),false);
+    }
+    await broker.runtimeHealth.waitForIdle();
+    assert.equal(f.store.message(message.id).state,'contextObserved','未推进模拟时钟也应完成投递');
+    broker.scheduling=false;
+  }
+  if(boundary==='patrol'){
+    t.mock.timers.tick(9999);await f.wake();
+    assert.equal(reads,1,'没有新的空闲证据时保留重查间隔');
+    assert.equal(f.store.message(message.id).state,'accepted');
+    t.mock.timers.tick(1);
+  }
+  await f.wake();await f.wake();
   assert.equal(f.store.message(message.id).state,'contextObserved');assert.equal(f.codex.injected.length,1);assert.equal(f.codex.woken.length,1);
 });
 

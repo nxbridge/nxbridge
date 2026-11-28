@@ -18,7 +18,7 @@ const nativeRoute=(endpoint:Endpoint)=>JSON.stringify([endpoint.address,endpoint
 
                                           
 export class CodexDirectDelivery {
-  private active=new Set<string>();
+  private active=new Map<string,{scope:string;physicalRoute:string;readyDuringRead:boolean}>();
   constructor(private store:Store,private adapter:Pick<CodexAdapter,'injectionState'|'inject'|'continueInjected'>){}
   pending(peerId:string):boolean{const value=this.store.setting<Reservation>(key(peerId));return !!value&&(value.attempts.length>0||!!value.continuation&&(value.continuation.attempts<3||!!value.continuation.uncertain));}
   status(peerId:string):Reservation|undefined{return this.store.setting(key(peerId));}
@@ -38,8 +38,10 @@ export class CodexDirectDelivery {
     return value?.scope===identity(peer,endpoint,pairId)&&value.continuation?.uncertain===true;
   }
   nativeReady(peer:Peer,endpoint:Endpoint,pairId:string):void{
+    const scope=identity(peer,endpoint,pairId),route=nativeRoute(endpoint),running=this.active.get(peer.id);
+    if(running?.scope===scope&&running.physicalRoute===route)running.readyDuringRead=true;
     const value=this.status(peer.id);
-    if(value?.scope===identity(peer,endpoint,pairId)&&value.wait?.route===nativeRoute(endpoint)&&value.checkedAt!==undefined){
+    if(value?.scope===scope&&value.wait?.route===route&&value.checkedAt!==undefined){
       delete value.checkedAt;this.store.setSetting(key(peer.id),value);
     }
   }
@@ -47,9 +49,11 @@ export class CodexDirectDelivery {
   async deliver(peer:Peer,endpoint:Endpoint,messages:(Message&{notice?:boolean})[],output:(message:Message&{notice?:boolean})=>Promise<string|undefined>,guard:()=>boolean,observed:(receipt:CodexContextReceipt)=>void,noticeCanContinue:(id:string)=>boolean=()=>true,continued?:(turnId:string)=>void,notSubmitted?:(id:string)=>void):Promise<void>{
     if(hostingGate(this.store,peer))return;
     const enabled=()=>memberEnabled(this.store,this.store.peer(peer.id));if(!enabled())return;
-    if(this.active.has(peer.id))return;this.active.add(peer.id);
+    if(this.active.has(peer.id))return;
+    const route=identity(peer,endpoint,this.store.pairFor(peer.id)?.id),physical=nativeRoute(endpoint),running={scope:route,physicalRoute:physical,readyDuringRead:false};
+    this.active.set(peer.id,running);
     try{
-      const route=identity(peer,endpoint,this.store.pairFor(peer.id)?.id),previous=this.status(peer.id);
+      const previous=this.status(peer.id);
       if(previous&&previous.scope!==route){this.store.setSetting(key(peer.id),null);return;}
       const reservation:Reservation=previous??{scope:route,attempts:[]},save=()=>this.store.setSetting(key(peer.id),reservation);
                                                  
@@ -59,20 +63,28 @@ export class CodexDirectDelivery {
         if(!message&&!noticeCanContinue(id)){delete reservation.continuation;save();}
       }
       if(!this.canCheck(reservation,route,endpoint,messages.length>0))return;
-      reservation.checkedAt=Date.now();
-      if(previous)save();
       const historyOptions=()=>{
                                                       
         if(reservation.attempts.some(value=>!value.historyCursor))return{since:Math.min(...reservation.attempts.map(value=>value.at??0))};
         const cursors=reservation.attempts.flatMap(value=>value.historyCursor?[value.historyCursor]:[]).sort((a,b)=>a.offset-b.offset);return cursors.length?{cursor:cursors[0]}:{tail:true};
       };
-      let state=await this.adapter.injectionState(peer,endpoint,historyOptions());
+      const readState=()=>{
+        running.readyDuringRead=false;
+        reservation.checkedAt=Date.now();
+        if(previous)save();
+        return this.adapter.injectionState(peer,endpoint,historyOptions());
+      };
+      let state=await readState();
       if(!enabled())return;
       const latest=()=>state.thread.turns?.at(-1),idle=()=>codexThreadIdle(state.thread);
       const recordWait=()=>{
         if(idle()){if(reservation.wait){delete reservation.wait;save();this.store.event('codex.delivery.resumed',{peerId:peer.id});}return;}
-        const turn=state.thread.turns?.find(turn=>turn.status==='inProgress'),facts={native_status:state.thread.status?.type??'unknown',active_flags:state.thread.status?.activeFlags??[],...(turn?{turn_id:turn.id}:{})},physical=nativeRoute(endpoint);
-        if(reservation.wait?.route===physical&&reservation.wait.native_status===facts.native_status&&JSON.stringify(reservation.wait.active_flags)===JSON.stringify(facts.active_flags)&&reservation.wait.turn_id===facts.turn_id)return;
+                                            
+        if(running.readyDuringRead)delete reservation.checkedAt;
+        const turn=state.thread.turns?.find(turn=>turn.status==='inProgress'),facts={native_status:state.thread.status?.type??'unknown',active_flags:state.thread.status?.activeFlags??[],...(turn?{turn_id:turn.id}:{})};
+        if(reservation.wait?.route===physical&&reservation.wait.native_status===facts.native_status&&JSON.stringify(reservation.wait.active_flags)===JSON.stringify(facts.active_flags)&&reservation.wait.turn_id===facts.turn_id){
+          if(running.readyDuringRead)save();return;
+        }
         const wait={...facts,since:Date.now(),message:'原生 Codex 尚未空闲（'+facts.native_status+(facts.active_flags.length?'；'+facts.active_flags.join(', '):'')+(turn?'；轮次 '+turn.id+' 仍在运行':'')+'）；消息保留，等待原生任务或输入处理完成后继续投递。'};
         reservation.wait={...wait,route:physical};save();this.store.event('codex.delivery.wait',{peerId:peer.id,...wait});
       };
@@ -118,7 +130,7 @@ export class CodexDirectDelivery {
         }
       }
       if(submitted){
-        if(!enabled())return;state=await this.adapter.injectionState(peer,endpoint,historyOptions());if(!enabled())return;recordWait();
+        if(!enabled())return;state=await readState();if(!enabled())return;recordWait();
         if(!idle())for(const attempt of reservation.attempts)attempt.waitingTurn=latest()?.status==='inProgress'?latest()?.id:undefined;
         save();reconcile();if(!idle()||!guard())return;
       }

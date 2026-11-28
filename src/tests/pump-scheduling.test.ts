@@ -92,6 +92,16 @@ test('歧义端点进入成员级退避时，其他成员仍按一秒时钟投�
   assert.equal(f.store.faults.ready('delivery_ready:'+f.c.id),false);
 });
 
+test('等待复查遇到歧义端点时仍保留成员的就绪状态更新',t=>{
+  const f=fixture(t),endpoint=f.store.endpoint(f.x.id)!;
+  f.store.pair(f.c.id,f.x.id);
+  f.store.updatePeer(f.x.id,{state:'busy'});
+  f.store.saveEndpoint({...endpoint,epoch:'ambiguous-ready'});
+  f.store.transaction(()=>f.store.updatePeer(f.x.id,{state:'ready'}));
+  assert.equal(f.store.peer(f.x.id).state,'ready');
+  assert.ok(f.store.faults.status().some(failure=>failure.stage==='delivery_native_ready:'+f.x.id));
+});
+
 test('远程唤醒仅在当前预约到期后推进，耗尽的老预约不遮住新收件锚点',async t=>{
   t.mock.timers.enable({apis:['Date','setTimeout'],now:100000});
   const f=fixture(t),pair=f.store.pair(f.c.id,f.x.id);

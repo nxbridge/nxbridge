@@ -12,6 +12,54 @@ import { daemonDelivery } from '../broker/delivery/delivery-guidance.js';
 import type { CodexThread } from '../hosts/codex/adapter.js';
 import { HEALTH_WAKE_NOTICE } from '../types.js';
 
+test('同一 daemon 路线的空闲证据立即重开复查，迟到的忙碌结果与旧路线脉冲均不覆盖当前证据',async t=>{
+  const f=fixture(t),native=await processIdentity(process.pid);
+  const domain:DaemonDomain={configHome:temporary(t),pid:process.pid,procStart:native.startedAt,address:'unix://ready-pulse-daemon'};
+  mkdirSync(path.join(domain.configHome,'app-server-daemon'));
+  writeFileSync(path.join(domain.configHome,'app-server-daemon/daemon.pid'),JSON.stringify({pid:process.pid}),'utf8');
+  t.mock.timers.enable({apis:['Date'],now:Date.now()});
+  const {daemons}=f.broker as unknown as {daemons:CodexDaemons};
+  const idle:CodexThread={id:'ready-pulse',cwd:f.c.cwd,source:'cli',status:{type:'idle'}};
+  const peer=f.store.register(daemonRegistration(idle,domain)),endpoint=f.store.endpoint(peer.id)!,pair=f.store.pair(f.c.id,peer.id);
+  authorizeDaemonWake(f.store,pair,'selection');
+  let read=async():Promise<CodexThread>=>({...idle,status:{type:'notLoaded'}});
+  let reads=0;
+  const rpc={closed:false,close(){this.closed=true;},request:async(method:string)=>{
+    assert.equal(method,'thread/read');reads++;return{thread:await read()};
+  }};
+  (daemons as unknown as {clients:Map<string,unknown>}).clients.set(normalizedHome(domain.configHome),{...domain,rpc,at:Date.now(),revision:0,threads:[idle]});
+  assert.equal(await daemons.wakeReady(peer,endpoint),false);
+  assert.equal(daemons.wakeMayAdvance(peer,endpoint),false);
+  daemons.nativeReady(peer,{...endpoint,procStart:'old-generation'});
+  assert.equal(daemons.wakeMayAdvance(peer,endpoint),false,'相同地址的旧代次不能清除当前退避');
+  t.mock.timers.tick(4999);assert.equal(daemons.wakeMayAdvance(peer,endpoint),false);
+  t.mock.timers.tick(1);assert.equal(daemons.wakeMayAdvance(peer,endpoint),true);
+  assert.equal(await daemons.wakeReady(peer,endpoint),false);
+  const readyEdge=()=>{f.store.updatePeer(peer.id,{state:'busy'});f.store.updatePeer(peer.id,{state:'ready'});};
+  readyEdge();
+  assert.equal(daemons.wakeMayAdvance(peer,endpoint),true);
+  assert.equal(daemons.canWake(peer,endpoint),false,'状态脉冲只重开核验，不授予投递许可');
+  assert.equal(reads,2);
+
+  let enter!:()=>void,finish!:()=>void;
+  const entered=new Promise<void>(resolve=>{enter=resolve;}),pending=new Promise<void>(resolve=>{finish=resolve;});
+  read=async()=>{enter();await pending;return {...idle,status:{type:'active'}};};
+  const stale=daemons.wakeReady(peer,endpoint);
+  try{
+    await entered;
+    assert.equal(daemons.wakeMayAdvance(peer,endpoint),false,'软等待期间不重复安排相同路线');
+    readyEdge();
+    assert.equal(daemons.wakeMayAdvance(peer,endpoint),true,'同一时钟刻度出现的新空闲证据也可重开复查');
+  }finally{finish();}
+  assert.equal(await stale,false);
+  assert.equal(f.store.peer(peer.id).state,'ready');
+  assert.equal(daemons.wakeMayAdvance(peer,endpoint),true);
+  assert.equal(daemons.canWake(peer,endpoint),false);
+  read=async()=>idle;
+  assert.equal(await daemons.wakeReady(peer,endpoint),true);
+  assert.equal(daemons.canWake(peer,endpoint),true);
+});
+
 test('共享 daemon 仅向显式授权且已加载空闲的原线程注入续跑，不订阅、不恢复、不排队',async t=>{
   const f=fixture(t),native=await processIdentity(process.pid),domain:DaemonDomain={configHome:temporary(t),pid:process.pid,procStart:native.startedAt,address:'unix://wake-fixture'},calls:{method:string;params:any}[]=[];
   mkdirSync(path.join(domain.configHome,'app-server-daemon'));writeFileSync(path.join(domain.configHome,'app-server-daemon/daemon.pid'),JSON.stringify({pid:process.pid}),'utf8');

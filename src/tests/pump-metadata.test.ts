@@ -74,7 +74,7 @@ for(const gate of ['paused','needsHuman','retry','disabled','embedded','remote']
   await broker.pump();if(gate==='remote')await broker.pump();
   assert.equal(pending.mock.callCount(),0);assert.equal(pendingMessage.mock.callCount(),0);
   assert.equal(store.message(message.id).attempts,0);assert.equal(store.message(message.id).state,'accepted');assert.equal(claude.delivered.length,0);
-  if(gate==='remote'){assert.equal(codex.woken.length,1);assert.equal(anchor.mock.callCount(),2);assert.equal((store.setting<any>('codexWake:'+x.id)).anchor,message.id);}
+  if(gate==='remote'){assert.equal(codex.woken.length,1);assert.equal(anchor.mock.callCount(),1);assert.equal((store.setting<any>('codexWake:'+x.id)).anchor,message.id);}
   else assert.equal(codex.woken.length,0);
   assert.deepEqual(store.faults.status().filter(stage=>stage.degraded),[]);
 });
@@ -95,6 +95,24 @@ test('异步探测后只读取原快照中仍为同次 accepted 的消息，消�
   assert.equal(loaded.mock.calls.filter(call=>call.result!==undefined).length,1);
   await broker.pump();assert.deepEqual(claude.delivered.map(message=>message.id),[good.id,requeued.id,late!.id]);
   assert.deepEqual(store.faults.status().filter(stage=>stage.degraded),[]);
+});
+
+test('远程目标在异步探测期间取走首条消息时，按新的待发首条预约唤醒',async t=>{
+  const {store,broker,c,x,codex}=fixture(t),pair=store.pair(c.id,x.id);
+  store.saveEndpoint({...store.endpoint(x.id)!,address:'ws://example.invalid:4123'});
+  const first=store.accept(pair,c,'探测前的首条','first'),second=store.accept(pair,c,'更新后的首条','second');
+  t.mock.method((broker as any).runtimeHealth,'deliveryAvailability',async()=>reachable());
+  t.mock.method(codex,'probe',async()=>{
+    await Promise.resolve();
+    store.transition(first.id,'contextObserved','原生取件的回执');
+    return reachable();
+  });
+  const pending=t.mock.method(store,'pending',()=>{throw Error('仅唤醒不应读取正文');});
+  await broker.pump();
+  assert.equal(pending.mock.callCount(),0);
+  assert.equal(codex.woken.length,1);
+  assert.equal(store.setting<{anchor:string}>('codexWake:'+x.id)?.anchor,second.id);
+  assert.equal(store.message(second.id).state,'accepted');assert.equal(store.message(second.id).attempts,0);
 });
 
 for(const race of ['paused','disabled','session','transition','pairPaused','unpaired','restarting'] as const)test('异步探测期间资格改变后仍在正文读取前阻止投递：'+race,async t=>{
